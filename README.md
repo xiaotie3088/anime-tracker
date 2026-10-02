@@ -1,143 +1,132 @@
 # 新番追番日历
 
-当季新番自动汇总 + 追番管理 + 更新日历 + 补番库。**本地优先、单机使用、数据在你自己手里。**
+**当季新番自动汇总 · 追番管理 · 更新日历 · 补番库**
 
-你把追番列表当资产，所以它存在本地 SQLite 里，不依赖任何在线账号。
+本地优先的单机工具：数据存在你自己的 SQLite 里，不需要注册任何账号，没有云同步。
 
----
-
-## 当前状态
-
-**核心功能已全部可用：知道当季有什么番 → 选番加入 → 日历看更新时间 → 手机也能看。**
-
-| 阶段 | 状态 |
-|---|---|
-| Phase 0 数据源实测 | ✅ 完成（结论见 [docs/sources.md](docs/sources.md)） |
-| 核心逻辑（深夜番归属 / 补番规则 / 时区） | ✅ 完成，102 项离线自检全绿 |
-| 数据库与 CLI | ✅ 可用（`sync` / `update` / `translate` / `search` / `add` / `list` / `week` / `changes` / `backups` / `archive` / `stats`） |
-| 抓取器 | 🚧 3/5：bangumi-data ✅、yuc.wiki ✅、AniList ✅；B站 / Jikan 待接 |
-| **一键更新数据** | ✅ 完成（当季 + 历史回填 + 机翻补齐 + 汇总报告） |
-| **临时机翻译名** | ✅ 完成（官方译名一到自动替换，界面标「临时机翻」） |
-| **历史季度保留 / 回填** | ✅ 完成（同步从不删历史；可增量回填最近 N 季） |
-| **数据备份 / 导出** | ✅ 完成（每次写库前自动备份，可一键导出追番列表） |
-| Web 界面（周视图 / 全季总览 / 我的追番 / 变更） | ✅ 完成，28 项接口自检全绿 |
-| 延期 / 改档检测 | ✅ 完成（同步时对比历史，自动过滤假变更） |
-| `.ics` 日历导出 | ✅ 完成（可导入手机系统日历） |
-| 桌面端双击启动 | ✅ 完成，含诊断日志与调试入口（见 [desktop/README.md](desktop/README.md)） |
-| 桌面通知 | ⬜ 未开始 |
-
-实测效果（2026 秋）：**112 部番**（另有回填出来的 2026-07 147 部、2026-04 7 部）。
-当季中文名：官方 76 部、**临时机翻 32 部**（界面会标注）、仍缺 4 部
-（原名纯拉丁或本身已可读，按规则刻意不翻）。
+[![Node](https://img.shields.io/badge/Node-%E2%89%A522.18-339933?logo=nodedotjs&logoColor=white)](https://nodejs.org/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![Dependencies](https://img.shields.io/badge/runtime%20deps-2-brightgreen)]()
+[![Build](https://img.shields.io/badge/build-none-orange)]()
+[![License](https://img.shields.io/badge/license-not%20set-lightgrey)]()
 
 ---
 
-## 怎么更新数据
+## 它解决什么问题
 
-**点界面右上角的「更新数据」**，它是一条完整链路，不是一个抓取按钮：
+每季新番有 100 多部，散落在各个网站：**中文名在一处、放送时刻在另一处、国内什么时候能看在第三处**。
+想知道"这周我追的番哪天几点更新"，通常得开好几个页面自己拼。
 
-1. **抓取当季** —— 三源融合后落库（含延期/改档检测与自动归档）
-2. **增量回填历史季度** —— 默认最近 3 季；已经有数据的季度会跳过（`force` 才重抓）
-3. **官方译名替换临时机翻名** —— 官方中文名一到，自动把机翻名换掉
-4. **给仍然缺中文名的做临时机翻** —— 逐条串行，约 0.7 秒一条
-5. **汇总报告** —— 「写入 N 部 / 官方名替换 K 个 / 机翻补齐 J 个 / 移入补番库 X 部」，
-   明细直接摊在界面上（汇总成一句话会说谎，明细不会）
+这个工具把它们抓下来融合进一个本地库，然后回答四个问题：
 
-写库前会**自动备份**数据库到 `data/backups/`（只留最近 20 份）。
-
-右上角还有一个「只同步本季」，用于「我只想快点刷新当季」，语义与「更新数据」明确区分。
-命令行等价物：
-
-```powershell
-node src/server/cli.ts update                   # 一键更新（默认回填 3 季 + 机翻）
-node src/server/cli.ts update --no-translate    # 跳过机翻（更快）
-node src/server/cli.ts update --limit=20        # 机翻条数上限
-node src/server/cli.ts sync                     # 只同步当季
-node src/server/cli.ts sync --backfill=4        # 增量回填最近 4 季
-node src/server/cli.ts sync --seasons=2026-04,2026-07
-node src/server/cli.ts translate --all          # 只补中文名（全库）
-```
-
----
-
-## 快速开始
-
-**方式一：桌面端（推荐，日常使用）**
-
-双击 `desktop\创建桌面快捷方式.cmd`（只需一次），之后双击桌面上的「新番追番日历」即可。
-细节与原理见 [desktop/README.md](desktop/README.md)。
-
-**方式二：命令行**
-
-```powershell
-pnpm install
-
-# 启动服务并打开界面
-node src/server/server.ts
-#    浏览器打开 http://127.0.0.1:8787
-#    首次进入点右上角「同步当季」即可
-
-# 离线自检：不需要联网、不需要装包，验证核心逻辑
-node scripts/verify.ts
-
-# 接口自检：需要服务已启动（另一个终端）
-node scripts/verify-api.ts
-
-# 数据源探测：确认各源是否可用、字段是否变了
-node scripts/probe-sources.ts
-```
-
-命令行也能干同样的事：
-
-```powershell
-node src/server/cli.ts season                  # 抓当季清单（只预览）
-node src/server/cli.ts update                   # 一键更新数据（推荐）
-node src/server/cli.ts sync                    # 抓当季并落库（含延期检测）
-node src/server/cli.ts changes                 # 看检测到的延期/改档
-node src/server/cli.ts search "药屋"            # 本地优先，中文名可搜
-node src/server/cli.ts add "药屋少女的呢喃 第三季" --backlog --watched=2
-node src/server/cli.ts week --rule=broadcast-calendar
-node src/server/cli.ts backups                 # 看备份与库里的季度
-```
-
-`node src/server/cli.ts` 不带参数会打印全部命令。
+- 这季有什么？→ **全季总览**（可筛选：放送星期 / 媒体类型 / 类型标签 / 国内平台）
+- 这周几点更新？→ **周视图**（带倒计时，手机日历也能导入）
+- 我追的看到哪了？→ **我的追番**（进度、补番库）
+- 它改档了吗？→ **变更**（延期 / 改档检测）
 
 ---
 
 ## 界面
 
-五个视图：
+> 📷 截图见下方。**（替换说明见文末「附：怎么加截图」）**
 
-| 视图 | 解决的问题 |
-|---|---|
-| **周视图** | 本周我追的番分别哪天几点更新，带倒计时；可切换「真实钟点 / 日本放送日历」口径 |
-| **全季总览** | 这一季有多少部、按星期/类型/平台怎么分布、缺哪些中文名；搜索 + 一键追番/补番 |
-| **我的追番** | 追番中 / 补番库 / 已看完 / 已弃番四个分类，进度 +1、移入补番库、移除 |
-| **变更** | 延期 / 改档 / 集数变化的历史记录，可标记已读 |
-| **搜索 / 加番** | 先搜本地库（中文名与别名都能命中），再搜 AniList 远程；老番靠这里加进补番库 |
+**周视图** —— 一周七天铺开，每格是当天更新的番：海报、第几话、放送时刻、倒计时。
+左上角切换「按真实钟点 / 按日本放送日历」两种口径（见下面「深夜番」那节）。今天那一列会高亮。
 
-详情卡里会显示**每个字段分别来自哪个数据源**（例如放送时刻来自 yuc.wiki、中文名来自 bangumi-data），
-数据源打架时会标「源有分歧」，手动修正过的会标「手动修正」。
+**全季总览** —— 顶部是本季统计；`筛选 / 排序` 面板可按放送星期、媒体类型（TV / 剧场版 / OVA…）、
+类型标签（动作 / 奇幻 / 科幻…）、国内平台（动画官网 / 巴哈姆特 / Crunchyroll…）多选筛选，
+选项旁标着各部数；排序可按首集放送时间、中文名、集数等；**每行几部也能调**（3~7 部）。
+季度标签支持**多选**，可以一次看几季的合集。
+
+<!-- 截图放好后把下面这行取消注释：
+![周视图与全季总览](screenshots/overview.png)
+-->
+
+**我的追番 / 补番库** —— 四个分类（追番中 / 补番库 / 已看完 / 已弃番）。
+补番库会显示「5/24，还剩 19 集，约 7 小时 36 分」。
+
+**详情卡** —— 每一集的确切放送时刻，以及**每个字段分别来自哪个数据源**。
+数据源打架时会标「源有分歧」，手动改过的标「手动修正」。
 
 ---
 
-## 这个项目最容易做错的一件事
+## 快速开始
 
-日本电视台把深夜番写成 **「日曜 24:30」**：放送日历上是**周日**，真实钟点却是**周一 00:30**。
+### 环境要求
 
+- **Node.js ≥ 22.18**（本机用 24 开发；`node:sqlite` 需要较新的 Node）
+- **pnpm**（没有的话用 `npm install` 也一样）
+
+### 三步跑起来
+
+```bash
+git clone https://github.com/xiaotie3088/anime-tracker.git
+cd anime-tracker
+pnpm install          # ← 必须先做，否则会报 Cannot find package 'zod'
+```
+
+然后启动：
+
+```bash
+node src/server/server.ts
+# 浏览器打开 http://127.0.0.1:8787
+# 首次进入是空库，点右上角「更新数据」抓当季
+```
+
+**Windows 桌面端**（可选，日常使用更方便）：
+
+双击 `desktop\创建桌面快捷方式.cmd`（只需一次），之后双击桌面上的「新番追番日历」即可。
+它直接调用浏览器 exe 启动，不依赖系统的 `http://` 关联。
+
+> ⚠️ 桌面快捷方式同样**需要先跑过 `pnpm install`**。
+
+---
+
+## 装了什么依赖
+
+只有 **2 个运行时依赖**，没有构建步骤（Node 直接跑 `.ts`）：
+
+| 依赖 | 用途 |
+|---|---|
+| `zod` | 校验源站响应结构 —— 源站改版时**早失败**，而不是把脏数据写进库 |
+| `undici` | 全局 `fetch` 不读 `HTTPS_PROXY`，而 Bangumi 在国内必须走代理 |
+
+开发依赖只有 `typescript` 和 `@types/node`。**没有** webpack / vite / babel / ESLint / 测试框架。
+
+---
+
+## 数据从哪来
+
+三个源做**字段级融合**（不是简单拼接，参见 `src/core/merge.ts` 的字段优先级）：
+
+| 源 | 提供 |
+|---|---|
+| [bangumi-data](https://github.com/bangumi-data/bangumi-data) | 中文名、放送时刻 |
+| [yuc.wiki](http://yuc.wiki) | 人工校对过的当季排期 |
+| [AniList](https://anilist.co) | 每集的精确 UTC 时刻、类型标签、海报 |
+
+缺中文名的会用 Bing 兜底机翻，界面上明确标成 **「临时机翻」**；官方译名一到，
+点「更新数据」会**自动替换**（数据库里 `title_cn_source` 从 `machine` 变回 `official`）。
+不该翻的**不翻**：已有官方中文名、原名本身是中文、或原名是纯拉丁字母的（`dreamland` 直接可读）。
+
+---
+
+## 深夜番：这个项目最容易做错的一件事
+
+日本电视台把深夜番写成 **「日曜 24:30」** —— 放送日历上是**周日**，真实钟点却是**周一 00:30**。
 同一集，两种口径落在不同的一天，甚至不同的一周。多数日历工具在这里会错位一天。
 
-本项目的处理方式：
+本项目的做法：
 
-1. 数据库里**同时**保存两个星期归属（`broadcast_weekday_jst` 与真实钟点），绝不混用。
+1. 数据库里**同时**保存两个星期归属，绝不混用
 2. 日历提供两种分组口径，由你切换：
-   - `--rule=clock` 按真实钟点（周一 00:30 落在周一）
-   - `--rule=broadcast-calendar` 按日本放送日历（同一集落在周日）
-3. 所有时间统一以 ISO 8601 UTC 存储，展示时才转换。
+   - `按真实钟点` —— 周一 00:30 落在周一
+   - `按日本放送日历` —— 同一集落在周日
+3. 所有时间统一以 **ISO 8601 UTC** 存储，展示时才转换
 
-实测演示（同一集，两种口径结果确实不同）：
+命令行可以直接看到差别（同一集、同一周、结果不同）：
 
-```
+```bash
 $ node src/server/cli.ts week --rule=clock
 本周更新  2026-09-28 ~ 2026-10-04（JST）  归属口径：真实钟点
 这一周没有你追的番更新。
@@ -148,66 +137,88 @@ $ node src/server/cli.ts week --rule=broadcast-calendar
   黑暗召唤师在地下恋爱中   第 1 话   周一 01:20 (JST)   2 天 8 小时后
 ```
 
-第 1 话的真实钟点是周一 01:20，所以按钟点算它属于下一周；而日本排期表把它记在周日深夜，所以按放送日历算属于本周。
+第 1 话的真实钟点是周一 01:20，所以按钟点算它属于**下一周**；而日本排期表把它记在周日深夜，
+所以按放送日历算属于**本周**。
 
 ---
 
-## 补番库
+## 补番库是显式建模的
 
-「番剧没看完但到下一个季度了」这件事是显式建模的，不是靠你自己记：
+「番没看完就到下一季了」这件事不靠你自己记：
 
-- **自动归档**：季度同步时，`已播完 + 看了至少 1 集 + 没看完` 的追番会自动移入补番库（`category = 'backlog'`）。
-  - 一集都没看的**不动** —— 那是「想看」，凭这个自动搬运会很烦人。
-  - 总集数未知的**不动** —— 不能靠猜迁移。
-- **手动加入任意老番**：`add "番名" --backlog`，不限季度。
-- **剩余进度**：显示「5/24，还剩 19 集，约 7 小时 36 分」。
-- **可选的补番计划**：给某部补番设定「每周几看 / 每天看几集」，让它出现在日历上（默认不进日历，避免污染「今天更新什么」这个语义）。
+- **自动归档**：季度同步时，`已播完 + 看了至少 1 集 + 没看完` 的追番自动移入补番库
+  - 一集都没看的**不动** —— 那是「想看」，自动搬运会很烦人
+  - 总集数未知的**不动** —— 不能靠猜迁移
+- **手动加任意老番**：`node src/server/cli.ts add "番名" --backlog`，不限季度
+- **归档可见**：每次移动都会当场告诉你是哪几部
 
-**归档是可见的**：自动归档会让番从「追番中」消失，容易被误认为「记录丢了」，
-所以每次移动都会当场告诉你移了哪几部（界面 toast + 更新明细里列出番名）。
-这是刻意的：沉默的自动搬运就是「记录消失」的观感。
+  > 沉默的自动搬运 = 「我的记录消失了」的观感，所以这里刻意做成显式的。
 
 ---
 
-## 临时机翻译名
+## 常用命令
 
-有些番只有日文原名、没有官方中文名。界面上的「补全中文名（机翻）」会给出**临时译名**：
+```bash
+node src/server/cli.ts                    # 不带参数会打印全部命令
+node src/server/cli.ts update              # 一键更新：抓当季 + 回填历史 + 机翻 + 报告
+node src/server/cli.ts update --no-translate
+node src/server/cli.ts sync --backfill=4   # 增量回填最近 4 季
+node src/server/cli.ts season              # 只看当季清单（不落库）
+node src/server/cli.ts search "药屋"        # 本地优先，中文名与别名都能命中
+node src/server/cli.ts list                # 我的追番 / 补番库
+node src/server/cli.ts changes             # 延期 / 改档
+node src/server/cli.ts backups             # 看备份与库里的季度
+node src/server/cli.ts stats
+```
 
-- 界面上标 **「临时机翻」**，详情卡里单独标出处 —— 不跟官方译名混在一起。
-- 机翻名**不进** `fieldSources`（那是官方源的字段级出处，机翻不能伪装成官方来源）。
-- 原名与英文名会并入别名，所以**用原名照样搜得到**。
-- 官方译名一到，**「更新数据」自动替换**（数据库层面：`title_cn_source` 从 `machine` 变回 `official`）。
-- 不该翻的**不翻**：已有官方中文名的、原名本身就是可读中文的（`夏日`/`魔法使之夜`）、
-  原名是纯拉丁字母的（`DARK MACHINE THE ANIMATION` 直接可读，机翻成「黑暗机器 动画」反而是信息损失）。
+### 自检
 
-实测质量（Bing 翻译，2026 秋 35 部）：专有名词会错（`マゼンチュ` → 「马森楚」），
-其余相当可读（`メイドインアビス 目覚める神秘` → 「来自深渊 觉醒的神秘」）。
-所以它**只能是临时译名**，这也是这套「标记 + 自动替换」机制存在的理由。
+```bash
+pnpm exec tsc --noEmit        # 类型检查，0 错误
+node scripts/verify.ts         # 102 项离线自检（不需要装包、不需要联网）
+node scripts/verify-api.ts     # 28 项接口自检（需要服务已启动）
+pnpm ui:smoke                   # 前端交互冒烟：筛选/排序按钮到底有没有反应
+```
+
+`scripts/verify-api.ts` 会打**真实源站与翻译接口**，也会往库里写测试数据 ——
+跑之前建议先备份 `data/anime.db`。
 
 ---
 
-## 历史季度会一直保留
+## HTTP 接口
 
-- **数据库层面本来就保留**：`subject` / `episode` 按 `season` 存，同步只 upsert 当季，**从不删除**历史季度。
-  季度下拉框可以随时切回上一季。
-- **界面会告诉你库里有哪些季度**：全季总览顶部列出每个季度的部数与最后更新时刻。
-- **要补更早的季度**：点「更新数据」，它会**增量回填**最近几个季度
-  （已有数据的季度跳过，不会把源站打爆；老季度的 yuc.wiki 页面 404 属正常，会被容忍并如实报告）。
+服务只监听 `127.0.0.1`，不对外暴露（单人本地工具，不需要鉴权）。
+
+```
+GET  /api/health          GET  /api/overview       GET  /api/week
+GET  /api/my              POST /api/my             PATCH|DELETE /api/my/:key
+GET  /api/subject/:key    POST /api/override       GET  /api/search
+POST /api/search/import   POST /api/sync           POST /api/update
+POST /api/translate       GET  /api/changes        POST /api/changes/ack
+GET  /api/ics             GET  /api/export
+```
+
+`/api/overview` 支持多季合并与排序，例如：
+
+```
+/api/overview?season=2026-10,2026-07&sort=firstAir
+```
+
+`sort` 可选 `firstAir` / `firstAirDesc` / `weekday` / `titleCn` / `totalEps`。
 
 ---
 
-## 数据备份与导出
+## 数据安全
 
-追番列表、进度、补番库、手动修正**不可重建**，所以：
+追番列表、进度、手动修正**不可重建**，所以：
 
-- **自动备份**：启动服务时、以及每次写库（同步 / 更新）**之前**，都会备份到 `data/backups/`，
-  只保留最近 20 份。`node src/server/cli.ts backups` 可以列出它们。
-  - ⚠ 备份必须处理 WAL：本项目用 WAL 日志模式，**只拷 `anime.db` 会丢数据**。
-    实测过：只拷主文件时 `subject` 有 126 行而 `my_anime` **是 0 行** —— 追番列表整条丢。
-    所以备份会先做 `wal_checkpoint(TRUNCATE)`，再把 `-wal` / `-shm` 一起拷过去。
-- **导出**：界面上的「导出我的数据」→ `GET /api/export`，下载一个 JSON，
-  含追番列表与进度、手动修正、变更历史（带番剧名，人能看懂）。
-  抓来的番剧数据可以重新抓，所以不在此列。
+- **自动备份**：启动服务时、以及每次写库（同步 / 更新）**之前**，备份到 `data/backups/`，只留最近 20 份
+  - ⚠️ 本项目用 WAL 日志模式，**只拷 `anime.db` 会丢数据**。实测过：只拷主文件时
+    `subject` 有 126 行而 `my_anime` **是 0 行** —— 追番列表整条丢。
+    所以备份会先 `wal_checkpoint(TRUNCATE)`，再把 `-wal` / `-shm` 一起拷过去
+- **导出**：界面「导出我的数据」→ `GET /api/export`，下载 JSON
+  （含追番列表与进度、手动修正、变更历史；抓来的番剧数据可重抓，故不在此列）
+- **历史季度从不删除**：同步只 upsert 当季，季度下拉框随时能切回上一季
 
 ---
 
@@ -216,99 +227,82 @@ $ node src/server/cli.ts week --rule=broadcast-calendar
 ```
 anime-tracker/
 ├─ src/
-│  ├─ core/            # 零依赖纯逻辑：time(时间/深夜番) / calendar(日历分组)
-│  │                   #   backlog(补番规则) / types / merge(多源融合)
-│  ├─ providers/       # http(代理+限速) / snapshot(快照) / validate(zod 友好报错)
-│  │                   #   bangumi-data / yuc / anilist / provider(统一接口)
-│  └─ server/          # db(node:sqlite) / schema.sql / sync(抓取+落库)
-│                      #   changes(延期检测) / server.ts(HTTP 服务) / ics / cli.ts
-├─ web/                # 界面：index.html / styles.css / app.js（原生 ES 模块，零构建）
-├─ src/
-│  ├─ core/            # 零依赖纯逻辑：time(时间/深夜番) / calendar(日历分组)
-│  │                   #   backlog(补番规则) / mt(该不该机翻) / types / merge(多源融合)
-│  ├─ providers/       # http(代理+限速) / snapshot(快照) / validate(zod 友好报错)
-│  │                   #   bangumi-data / yuc / anilist / mt(机翻) / provider(统一接口)
-│  └─ server/          # db(node:sqlite) / schema.sql / sync(抓取+落库+回填+一键更新)
-│                      #   changes(延期检测) / server.ts(HTTP 服务) / ics / cli.ts
-├─ web/                # 界面：index.html / styles.css / app.js（原生 ES 模块，零构建）
-├─ desktop/            # 桌面端启动器 + 快捷方式（脚本必须纯 ASCII，见其中 README）
-├─ scripts/
-│  ├─ verify.ts        # 离线自检（零依赖、单进程、102 项）
-│  ├─ verify-api.ts    # 接口自检（需要服务已启动、28 项）
-│  ├─ probe-sources.ts # 数据源探测（零依赖）
-│  └─ diagnose-network.ts
-├─ data/               # anime.db + backups/ + snapshots/ + cache/（已 gitignore）
-                       #   launcher.log（桌面启动器的诊断日志）
-└─ docs/
-   ├─ 交接说明-第四轮.md  # ★ 自包含的最新交接文档（换新对话先看这份）
-   ├─ 交接说明.md        # 第一轮的硬约束与验证习惯（细读版）
-   ├─ 交接说明-第二轮.md  # 第二轮调查记录（历史）
-   ├─ 交接说明-第三轮.md  # 第三轮交付记录（历史）
-   ├─ 方案报告-v1.md    # 最初的设计方案（含 v2 更新说明）
-   ├─ sources.md        # ★ 数据源实测结论
-   └─ 决策记录.md        # ★ ADR：为什么这么做（D1–D12）
+│  ├─ core/          零依赖纯逻辑
+│  │                 time(时间/深夜番归属) · calendar(日历分组) · backlog(补番规则)
+│  │                 mt(该不该机翻) · merge(多源融合+字段优先级) · types
+│  ├─ providers/     数据源接入
+│  │                 http(代理/限速/超时) · snapshot(原始响应落盘) · validate(zod)
+│  │                 bangumi-data · yuc · anilist · mt(Bing机翻) · provider(统一接口)
+│  └─ server/        db(node:sqlite) · schema.sql · sync(抓取+落库+回填+一键更新)
+│                    changes(延期检测) · server.ts(HTTP) · ics · cli.ts
+├─ web/              界面：index.html · styles.css · app.js（原生 ES 模块，零构建）
+├─ desktop/          Windows 启动器与快捷方式（脚本必须纯 ASCII）
+├─ scripts/          verify(102) · verify-api(28) · ui-smoke · preview-ui
+│                    probe-sources(数据源探测) · diagnose-network
+├─ data/             anime.db + backups/ + cache/（已 gitignore，不入库）
+└─ docs/             数据源实测 · 决策记录(ADR) · 设计方案 · 交接文档
 ```
-
-**为什么是单包而不是 pnpm monorepo**：本项目用 Node 24 原生跑 TypeScript，没有构建步骤。
-单包 + 相对 `.ts` 导入最省事；等 Phase 2 加 Web UI 时，再单独给前端建一个包。
 
 ---
 
-## 技术选型要点
+## 技术选型
 
 | 选择 | 理由 |
 |---|---|
-| Node 24 原生跑 `.ts` | 零构建步骤；`node src/server/cli.ts` 直接跑 |
+| Node 24 **原生跑 `.ts`** | 零构建步骤，`node src/server/cli.ts` 直接跑，改完即生效 |
 | `node:sqlite` | 无原生模块编译问题（Windows 上装 node-gyp 是常见的坑），且零依赖 |
-| undici 而非全局 fetch | 全局 fetch 不读 `HTTPS_PROXY`，而 Bangumi 必须走代理 |
-| TypeScript 5.9 | TS 7（原生版）需要平台二进制包，当前镜像装不上 |
-| zod 校验响应结构 | 源站改版时**早失败**，而不是把脏数据写进库 |
-| 原始响应落盘 | 可离线重放解析、可对比出「延期/改档」、调试时不打源站 |
-| 机翻用 Bing（token 方案） | 实测 Google 系全部不可达、微软官方接口要订阅密钥；Bing 可用且质量最好，MyMemory 兜底 |
+| `undici` 而非全局 fetch | 全局 fetch 不读 `HTTPS_PROXY`，而 Bangumi 必须走代理 |
+| 只监听 `127.0.0.1` | 单人本地工具，不需要鉴权，也不该对外暴露 |
+| 原始响应落盘 | 可离线重放解析、可对比出「延期/改档」、调试时不反复打源站 |
+| 机翻用 Bing | 实测 Google 系全部不可达、微软官方接口要订阅密钥；Bing 可用且质量最好 |
+
+**为什么不用框架**：核心逻辑是时间计算与字段融合，框架帮不上忙；
+不引框架就不需要构建步骤、也不需要几百个依赖。界面用原生 ES 模块 + 一个 `app.js` 就够。
+
+---
+
+## 已知限制 / 路线图
+
+- ✅ 已实现：当季抓取、周视图、全季总览（筛选/排序/多季）、追番与补番库、变更检测、
+  历史季度保留与回填、临时机翻、`.ics` 导出、数据备份与导出、Windows 桌面启动器
+- 🚧 **Bilibili PGC** —— 把「国内几点能看」落到每一集（接口已验证可用，未接入）
+- 🚧 **桌面通知** —— 更新前提醒（`.ics` 已覆盖手机端）
+- 🚧 **补番计划的界面入口** —— 数据层已支持「每周几看 / 每天几集」
+- 🚧 **假重复合并** —— 同一部番偶尔会落成两条记录（标题归一化后不相等、且没有跨源 ID 锚点）。
+  不能草率用「标题包含关系」合：`薬屋のひとりごと 亡妃の秘宝`（剧场版）与
+  `薬屋のひとりごと`（TV）是**两部不同作品**
+- ⬜ 明确不做：在线播放 / 弹幕 / 社交 / 云同步账号 / 独立手机 App
 
 ---
 
 ## 网络问题排查
 
-抓不到东西时**先跑网络诊断，不要用 curl 下结论**：
+抓不到数据时**先跑诊断，不要用 curl 下结论**（PowerShell 与 curl 走 schannel，
+在本机可能全部失败而 Node 正常）：
 
-```powershell
+```bash
 node scripts/diagnose-network.ts
 ```
 
-已知的三个坑：
+已知的坑：
 
-1. **`api.bgm.tv` 被 DNS 污染**（解析到 Facebook 的 IP）→ 需要代理：
-   ```powershell
-   $env:HTTPS_PROXY = "http://127.0.0.1:7890"
-   ```
-2. **`yuc.wiki` 的 HTTPS 证书已过期** → 只能走 `http://`。
-3. **PowerShell / curl 在本机全部失败但 Node 正常**（schannel 拿不到凭证）——
-   判断某个源是否可用必须用 Node 复现。
+1. **`api.bgm.tv` 被 DNS 污染** → 需要代理：`$env:HTTPS_PROXY = "http://127.0.0.1:7890"`
+2. **`yuc.wiki` 的 HTTPS 证书已过期** → 只能走 `http://`
+3. **`diagnose-network.ts` 说源站不可达 ≠ 真的不可达** → 用 Node 复现
 
 ---
 
-## 下一步
+## 文档
 
-按「对你实际有用」的优先级：
+| 文档 | 内容 |
+|---|---|
+| [docs/sources.md](docs/sources.md) | 三个数据源的实测结论（字段、可用性、坑） |
+| [docs/决策记录.md](docs/决策记录.md) | ADR：为什么这么做 |
+| [docs/方案报告-v1.md](docs/方案报告-v1.md) | 最初的设计方案 |
+| [docs/交接说明-第四轮.md](docs/交接说明-第四轮.md) | 自包含的开发交接文档（硬约束、坑、待办） |
 
-1. **接入 Bilibili PGC Provider** —— 把「国内几点能看」落到每一集（`pub_at_utc`）。
-   接口已验证可用，且这是你真正点开看的时刻。
-2. **桌面通知** —— 更新前提醒；`.ics` 已经覆盖手机端，桌面端还差这一步。
-3. **补番计划的界面入口** —— 数据层已支持「每周几看 / 每天看几集」
-   （`planned_weekday_jst` / `planned_eps_per_day`），界面上还没做。
-4. **Bangumi API（需代理）** —— 增益是更准的分集数与制作公司。
-5. **修掉假重复** —— 实测发现同一部番可能落成两条记录
-   （`anilist:210482` 与 `title:jojo奇妙冒险飙马野郎2nd3rdstage` 是同一部，
-   `bgm:505550` 与 `title:darkmachine` 也是）。原因是标题归一化后
-   `ジョジョの奇妙冒険 スティール・ボール・ラン 2nd＆3rd STAGE` 与
-   `JOJO奇妙冒険飙马野郎 2nd&3rd STAGE` 不相等，而两条记录都没有跨源 ID 锚点。
-   影响：官方中文名可能落在「另一条」记录上，所以那 4 部仍缺中文名里有一部分其实是被拆开了。
-   修法要让「包含关系」参与聚类，但要防误合（实测「薬屋のひとりごと 亡妃の秘宝」与
-   「薬屋のひとりごと」是**两部不同的作品**，不能合）—— 所以这是下一轮该认真做的一件事。
-6. **仍未验证的部分**见 [docs/sources.md](docs/sources.md) 第十一节。
+---
 
-**换新对话继续开发时，先看 [docs/交接说明-第四轮.md](docs/交接说明-第四轮.md)**
-（★ 自包含的最新交接文档：硬约束、现状、坑、待办、可直接复制的开场白都在里面）。
+## 许可
 
-已知未做但明确要求过不在范围内的：不接 Bangumi OAuth；不做播放/弹幕/社交/云同步。
+尚未指定 License。如果你想用这份代码，欢迎先提 Issue 说一声。
