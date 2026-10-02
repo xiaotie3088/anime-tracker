@@ -1,0 +1,32 @@
+{
+  "name": "anime-tracker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "当季新番抓取 + 追番管理 + 更新日历 + 补番库（本地优先，单机使用）",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "scripts": {
+    "probe": "node scripts/probe-sources.ts",
+    "preview:ui": "node scripts/preview-ui.ts",
+    "verify": "node scripts/verify.ts",
+    "verify:api": "node scripts/verify-api.ts",
+    "ui:smoke": "node scripts/ui-smoke.ts",
+    "typecheck": "tsc --noEmit",
+    "web": "node src/server/server.ts",
+    "season": "node src/server/cli.ts season",
+    "sync": "node src/server/cli.ts sync",
+    "update": "node src/server/cli.ts update",
+    "translate": "node src/server/cli.ts translate",
+    "backups": "node src/server/cli.ts backups"
+  },
+  "dependencies": {
+    "undici": "^7.0.0",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}

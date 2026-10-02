@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>新番追番日历</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="top">
+      <div class="brand">
+        <span class="logo">◈</span>
+        <h1>新番追番日历</h1>
+        <span class="season-badge" id="season-badge">—</span>
+      </div>
+
+      <div class="controls">
+        <label class="field">
+          <span>季度</span>
+          <select id="season-select"></select>
+        </label>
+
+        <label class="field">
+          <span>日历归属</span>
+          <select id="rule-select">
+            <option value="clock">按真实钟点</option>
+            <option value="broadcast-calendar">按日本放送日历</option>
+          </select>
+        </label>
+
+        <button
+          id="update-btn"
+          class="btn btn-primary"
+          title="一键更新：抓取当季 + 回填历史季度 + 官方译名替换临时机翻 + 缺中文名的做临时机翻"
+        >
+          更新数据
+        </button>
+
+        <!--
+          低频操作收进「更多」菜单：顶栏原来是 5 个按钮 + 2 个下拉挤成一排，
+          窄一点的窗口会换行成两三层。功能一个没少，只是不再占主视线。
+        -->
+        <details class="menu" id="more-menu">
+          <summary class="btn" title="同步与导出">更多 <span class="caret">▾</span></summary>
+          <div class="menu-panel">
+            <button id="sync-btn" class="btn" title="只抓取当前选中的这一季（更快）">只同步本季</button>
+            <button
+              id="translate-btn"
+              class="btn"
+              title="给缺中文名的番加上临时机翻名；官方译名一到，更新数据时会自动替换"
+            >
+              补全中文名（机翻）
+            </button>
+            <a id="ics-link" class="btn" href="/api/ics" title="导入手机系统日历，之后不打开本页面也能看"
+              >导出日历 (.ics)</a
+            >
+            <a
+              id="export-link"
+              class="btn"
+              href="/api/export"
+              title="把你的追番列表、进度、手动修正、变更历史导出成 JSON —— 这些数据不可重建，建议定期留一份"
+              >导出我的数据</a
+            >
+          </div>
+        </details>
+      </div>
+    </header>
+
+    <nav class="tabs">
+      <button class="tab is-active" data-view="week">周视图</button>
+      <button class="tab" data-view="season">全季总览</button>
+      <button class="tab" data-view="my">我的追番 <span class="pill" id="tab-my-count">0</span></button>
+      <button class="tab" data-view="changes">变更 <span class="pill" id="tab-changes-count">0</span></button>
+      <button class="tab" data-view="search">搜索 / 加番</button>
+      <span class="spacer"></span>
+      <span class="status" id="status"></span>
+    </nav>
+
+    <main id="app">
+      <div class="loading">正在加载…</div>
+    </main>
+
+    <div class="modal-backdrop" id="modal-backdrop" hidden>
+      <div class="modal" id="modal" role="dialog" aria-modal="true"></div>
+    </div>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

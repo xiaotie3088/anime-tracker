@@ -1,0 +1,1850 @@
+/**
+ * 新番追番日历 · 前端（原生 ES 模块，无构建步骤）
+ *
+ * 结构很简单：state + 每个视图一个渲染函数 + 用事件委托处理点击。
+ * 刻意的取舍：
+ *   - 不用框架：这个界面只有 4 个视图，引入 React/Vite 会带来构建步骤与几百个依赖，
+ *     而收益（组件复用）在这里并不明显。
+ *   - 倒计时在客户端算：页面开着的时候秒/分钟级地变，不能只依赖服务端返回的文本。
+ */
+
+const $ = (selector, root = document) => root.querySelector(selector);
+const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
+
+const WEEKDAYS = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+
+/**
+ * 类型标签的中文显示（第五轮需求 3）。
+ *
+ * ⚠ 刻意**只做显示映射**，不改数据库里的值：
+ *   - `genre` 是抓取来的原始数据（AniList 给英文、yuc.wiki 给中文），
+ *     写回中文会让「融合字段优先级」和下次同步互相打架（见交接文档第五节第 3 条）。
+ *   - 库里已经是中文的标签（恋爱/机战/转生…）不在表里，原样显示。
+ * 所以这里是"翻译表"，不是"数据字典"。
+ */
+const GENRE_CN = {
+  Action: '动作',
+  Adventure: '冒险',
+  Comedy: '喜剧',
+  Drama: '剧情',
+  Ecchi: '擦边',
+  Fantasy: '奇幻',
+  Hentai: '成人',
+  Horror: '恐怖',
+  'Mahou Shoujo': '魔法少女',
+  Mecha: '机甲',
+  Music: '音乐',
+  Mystery: '悬疑',
+  Psychological: '心理',
+  Romance: '恋爱',
+  'Sci-Fi': '科幻',
+  'Slice of Life': '日常',
+  Sports: '运动',
+  Supernatural: '超自然',
+  Thriller: '惊悚',
+};
+
+/** 类型标签的中文显示名（没有映射的原样返回）。 */
+function genreLabel(genre) {
+  return GENRE_CN[genre] ?? genre;
+}
+
+/** 媒体类型的中文显示名。 */
+const MEDIA_TYPE_CN = { TV: 'TV 动画', MOVIE: '剧场版', OVA: 'OVA', ONA: '网络动画', WEB: '网络动画', SPECIAL: '特别篇' };
+function mediaTypeLabel(mediaType) {
+  return MEDIA_TYPE_CN[mediaType] ?? mediaType;
+}
+
+/** 总览列表的排序口径（与服务端 resolveSeasonSort 的白名单一致）。 */
+const SORT_OPTIONS = [
+  { key: 'firstAir', label: '首集放送时间（早→晚）' },
+  { key: 'firstAirDesc', label: '首集放送时间（晚→早）' },
+  { key: 'weekday', label: '按放送星期 / 时刻' },
+  { key: 'titleCn', label: '按中文名' },
+  { key: 'totalEps', label: '按集数（多→少）' },
+];
+
+/** 番剧列表每行几部（第五轮需求 4）。只在 3~7 之间取值。 */
+const PER_ROW_OPTIONS = [3, 4, 5, 6, 7];
+const PER_ROW_DEFAULT = 4;
+const PER_ROW_MIN = 3;
+const PER_ROW_MAX = 7;
+
+/** 总览里"可多选的分面"四栏，顺序就是界面上的顺序。 */
+const FACET_DIMENSIONS = ['weekdays', 'mediaTypes', 'genres', 'platforms'];
+
+/** localStorage 的键：布局偏好要跨刷新记住，否则每次打开都得重设一遍。 */
+const LS_PER_ROW = 'anime-tracker.perRow';
+const LS_SORT = 'anime-tracker.sort';
+const LS_FILTERS_OPEN = 'anime-tracker.filtersOpen';
+
+function readStoredNumber(key, options, fallback) {
+  const raw = Number(localStorage.getItem(key));
+  return options.includes(raw) ? raw : fallback;
+}
+
+function readStoredString(key, allowed, fallback) {
+  const raw = localStorage.getItem(key);
+  return raw && allowed.includes(raw) ? raw : fallback;
+}
+
+function store(key, value) {
+  try {
+    localStorage.setItem(key, String(value));
+  } catch {
+    /* 隐私模式下写不了 localStorage，忽略即可（只是记不住偏好） */
+  }
+}
+
+const state = {
+  view: 'week',
+  season: null,
+  /** 同时选中的季度（多选，第一个是主季 —— 周视图 / .ics 用它） */
+  selectedSeasons: [],
+  rule: 'clock',
+  offset: 0,
+  myCategory: 'tracking',
+  overview: null,
+  /** 总览的筛选条件：同一维度内多选取并集，跨维度取交集；side 是「我追的/补番库」这类 */
+  filters: { weekdays: [], mediaTypes: [], genres: [], platforms: [], side: [] },
+  filtersOpen: true,
+  /** 四栏分面各自展开着没有（点选后要重绘面板，得把展开状态记住，否则会被重置） */
+  facetsOpen: {},
+  sort: 'firstAir',
+  perRow: PER_ROW_DEFAULT,
+  showAllChanges: false,
+  searchQuery: '',
+  detailKey: null,
+};
+
+// ---------------------------------------------------------------------------
+// 基础工具
+// ---------------------------------------------------------------------------
+
+async function api(path, options = {}) {
+  const response = await fetch(path, {
+    headers: options.body ? { 'content-type': 'application/json' } : undefined,
+    ...options,
+  });
+  const text = await response.text();
+  let payload;
+  try {
+    payload = text ? JSON.parse(text) : {};
+  } catch {
+    throw new Error(`响应不是 JSON：${text.slice(0, 200)}`);
+  }
+  if (!response.ok) throw new Error(payload.error ?? `HTTP ${response.status}`);
+  return payload;
+}
+
+let statusTimer = null;
+function setStatus(text, kind = '') {
+  const el = $('#status');
+  el.textContent = text;
+  el.className = `status${kind ? ` is-${kind}` : ''}`;
+  if (statusTimer) clearTimeout(statusTimer);
+  if (text && kind !== 'error') {
+    statusTimer = setTimeout(() => {
+      el.textContent = '';
+      el.className = 'status';
+    }, 6000);
+  }
+}
+
+function toast(message, isError = false) {
+  const el = document.createElement('div');
+  el.className = `toast${isError ? ' is-error' : ''}`;
+  el.textContent = message;
+  document.body.append(el);
+  setTimeout(() => el.remove(), 2600);
+}
+
+function esc(value) {
+  return String(value ?? '').replace(/[&<>"']/g, (char) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char],
+  );
+}
+
+/** 与服务端一致的放送展示：JST 下的星期与时刻。 */
+function formatJst(iso) {
+  if (!iso) return '—';
+  const ms = Date.parse(iso);
+  if (Number.isNaN(ms)) return '—';
+  const d = new Date(ms + 9 * 3_600_000);
+  return `${WEEKDAYS[d.getUTCDay()]} ${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
+}
+
+function formatCn(iso) {
+  if (!iso) return '—';
+  const ms = Date.parse(iso);
+  if (Number.isNaN(ms)) return '—';
+  const d = new Date(ms + 8 * 3_600_000);
+  return `${d.toISOString().slice(5, 10)} ${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
+}
+
+function humanDuration(ms) {
+  const abs = Math.abs(ms);
+  const minute = 60_000;
+  const hour = 60 * minute;
+  const day = 24 * hour;
+  if (abs < minute) return '不到 1 分钟';
+  const days = Math.floor(abs / day);
+  const hours = Math.floor((abs % day) / hour);
+  const minutes = Math.floor((abs % hour) / minute);
+  if (days > 0) return hours > 0 ? `${days} 天 ${hours} 小时` : `${days} 天`;
+  if (hours > 0) return minutes > 0 ? `${hours} 小时 ${minutes} 分` : `${hours} 小时`;
+  return `${minutes} 分`;
+}
+
+function countdownText(iso) {
+  if (!iso) return '';
+  const diff = Date.parse(iso) - Date.now();
+  return diff > 0 ? `${humanDuration(diff)}后` : '已更新';
+}
+
+function isPast(iso) {
+  return Boolean(iso) && Date.parse(iso) <= Date.now();
+}
+
+/**
+ * 海报。
+ *
+ * `onerror` 是必需的：封面来自远程 CDN，偶发会加载失败（限流 / 网络抖动 / 图被删）。
+ * 失败时 `<img>` 会留下一个空白或**纯黑**的框 —— 用户看到的就是"预览图黑掉了"。
+ * 这里在加载失败时把它换成占位块，至少形状和颜色是对的，不会突兀地黑一块。
+ * （`background` 给的是加载期间的颜色，也在 --cover-bg / --surface-2 里定义，两套主题都协调。）
+ */
+function coverHtml(url, className) {
+  return url
+    ? `<img class="${className}" src="${esc(url)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.onerror=null;this.className='${esc(
+        className,
+      )} ep-cover-ph';this.removeAttribute('src');this.textContent='◈';" />`
+    : `<div class="${className} ep-cover-ph">◈</div>`;
+}
+
+function subjectTitle(item) {
+  return item.titleCn || item.titleOriginal || item.titleEn || item.key;
+}
+
+// ---------------------------------------------------------------------------
+// 视图：周视图
+// ---------------------------------------------------------------------------
+
+function renderWeekLoading() {
+  $('#app').innerHTML = '<div class="loading">正在加载本周安排…</div>';
+}
+
+function weekCard(item) {
+  const past = isPast(item.airAtUtc);
+  const tags = [];
+  if (item.broadcastTimeJst && Number(item.broadcastTimeJst.slice(0, 2)) >= 24) {
+    tags.push('<span class="tag tag-purple" title="日本排期表写作前一天的 24:xx 档">深夜番</span>');
+  }
+  if (item.pubAtUtc) tags.push(`<span class="tag tag-ok">国内 ${esc(formatCn(item.pubAtUtc))}</span>`);
+  if (item.isOverridden) tags.push('<span class="tag tag-warn">手动修正</span>');
+  if (item.conflicting) tags.push('<span class="tag tag-warn">源有分歧</span>');
+
+  return `
+    <div class="ep-card${past ? ' is-past' : ''}" data-key="${esc(item.subjectKey)}">
+      ${coverHtml(item.coverUrl, 'ep-cover')}
+      <div class="ep-main">
+        <div class="ep-title">${esc(subjectTitle(item))}</div>
+        <div class="ep-sub">第 ${esc(item.epNumber)} 话${
+          item.totalEps ? ` / 共 ${esc(item.totalEps)}` : ''
+        } · 已看 ${esc(item.watchedEps ?? 0)}</div>
+        <div class="ep-time">放送 ${esc(formatJst(item.airAtUtc))}</div>
+        <div class="ep-count" data-countdown="${esc(item.airAtUtc ?? '')}">${esc(countdownText(item.airAtUtc))}</div>
+        ${tags.length ? `<div class="ep-tags">${tags.join('')}</div>` : ''}
+      </div>
+    </div>`;
+}
+
+async function renderWeek() {
+  renderWeekLoading();
+  const data = await api(`/api/week?season=${encodeURIComponent(state.season)}&rule=${state.rule}&offset=${state.offset}`);
+
+  const weekTotal = data.days.reduce((sum, day) => sum + day.items.length, 0);
+
+  const upcomingHtml = data.upcoming.length
+    ? `<div class="card dist upcoming">
+         <h3 class="section-title">接下来要更新的</h3>
+         ${data.upcoming
+           .map(
+             (item) => `
+           <div class="bar-row upcoming-row">
+             <span class="name is-strong">${esc(subjectTitle(item))} 第${esc(item.epNumber)}话</span>
+             <span class="num">${esc(formatJst(item.airAtUtc))}</span>
+             <span class="num is-accent" data-countdown="${esc(item.airAtUtc ?? '')}">${esc(
+               countdownText(item.airAtUtc),
+             )}</span>
+           </div>`,
+           )
+           .join('')}
+       </div>`
+    : '';
+
+  // ⚠ 顺序是刻意的（第五轮需求 1）：用户主要看的是下面这排「周一~周日」的格子，
+  //   所以周格子必须在最上面，「接下来要更新的」倒计时列表挪到它下面。
+  $('#app').innerHTML = `
+    <div class="week-nav">
+      <button class="btn btn-sm" data-week-offset="-1">‹ 上一周</button>
+      <button class="btn btn-sm" data-week-offset="0">本周</button>
+      <button class="btn btn-sm" data-week-offset="1">下一周 ›</button>
+      <span class="range">${esc(data.week.startDateJst)} ~ ${esc(data.week.endDateJst)}</span>
+      <span class="hint">共 ${weekTotal} 集 · 归属口径：${
+        data.rule === 'clock' ? '真实钟点' : '日本放送日历'
+      }（可切换）</span>
+    </div>
+    <div class="week-grid">
+      ${data.days
+        .map(
+          (day) => `
+        <div class="day-col card${day.isToday ? ' is-today' : ''}">
+          <div class="day-head">
+            <span class="wd">${esc(day.weekdayLabel)}</span>
+            <span class="dt">${esc(String(day.dateJst).slice(5))} · ${day.items.length} 集</span>
+          </div>
+          <div class="day-body">
+            ${day.items.length ? day.items.map(weekCard).join('') : '<div class="empty day-empty">—</div>'}
+          </div>
+        </div>`,
+        )
+        .join('')}
+    </div>
+    ${
+      weekTotal === 0
+        ? `<div class="empty">这一周没有你追的番更新。<br />
+             如果是第一次用，先去「全季总览」或「搜索 / 加番」把要追的番加进来；
+             也可以点右上角「更新数据」抓取当季清单并回填历史季度。</div>`
+        : ''
+    }
+    ${upcomingHtml}`;
+}
+
+// ---------------------------------------------------------------------------
+// 视图：全季总览
+// ---------------------------------------------------------------------------
+
+function subjectRow(item) {
+  const inList =
+    item.myCategory === 'tracking'
+      ? '<span class="tag tag-ok">追番中</span>'
+      : item.myCategory === 'backlog'
+        ? '<span class="tag tag-purple">补番库</span>'
+        : item.myCategory === 'finished'
+          ? '<span class="tag">已看完</span>'
+          : item.myCategory === 'dropped'
+            ? '<span class="tag">已弃番</span>'
+            : '';
+
+  const weekday = item.broadcastWeekdayJst === null ? null : WEEKDAYS[item.broadcastWeekdayJst];
+  const platforms = [...new Set(item.platforms.map((p) => p.name))];
+  const genres = [...new Set(item.genres)];
+
+  return `
+    <div class="subject-row" data-key="${esc(item.key)}">
+      ${coverHtml(item.coverUrl, 'cover')}
+      <div class="info">
+        <div class="t-cn">${esc(item.titleCn ?? '（无中文名）')} ${machineTag(item.titleCnSource)} ${inList}</div>
+        <div class="t-orig">${esc(item.titleOriginal ?? '')}</div>
+        <div class="meta">
+          <span class="tag">${esc(mediaTypeLabel(item.mediaType))}</span>
+          ${item.totalEps ? `<span class="tag">${esc(item.totalEps)} 话</span>` : '<span class="tag tag-warn">集数未知</span>'}
+          ${
+            item.firstAirAtUtc
+              ? `<span class="tag" title="首集放送时刻（JST），列表默认就按这个排">首播 ${esc(
+                  formatJst(item.firstAirAtUtc),
+                )}</span>`
+              : ''
+          }
+          ${weekday ? `<span class="tag">${esc(weekday)} ${esc(item.broadcastTimeJst ?? '')}</span>` : ''}
+          ${genres
+            .map(
+              (genre) =>
+                `<span class="tag" title="原始标签：${esc(genre)}">${esc(genreLabel(genre))}</span>`,
+            )
+            .join('')}
+          ${platforms.map((name) => `<span class="tag tag-ok">${esc(name)}</span>`).join('')}
+        </div>
+      </div>
+      <div class="actions">
+        ${
+          item.myCategory
+            ? `<button class="btn btn-sm" data-open="${esc(item.key)}">详情</button>
+               <button class="btn btn-sm btn-danger" data-remove="${esc(item.key)}">移除</button>`
+            : // 详情放在追番/补番**之前**：总得先看看是什么番、什么时候放，再决定追还是补。
+              // 原来只有"追番 / 补番"两个按钮，等于逼人在没信息的情况下做选择。
+              `<button class="btn btn-sm" data-open="${esc(item.key)}">详情</button>
+               <button class="btn btn-sm btn-primary" data-add="${esc(item.key)}" data-category="tracking">追番</button>
+               <button class="btn btn-sm" data-add="${esc(item.key)}" data-category="backlog">补番</button>`
+        }
+      </div>
+    </div>`;
+}
+
+/**
+ * 「临时机翻」标记。
+ *
+ * 用户明确要求：机翻名必须是**可区分**的 ——「官方译名出来后一键更新改成官方名」。
+ * 所以不能只写一个中文名就完事，要让人一眼看出这个名字是临时的。
+ */
+function machineTag(source) {
+  if (source !== 'machine') return '';
+  return '<span class="tag tag-warn" title="这是机器翻译的临时译名；官方译名一到，「更新数据」会自动替换成官方名">临时机翻</span>';
+}
+
+/**
+ * 总览的两个"独立"筛选：我追的 / 补番库。
+ * 从原来的 monthFilter 里拆出来的 —— 它和下面那组可点选的分布筛选混在一个字段里，
+ * 加多选时会互相覆盖。
+ */
+function overviewSideFilter() {
+  return state.filters.side ?? [];
+}
+
+/** 只应用"搜索框 + 我追的/补番库 + 状态"这些不在分布面板里的条件。 */
+function baseFilteredSubjects() {
+  const overview = state.overview;
+  if (!overview) return [];
+  const query = state.searchQuery.trim().toLowerCase();
+  const side = overviewSideFilter();
+  return overview.subjects.filter((item) => {
+    if (side.includes('mine') && !item.myCategory) return false;
+    if (side.includes('backlog') && item.myCategory !== 'backlog') return false;
+    if (side.includes('airing') && item.status !== 'airing') return false;
+    if (side.includes('upcoming') && item.status !== 'upcoming') return false;
+    if (side.includes('nozh') && item.titleCn) return false;
+    if (side.includes('bilibili') && !item.platforms.some((p) => p.name.includes('哔哩哔哩'))) return false;
+    if (!query) return true;
+    return [item.titleCn, item.titleOriginal, item.titleEn]
+      .filter(Boolean)
+      .some((title) => String(title).toLowerCase().includes(query));
+  });
+}
+
+/** 某一维度的全部候选值及部数（用于把各部数写在筛选项旁边，替代原来的分布图）。 */
+function dimensionEntries(dimension, items) {
+  if (dimension === 'weekdays') {
+    return WEEKDAYS.map((label, weekday) => ({
+      value: weekday,
+      label,
+      count: items.filter((item) => item.broadcastWeekdayJst === weekday).length,
+    })).filter((entry) => entry.count > 0);
+  }
+  if (dimension === 'mediaTypes') {
+    const counter = new Map();
+    for (const item of items) counter.set(item.mediaType, (counter.get(item.mediaType) ?? 0) + 1);
+    return [...counter.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([value, count]) => ({ value, label: mediaTypeLabel(value), count }));
+  }
+  if (dimension === 'genres') {
+    const counter = new Map();
+    for (const item of items) {
+      for (const genre of new Set(item.genres)) counter.set(genre, (counter.get(genre) ?? 0) + 1);
+    }
+    // 排序用原文（稳定），显示用中文 —— 否则翻译后的中文排序会让同一个标签跳来跳去
+    return [...counter.entries()]
+      .sort((a, b) => b[1] - a[1] || String(a[0]).localeCompare(String(b[0])))
+      .map(([value, count]) => ({ value, label: genreLabel(value), count }));
+  }
+  const counter = new Map();
+  for (const item of items) {
+    for (const name of new Set(item.platforms.map((p) => p.name))) {
+      counter.set(name, (counter.get(name) ?? 0) + 1);
+    }
+  }
+  return [...counter.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([value, count]) => ({ value, label: value, count }));
+}
+
+/** 某维度当前选中的值（统一成字符串，避免 dataset 的 number/string 混用）。 */
+function selectedValues(dimension) {
+  return (state.filters[dimension] ?? []).map(String);
+}
+
+/**
+ * 分布面板里的部数：为了数字稳定好读，一律以「搜索框 + 我追的/补番库」的结果为基数，
+ * 不再叠加同面板里的其他维度选择（否则点一个筛选，旁边的数字会跟着变，越看越糊）。
+ */
+function facetEntries(dimension, base) {
+  return dimensionEntries(dimension, base);
+}
+
+function applyFilters(items) {
+  const filters = state.filters;
+  const weekdays = selectedValues('weekdays');
+  const mediaTypes = selectedValues('mediaTypes');
+  const genres = selectedValues('genres');
+  const platforms = selectedValues('platforms');
+
+  return items.filter((item) => {
+    // 同一维度内多选取并集，跨维度取交集
+    if (weekdays.length && !weekdays.includes(String(item.broadcastWeekdayJst))) return false;
+    if (mediaTypes.length && !mediaTypes.includes(item.mediaType)) return false;
+    if (genres.length && !item.genres.some((genre) => genres.includes(genre))) return false;
+    if (platforms.length) {
+      const names = item.platforms.map((p) => p.name);
+      if (!platforms.some((name) => names.includes(name))) return false;
+    }
+    return true;
+  });
+}
+
+function filteredSubjects() {
+  return applyFilters(baseFilteredSubjects());
+}
+
+/**
+ * 已选条件的提示条（可单删 / 一键清空）。
+ * 面板收起时也必须看得见 —— 否则"怎么列表只剩 3 部"会变成未解之谜。
+ */
+function activeFilterChips() {
+  const chips = [];
+  for (const [dimension, labeler] of [
+    ['weekdays', (value) => WEEKDAYS[Number(value)] ?? `星期 ${value}`],
+    ['mediaTypes', mediaTypeLabel],
+    ['genres', genreLabel],
+    ['platforms', (value) => value],
+  ]) {
+    for (const value of selectedValues(dimension)) {
+      chips.push(
+        `<button class="chip is-active" data-toggle-filter="${esc(dimension)}" data-toggle-value="${esc(
+          value,
+        )}" title="点击取消这个筛选">${esc(labeler(value))} ✕</button>`,
+      );
+    }
+  }
+  for (const [value, label] of [
+    ['mine', '我追的'],
+    ['backlog', '补番库'],
+    ['airing', '放送中'],
+    ['upcoming', '未开播'],
+    ['bilibili', 'B站有版权'],
+    ['nozh', '缺中文名'],
+  ]) {
+    if (overviewSideFilter().includes(value)) {
+      chips.push(
+        `<button class="chip is-active" data-quick-filter="${value}" title="点击取消这个筛选">${label} ✕</button>`,
+      );
+    }
+  }
+  if (chips.length === 0) return '';
+  return `<div class="active-filters">
+      <span class="af-label">已选条件</span>
+      ${chips.join('')}
+      <button class="btn btn-sm" data-clear-filters="1">清空筛选</button>
+    </div>`;
+}
+
+function filterPanelHtml(base) {
+  const sortLabel = (SORT_OPTIONS.find((option) => option.key === state.sort) ?? SORT_OPTIONS[0]).label;
+  // 四栏里一共选了几项 —— 只有选了才显示「清空筛选」，免得平时多一个没用的按钮
+  const facetActiveCount = FACET_DIMENSIONS.reduce(
+    (sum, dimension) => sum + selectedValues(dimension).length,
+    0,
+  );
+  return `
+    <div class="filter-panel" id="filter-panel">
+      <div class="filter-panel-head">
+        <div class="filter-group">
+          <div class="filter-group-head">快速筛选</div>
+          <div class="filter-opts">
+            ${[
+              ['mine', '我追的'],
+              ['backlog', '补番库'],
+              ['airing', '放送中'],
+              ['upcoming', '未开播'],
+              ['bilibili', 'B站有版权'],
+              ['nozh', '缺中文名'],
+            ]
+              .map(([value, label]) => {
+                const active = overviewSideFilter().includes(value);
+                return `<button class="filter-opt${active ? ' is-active' : ''}" data-quick-filter="${value}">${label}<span class="c">${
+                  value === 'mine'
+                    ? base.filter((item) => item.myCategory).length
+                    : value === 'backlog'
+                      ? base.filter((item) => item.myCategory === 'backlog').length
+                      : value === 'airing'
+                        ? base.filter((item) => item.status === 'airing').length
+                        : value === 'upcoming'
+                          ? base.filter((item) => item.status === 'upcoming').length
+                          : value === 'nozh'
+                            ? base.filter((item) => !item.titleCn).length
+                            : base.filter((item) => item.platforms.some((p) => p.name.includes('哔哩哔哩'))).length
+                }</span></button>`;
+              })
+              .join('')}
+          </div>
+        </div>
+        <div class="filter-group">
+          <div class="filter-group-head">排序方式</div>
+          <div class="filter-opts">
+            ${SORT_OPTIONS.map(
+              (option) =>
+                `<button class="filter-opt${state.sort === option.key ? ' is-active' : ''}" data-sort="${
+                  option.key
+                }">${esc(option.label)}</button>`,
+            ).join('')}
+          </div>
+          <div class="filter-note">当前：${esc(sortLabel)}</div>
+        </div>
+        <div class="filter-group">
+          <div class="filter-group-head">每行几部</div>
+          <div class="filter-opts">
+            ${PER_ROW_OPTIONS.map(
+              (n) =>
+                `<button class="filter-opt${state.perRow === n ? ' is-active' : ''}" data-per-row="${n}">${n} 部</button>`,
+            ).join('')}
+          </div>
+          <div class="filter-note">现在的卡片太挤的话，调小一点</div>
+        </div>
+      </div>
+      <div class="filter-row">
+        <label class="field"
+          ><span>放送星期</span>
+          <select id="filter-weekday">
+            <option value="">全部</option>
+            ${facetEntries('weekdays', base)
+              .map((entry) => `<option value="${entry.value}">${esc(entry.label)}（${entry.count}）</option>`)
+              .join('')}
+          </select>
+        </label>
+        <label class="field"
+          ><span>媒体类型</span>
+          <select id="filter-media">
+            <option value="">全部</option>
+            ${facetEntries('mediaTypes', base)
+              .map((entry) => `<option value="${esc(String(entry.value))}">${esc(entry.label)}（${entry.count}）</option>`)
+              .join('')}
+          </select>
+        </label>
+        <label class="field"
+          ><span>类型标签</span>
+          <select id="filter-genre">
+            <option value="">全部</option>
+            ${facetEntries('genres', base)
+              .map((entry) => `<option value="${esc(String(entry.value))}">${esc(entry.label)}（${entry.count}）</option>`)
+              .join('')}
+          </select>
+        </label>
+        <label class="field"
+          ><span>国内平台</span>
+          <select id="filter-platform">
+            <option value="">全部</option>
+            ${facetEntries('platforms', base)
+              .map((entry) => `<option value="${esc(String(entry.value))}">${esc(entry.label)}（${entry.count}）</option>`)
+              .join('')}
+          </select>
+        </label>
+      </div>
+      <div class="filter-facets">
+        <div class="filter-facets-bar">
+          <span class="filter-note is-flush">点标题展开 / 收起每一栏</span>
+          ${facetActiveCount ? '<button class="btn btn-sm" data-clear-filters="1">清空筛选</button>' : ''}
+        </div>
+        ${filterGroupHtml('weekdays', '放送星期', base)}
+        ${filterGroupHtml('mediaTypes', '媒体类型', base)}
+        ${filterGroupHtml('platforms', '国内平台', base)}
+        ${filterGroupHtml('genres', '类型标签', base, { scroll: true })}
+      </div>
+      <div class="filter-note">
+        同一栏里选多个 = 满足任意一个；不同栏之间 = 同时满足。点已选中的项即可取消。
+      </div>
+    </div>`;
+}
+
+/**
+ * 筛选面板里"放送星期 / 媒体类型 / 国内平台 / 类型标签"这四栏。
+ *
+ * 用 `<details>` 做成可折叠：**默认全部收起**（只显示标题 + 已选摘要），
+ * 否则四栏全铺开会把这个面板顶得很长（类型标签有 30 多项），
+ * 反而看不清"我到底筛了什么"。点标题展开。
+ *
+ * 用 `<details>` 而不是自己写开合：浏览器原生支持键盘（Tab 到标题、Enter 展开），
+ * 也不用担心和点击委托互相干扰（summary 不是 button，委托不会命中它）。
+ */
+function filterGroupHtml(dimension, title, base, { scroll = false } = {}) {
+  const all = facetEntries(dimension, base);
+  if (all.length === 0) return '';
+  const selected = selectedValues(dimension);
+  const summary = selected.length
+    ? `<span class="facet-picked">${selected
+        .map((value) => esc(dimensionLabel(dimension, value)))
+        .join('、')}</span>`
+    : '';
+
+  const options = all
+    .map((entry) => {
+      const active = selected.includes(String(entry.value));
+      return `<button class="filter-opt${active ? ' is-active' : ''}"
+                data-toggle-filter="${esc(dimension)}"
+                data-toggle-value="${esc(String(entry.value))}"
+                title="${esc(String(entry.value))}">${esc(entry.label)}<span class="c">${entry.count}</span></button>`;
+    })
+    .join('');
+
+  // 有选中项、或用户自己展开过，就保持展开 —— 刷新 / 点选后不会莫名其妙被收起
+  const open = selected.length > 0 || state.facetsOpen[dimension] === true;
+  return `
+    <details class="filter-facet" data-facet="${esc(dimension)}"${open ? ' open' : ''}>
+      <summary class="facet-head">
+        <span class="facet-title">${esc(title)}</span>
+        <span class="facet-count">${selected.length ? `已选 ${selected.length}` : `${all.length} 项`}</span>
+        ${summary}
+        <span class="facet-caret">▾</span>
+      </summary>
+      <div class="filter-opts${scroll ? ' is-scroll' : ''}">${options}</div>
+    </details>`;
+}
+
+/** 维度 + 取值 → 给人看的标签（折叠标题里的"已选摘要"要用）。 */
+function dimensionLabel(dimension, value) {
+  if (dimension === 'weekdays') return WEEKDAYS[Number(value)] ?? `星期 ${value}`;
+  if (dimension === 'mediaTypes') return mediaTypeLabel(value);
+  if (dimension === 'genres') return genreLabel(value);
+  return value;
+}
+
+/** 把下拉框的值同步成"选中的第一项"，避免重绘后下拉框显示"全部"但列表已被筛过。 */
+function syncFilterSelects() {
+  const map = [
+    ['#filter-weekday', 'weekdays'],
+    ['#filter-media', 'mediaTypes'],
+    ['#filter-genre', 'genres'],
+    ['#filter-platform', 'platforms'],
+  ];
+  for (const [selector, dimension] of map) {
+    const el = $(selector);
+    if (el) el.value = selectedValues(dimension)[0] ?? '';
+  }
+}
+
+/**
+ * 「历史季度会一直保留」的显式说明（用户诉求 4）。
+ *
+ * 数据库层面本来就保留历史季度 —— 但用户看不到这件事，所以要在界面上说出来：
+ * 库里有哪些季度、各有多少部、最后一次更新是什么时候。
+ * 第五轮起这里同时是**多选器**：点一下选中/取消，选多个季度会合并查询。
+ */
+function seasonLibraryNotice(overview) {
+  const summaries = overview.seasonSummaries ?? [];
+  if (summaries.length === 0) return '';
+
+  const selected = state.selectedSeasons.length > 0 ? state.selectedSeasons : [state.season];
+  const chips = summaries
+    .map((item) => {
+      const active = selected.includes(item.season);
+      return `<button class="chip ${active ? 'is-active' : ''}" data-season-toggle="${esc(
+        item.season,
+      )}" aria-pressed="${active ? 'true' : 'false'}" title="点一下选中/取消；选多个季度会合并查询。最后更新：${esc(
+        String(item.updatedAt ?? '').slice(0, 16).replace('T', ' '),
+      )}">${active ? '✓ ' : ''}${esc(item.season)} · ${item.subjects} 部</button>`;
+    })
+    .join('');
+
+  const isMulti = selected.length > 1;
+  return `
+    <div class="card dist card-block">
+      <h3 class="section-title">库里已有的季度（可多选，历史数据会一直保留）</h3>
+      <p class="muted">
+        点季度标签可以<b>同时选多个</b>，下面的番剧列表就是这几季的合集（共 <b>${
+          overview.totals.all
+        }</b> 部），分布与筛选也一起算。
+        同步只写入当季，<b>从不删除</b>任何历史季度 —— 过季的番仍然在库里，随时可以切过去回看。
+        想让更早的季度也进库，点右上角「更新数据」，它会增量回填最近几个季度。
+        ${isMulti ? '<br />⚠ 周视图与 .ics 导出按<b>主季</b>（第一个选中的季度）计算。' : ''}
+      </p>
+      <div class="my-tabs">${chips}</div>
+    </div>`;
+}
+
+function emptyListHtml() {
+  return '<div class="empty">没有匹配的番剧 —— 换个关键词，或点「筛选」把条件放宽</div>';
+}
+
+function subjectListHtml() {
+  const items = filteredSubjects();
+  return items.length ? items.map(subjectRow).join('') : emptyListHtml();
+}
+
+/**
+ * 「每行几部」→ 卡片目标宽度。
+ *
+ * 为什么不是"直接写死 N 列 grid"：那样在窗口还不到 N 列宽时会横向溢出（手机上尤其明显）。
+ * 用 `auto-fill + minmax(目标宽度, 1fr)`：窗口够宽就正好是 N 部一行，
+ * 窗口变窄会自动降列数，永远不溢出。
+ */
+function perRowStyle() {
+  const perRow = PER_ROW_OPTIONS.includes(state.perRow) ? state.perRow : PER_ROW_DEFAULT;
+  return `--per-row-w: calc((100% - ${(perRow - 1) * 10}px) / ${perRow});`;
+}
+
+/**
+ * 只重绘"会被筛选/排序影响的部分"，不动筛选面板本身。
+ *
+ * 为什么分开：面板里有搜索框和四个 select，整块重绘会把焦点和下拉展开状态一起弄丢
+ * （在搜索框里打字时尤其明显）。
+ */
+function refreshSubjectList() {
+  const container = $('#subject-list');
+  if (container) {
+    container.style.cssText = perRowStyle();
+    container.innerHTML = subjectListHtml();
+  }
+  const shown = $('#subject-count');
+  if (shown) {
+    shown.textContent = `显示 ${filteredSubjects().length} / ${baseFilteredSubjects().length} 部`;
+  }
+  const active = $('#active-filters');
+  if (active) active.innerHTML = activeFilterChips();
+  syncFilterSelects();
+}
+
+function renderSeason() {
+  const overview = state.overview;
+  const totals = overview.totals;
+
+  if (state.selectedSeasons.length === 0) state.selectedSeasons = [state.season];
+
+  const base = baseFilteredSubjects();
+  const filterCount =
+    selectedValues('weekdays').length +
+    selectedValues('mediaTypes').length +
+    selectedValues('genres').length +
+    selectedValues('platforms').length +
+    overviewSideFilter().length;
+
+  $('#app').innerHTML = `
+    <div class="stat-row">
+      <div class="stat card"><div class="n">${totals.all}</div><div class="l">${
+        state.selectedSeasons.length > 1 ? `选中 ${state.selectedSeasons.length} 季合计` : '本季番剧总数'
+      }</div></div>
+      <div class="stat card"><div class="n">${totals.airing}</div><div class="l">放送中</div></div>
+      <div class="stat card"><div class="n">${totals.upcoming}</div><div class="l">未开播</div></div>
+      <div class="stat card"><div class="n">${totals.tracking}</div><div class="l">我追的</div></div>
+      <div class="stat card"><div class="n">${totals.backlog}</div><div class="l">补番库</div></div>
+      <div class="stat card"><div class="n">${totals.withoutChineseTitle}</div><div class="l">缺中文名</div></div>
+      <div class="stat card" title="这些名字是机器翻译的临时译名，官方译名一到会自动替换">
+        <div class="n">${totals.machineTranslatedTitle ?? 0}</div><div class="l">临时机翻名</div>
+      </div>
+    </div>
+
+    ${seasonLibraryNotice(overview)}
+
+    <div class="toolbar">
+      <input type="search" id="season-search" placeholder="搜索中文名 / 原名（也可以直接搜别名）" value="${esc(state.searchQuery)}" />
+      <button class="btn ${state.filtersOpen ? 'btn-primary' : ''}" id="filter-toggle" aria-expanded="${
+        state.filtersOpen ? 'true' : 'false'
+      }" title="按放送星期 / 媒体类型 / 类型标签 / 国内平台筛选，并切换排序与每行部数">
+        筛选 / 排序${filterCount ? ` <span class="pill">${filterCount}</span>` : ''} ${state.filtersOpen ? '▲' : '▼'}
+      </button>
+      <span class="hint" id="subject-count">显示 ${filteredSubjects().length} / ${base.length} 部</span>
+    </div>
+
+    ${state.filtersOpen ? filterPanelHtml(base) : ''}
+
+    <div id="active-filters">${activeFilterChips()}</div>
+
+    <div id="subject-list" class="subject-list" style="${perRowStyle()}">${subjectListHtml()}</div>`;
+
+  const search = $('#season-search');
+  if (search) {
+    search.addEventListener('input', (event) => {
+      state.searchQuery = event.target.value;
+      refreshSubjectList();
+    });
+  }
+
+  // 筛选面板里的四个下拉要绑 change（点击事件走不了：select 不触发 click 委托）。
+  // 放在这里统一绑，避免"面板重绘后监听丢了"。
+  renderFilterPanelOnly();
+}
+
+// ---------------------------------------------------------------------------
+// 视图：我的追番 / 补番库
+// ---------------------------------------------------------------------------
+
+async function renderMy() {
+  const data = await api('/api/my');
+  const groups = data.groups;
+  const labels = { tracking: '追番中', backlog: '补番库', finished: '已看完', dropped: '已弃番' };
+
+  const totalMine = Object.values(groups).reduce((sum, list) => sum + list.length, 0);
+  $('#tab-my-count').textContent = String(groups.tracking.length + groups.backlog.length);
+
+  const items = groups[state.myCategory] ?? [];
+
+  const rows = items
+    .map((item) => {
+      const total = item.totalEps;
+      const watched = item.watchedEps;
+      const percent = total ? Math.min(100, Math.round((watched / total) * 100)) : 0;
+      const remainingText =
+        item.remaining === null ? '剩余集数未知' : `还剩 ${item.remaining} 集 · 约 ${humanDuration(item.remaining * (item.durationMin ?? 24) * 60_000)}`;
+
+      const buttons = [];
+      if (state.myCategory === 'tracking' || state.myCategory === 'backlog') {
+        buttons.push(`<button class="btn btn-sm" data-watched="${esc(item.subjectKey)}" data-delta="1">+1 集</button>`);
+        if (watched > 0) buttons.push(`<button class="btn btn-sm" data-watched="${esc(item.subjectKey)}" data-delta="-1">-1</button>`);
+      }
+      if (state.myCategory === 'backlog') {
+        buttons.push(`<button class="btn btn-sm btn-primary" data-category="${esc(item.subjectKey)}" data-to="tracking">移到追番</button>`);
+      } else if (state.myCategory === 'tracking') {
+        buttons.push(`<button class="btn btn-sm" data-category="${esc(item.subjectKey)}" data-to="backlog">移入补番库</button>`);
+      } else {
+        buttons.push(`<button class="btn btn-sm" data-category="${esc(item.subjectKey)}" data-to="tracking">重新追番</button>`);
+      }
+      buttons.push(`<button class="btn btn-sm" data-open="${esc(item.subjectKey)}">详情</button>`);
+      buttons.push(`<button class="btn btn-sm btn-danger" data-remove="${esc(item.subjectKey)}">移除</button>`);
+
+      return `
+        <div class="subject-row">
+          ${coverHtml(item.coverUrl, 'cover')}
+          <div class="info">
+            <div class="t-cn">${esc(item.titleCn ?? '（无中文名）')} ${machineTag(item.titleCnSource)}</div>
+            <div class="t-orig">${esc(item.titleOriginal ?? '')}</div>
+            <div class="progress-wrap">
+              <span class="progress-track"><span class="progress-fill" style="width:${percent}%"></span></span>
+              <span class="progress-text">${esc(watched)}${total ? ` / ${esc(total)}` : ''}</span>
+            </div>
+            <div class="meta">
+              <span class="tag">${esc(item.status)}</span>
+              <span class="tag">${esc(item.season ?? '—')}</span>
+              ${item.category === 'backlog' ? `<span class="tag tag-purple">${esc(remainingText)}</span>` : ''}
+            </div>
+          </div>
+          <div class="actions">${buttons.join('')}</div>
+        </div>`;
+    })
+    .join('');
+
+  $('#app').innerHTML = `
+    <div class="my-tabs">
+      ${Object.entries(labels)
+        .map(
+          ([key, label]) =>
+            `<button class="chip ${state.myCategory === key ? 'is-active' : ''}" data-my-category="${key}">${label} ${
+              groups[key]?.length ?? 0
+            }</button>`,
+        )
+        .join('')}
+      <span class="spacer"></span>
+      <span class="hint search-hint">
+        共 ${totalMine} 部在列表中 ·
+        「更新数据」时会把<b>已播完但没看完</b>的自动移入补番库（并当场告诉你移了哪几部），
+        一集没看的不动
+      </span>
+    </div>
+    ${state.myCategory === 'backlog' ? '<div class="section-title">补番库：没看完的当季番与想看的老番都在这里，支持搜索「搜索 / 加番」加入任意老番</div>' : ''}
+    <div class="subject-list">${rows || '<div class="empty">这个分类还是空的</div>'}</div>`;
+}
+
+// ---------------------------------------------------------------------------
+// 视图：搜索 / 加番
+// ---------------------------------------------------------------------------
+
+function renderSearch() {
+  $('#app').innerHTML = `
+    <div class="toolbar">
+      <input type="search" id="search-input" placeholder="输入中文名 / 日文原名 / 别名，例如「药屋」「芙莉莲」「薬屋」" value="${esc(
+        state.searchQuery,
+      )}" />
+      <button class="btn btn-primary" id="search-go">搜索</button>
+    </div>
+    <div id="search-results"><div class="empty">本地库会先被搜索（支持中文名与别名），随后再从 AniList 远程搜索。</div></div>`;
+
+  const input = $('#search-input');
+  const go = () => {
+    state.searchQuery = input.value.trim();
+    if (state.searchQuery) void doSearch(state.searchQuery);
+  };
+  $('#search-go').addEventListener('click', go);
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') go();
+  });
+  if (state.searchQuery) void doSearch(state.searchQuery);
+}
+
+async function doSearch(keyword) {
+  const container = $('#search-results');
+  container.innerHTML = '<div class="loading">搜索中…</div>';
+  try {
+    const data = await api(`/api/search?q=${encodeURIComponent(keyword)}`);
+    const localHtml = data.local.length
+      ? `<h3 class="section-title">本地库（已有中文名与分集时刻）</h3>
+         <div class="subject-list">${data.local
+           .map(
+             (item) => `
+           <div class="subject-row">
+             ${coverHtml(item.coverUrl, 'cover')}
+             <div class="info">
+               <div class="t-cn">${esc(item.titleCn ?? '（无中文名）')}</div>
+               <div class="t-orig">${esc(item.titleOriginal ?? '')}</div>
+               <div class="meta">
+                 <span class="tag">${esc(item.status)}</span>
+                 <span class="tag">${esc(item.season ?? '—')}</span>
+                 ${item.totalEps ? `<span class="tag">${esc(item.totalEps)} 话</span>` : ''}
+               </div>
+             </div>
+             <div class="actions">
+               <button class="btn btn-sm btn-primary" data-add="${esc(item.key)}" data-category="tracking">加入追番</button>
+               <button class="btn btn-sm" data-add="${esc(item.key)}" data-category="backlog">加入补番库</button>
+             </div>
+           </div>`,
+           )
+           .join('')}</div>`
+      : '<div class="empty empty-inline">本地库没有匹配项</div>';
+
+    const remoteHtml = data.remote.length
+      ? `<h3 class="section-title section-title-spaced">AniList 远程结果（没有中文名，加入后需等季度同步补全）</h3>
+         <p class="muted">
+           加入时会自动归到它的季度，所以之后能在「全季总览」的对应季度里找到它
+           （也可以用「补全中文名（机翻）」给它一个临时译名）。
+         </p>
+         <div class="subject-list">${data.remote
+           .map(
+             (item, index) => `
+           <div class="subject-row">
+             ${coverHtml(item.coverUrl, 'cover')}
+             <div class="info">
+               <div class="t-cn">${esc(item.titleEn ?? '—')}</div>
+               <div class="t-orig">${esc(item.titleOriginal ?? '')}</div>
+               <div class="meta">
+                 <span class="tag">${esc(item.mediaType)}</span>
+                 <span class="tag">${esc(item.status)}</span>
+                 ${item.totalEps ? `<span class="tag">${esc(item.totalEps)} 话</span>` : ''}
+               </div>
+             </div>
+             <div class="actions">
+               <button class="btn btn-sm btn-primary" data-add-remote="${index}" data-category="tracking">加入追番</button>
+               <button class="btn btn-sm" data-add-remote="${index}" data-category="backlog">加入补番库</button>
+             </div>
+           </div>`,
+           )
+           .join('')}</div>`
+      : '<div class="empty empty-inline">远程没有结果（AniList 只认日文/英文名，试试原名）</div>';
+
+    container.innerHTML = `${localHtml}${remoteHtml}${
+      data.remoteError ? `<div class="empty" style="color:var(--warn)">远程搜索失败：${esc(data.remoteError)}</div>` : ''
+    }`;
+
+    // 远程结果需要先把原始条目写入本地库才能加入列表
+    state._remoteCache = data.remote;
+  } catch (error) {
+    container.innerHTML = `<div class="empty" style="color:var(--danger)">搜索失败：${esc(error.message)}</div>`;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 视图：变更（延期 / 改档检测结果）
+// ---------------------------------------------------------------------------
+
+async function refreshChangeBadge() {
+  try {
+    const data = await api('/api/changes');
+    const pill = $('#tab-changes-count');
+    pill.textContent = String(data.changes.length);
+    pill.style.borderColor = data.changes.length > 0 ? 'var(--warn)' : '';
+    pill.style.color = data.changes.length > 0 ? 'var(--warn)' : '';
+  } catch {
+    // 徽标失败不该打断界面
+  }
+}
+
+async function renderChanges() {
+  const data = await api('/api/changes?all=' + (state.showAllChanges ? '1' : '0'));
+  const changes = data.changes;
+
+  const kindClass = (kind) =>
+    kind === 'delayed'
+      ? 'tag-warn'
+      : kind === 'advanced'
+        ? 'tag-accent'
+        : kind === 'episode-added'
+          ? 'tag-ok'
+          : 'tag-purple';
+
+  $('#app').innerHTML = `
+    <div class="toolbar">
+      <button class="btn btn-sm ${state.showAllChanges ? '' : 'btn-primary'}" data-changes-filter="pending">待处理 ${data.pending}</button>
+      <button class="btn btn-sm ${state.showAllChanges ? 'btn-primary' : ''}" data-changes-filter="all">全部</button>
+      <span class="spacer"></span>
+      ${
+        changes.some((change) => !change.acknowledged)
+          ? '<button class="btn btn-sm" data-ack-all="1">全部标记已读</button>'
+          : ''
+      }
+    </div>
+    <div class="card dist">
+      <h3 class="section-title">变更记录</h3>
+      <p class="muted">
+        每次「同步当季」时会与库里的历史时刻做对比。同一部番的时间被改动才会记在这里 ——
+        因数据源切换或秒级抖动造成的差异会被自动过滤。
+      </p>
+      ${
+        changes.length === 0
+          ? '<div class="empty empty-inline">没有变更记录。改档/延期是在同步时通过对比历史发现的，多同步几次就会积累出来。</div>'
+          : changes
+              .map(
+                (change) => `
+        <div class="ep-line" style="align-items:center">
+          <span class="no" style="width:74px">
+            <span class="tag ${kindClass(change.kind)}">${esc(change.kindLabel)}</span>
+          </span>
+          <span class="t">
+            <b>${esc(change.title ?? change.subjectKey)}</b>
+            <div class="change-msg">${esc(change.message)}</div>
+          </span>
+          <span class="at change-at">${esc(change.detectedAt.slice(5, 16).replace('T', ' '))}</span>
+          <button class="btn btn-sm" data-open="${esc(change.subjectKey)}">详情</button>
+        </div>`,
+              )
+              .join('')
+      }
+    </div>`;
+
+  await refreshChangeBadge();
+}
+
+// ---------------------------------------------------------------------------
+// 番剧详情卡
+// ---------------------------------------------------------------------------
+
+async function openDetail(key) {
+  const backdrop = $('#modal-backdrop');
+  const modal = $('#modal');
+  state.detailKey = key;
+  modal.innerHTML = '<div class="loading">加载中…</div>';
+  backdrop.hidden = false;
+
+  try {
+    const { subject } = await api(`/api/subject/${encodeURIComponent(key)}`);
+    const my = subject.my;
+    const watched = my?.watchedEps ?? 0;
+
+    const fields = [
+      ['放送', subject.broadcastWeekdayJst === null ? '—' : `${WEEKDAYS[subject.broadcastWeekdayJst]} ${subject.broadcastTimeJst ?? ''}（JST）`],
+      ['首播', subject.firstAirAtUtc ? `${formatJst(subject.firstAirAtUtc)}（JST）` : '—'],
+      ['集数', subject.totalEps ? `${subject.totalEps} 话` : '未知'],
+      ['制作', subject.studios.length ? subject.studios.join(' / ') : '—'],
+      ['类型', subject.genres.length ? subject.genres.join(' / ') : '—'],
+      ['平台', [...new Set(subject.platforms.map((p) => p.name))].join(' / ') || '—'],
+      ['状态', subject.status],
+      ['数据源', subject.sources.join(' + ') || '—'],
+    ];
+
+    if (my) {
+      const remaining = subject.totalEps ? Math.max(0, subject.totalEps - watched) : null;
+      fields.push([
+        '我的进度',
+        `${watched}${subject.totalEps ? ` / ${subject.totalEps}` : ''}${
+          remaining === null ? '（总集数未知）' : `　还剩 ${remaining} 集 · 约 ${humanDuration(remaining * (subject.durationMin ?? 24) * 60_000)}`
+        }`,
+      ]);
+    }
+
+    modal.innerHTML = `
+      <div class="modal-head">
+        ${coverHtml(subject.coverUrl, '')}
+        <div class="h-info">
+          <h2>${esc(subject.titleCn ?? subject.titleOriginal ?? subject.key)}</h2>
+          <div class="orig">${esc(subject.titleOriginal ?? '')}${subject.titleEn ? ` · ${esc(subject.titleEn)}` : ''}</div>
+          <div class="meta">
+            <span class="tag">${esc(subject.mediaType)}</span>
+            <span class="tag">${esc(subject.season ?? '—')}</span>
+            ${my ? `<span class="tag tag-ok">${esc({ tracking: '追番中', backlog: '补番库', finished: '已看完', dropped: '已弃番' }[my.category] ?? my.category)}</span>` : ''}
+          </div>
+        </div>
+        <button class="close-x" data-close="1">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="kv">
+          ${fields.map(([k, v]) => `<div class="k">${esc(k)}</div><div class="v">${esc(v)}</div>`).join('')}
+        </div>
+        ${
+          subject.episodes.length
+            ? `<h3 class="section-title">分集（共 ${subject.episodes.length} 集已知）</h3>
+               <div class="ep-list">
+                 ${subject.episodes
+                   .map(
+                     (ep) => `
+                   <div class="ep-line${ep.epNumber <= watched ? ' is-watched' : ''}${ep.airAtUtc && ep.airAtUtc >= new Date().toISOString() && ep.epNumber === subject.episodes.find((x) => x.airAtUtc && x.airAtUtc >= new Date().toISOString())?.epNumber ? ' is-next' : ''}">
+                     <span class="no">${ep.epNumber <= watched ? '✓' : ''} ${esc(ep.epNumber)}</span>
+                     <span class="t">${esc(ep.titleCn ?? ep.title ?? '')}</span>
+                     <span class="at">${esc(formatJst(ep.airAtUtc))}</span>
+                     <span class="at ep-line-source">${esc(ep.airSource ?? '')}</span>
+                   </div>`,
+                   )
+                   .join('')}
+               </div>`
+            : '<div class="empty empty-inline">还没有分集数据 —— 在周视图里加进追番后，同步一次就会有了</div>'
+        }
+      </div>
+      <div class="modal-actions">
+        ${
+          my
+            ? `<button class="btn btn-primary" data-watched="${esc(key)}" data-delta="1" data-reload="1">看了一集 (+1)</button>
+               <button class="btn" data-category="${esc(key)}" data-to="${my.category === 'backlog' ? 'tracking' : 'backlog'}" data-reload="1">${
+                 my.category === 'backlog' ? '移到追番中' : '移入补番库'
+               }</button>
+               <button class="btn btn-danger" data-remove="${esc(key)}" data-reload="1">移除</button>`
+            : `<button class="btn btn-primary" data-add="${esc(key)}" data-category="tracking" data-reload="1">加入追番</button>
+               <button class="btn" data-add="${esc(key)}" data-category="backlog" data-reload="1">加入补番库</button>`
+        }
+        ${subject.siteUrl ? `<a class="btn" href="${esc(subject.siteUrl)}" target="_blank" rel="noreferrer">打开 Bangumi 页面</a>` : ''}
+        ${
+          subject.platforms.find((p) => p.url)
+            ? `<a class="btn" href="${esc(subject.platforms.find((p) => p.url).url)}" target="_blank" rel="noreferrer">去 ${esc(
+                subject.platforms.find((p) => p.url).name,
+              )} 看</a>`
+            : ''
+        }
+      </div>
+      ${
+        subject.fieldSources && Object.keys(subject.fieldSources).length
+          ? `<div class="modal-body modal-sources">
+               字段来源：${Object.entries(subject.fieldSources)
+                 .map(([field, source]) => `${esc(field)} ← ${esc(source)}`)
+                 .join('　')}
+             </div>`
+          : ''
+      }`;
+  } catch (error) {
+    modal.innerHTML = `<div class="modal-body"><div class="empty" style="color:var(--danger)">加载失败：${esc(
+      error.message,
+    )}</div></div>`;
+  }
+}
+
+function closeDetail() {
+  $('#modal-backdrop').hidden = true;
+  state.detailKey = null;
+}
+
+// ---------------------------------------------------------------------------
+// 动作
+// ---------------------------------------------------------------------------
+
+async function addToList(subjectKey, category, reloadDetail = false) {
+  await api('/api/my', { method: 'POST', body: JSON.stringify({ subjectKey, category }) });
+  toast(category === 'backlog' ? '已加入补番库' : '已加入追番');
+  await refresh(reloadDetail);
+}
+
+async function patchMy(subjectKey, patch, reloadDetail = false) {
+  await api(`/api/my/${encodeURIComponent(subjectKey)}`, { method: 'PATCH', body: JSON.stringify(patch) });
+  await refresh(reloadDetail);
+}
+
+async function removeFromList(subjectKey, reloadDetail = false) {
+  await api(`/api/my/${encodeURIComponent(subjectKey)}`, { method: 'DELETE' });
+  toast('已从列表移除');
+  await refresh(reloadDetail);
+}
+
+async function syncSeason() {
+  const button = $('#sync-btn');
+  button.disabled = true;
+  setStatus('正在同步本季数据…');
+  try {
+    const result = await api(`/api/sync?season=${encodeURIComponent(state.season)}`, { method: 'POST' });
+    const failed = result.reports.filter((report) => !report.ok);
+    const changeCount = (result.changes ?? []).length;
+    setStatus(
+      `同步完成：写入 ${result.written} 部 / ${result.episodeCount} 集` +
+        (result.archive.toBacklog.length ? ` · ${result.archive.toBacklog.length} 部移入补番库` : '') +
+        (changeCount ? ` · 检测到 ${changeCount} 条改档` : '') +
+        (failed.length ? ` · ${failed.length} 个源失败` : ''),
+      failed.length ? 'error' : 'ok',
+    );
+    reportArchiveMove(result.moved ?? result.archive.moved ?? []);
+    if (changeCount) toast(`检测到 ${changeCount} 条延期/改档，已记入「变更」`);
+    for (const report of failed) toast(`${report.provider} 失败：${(report.error ?? '').split('\n')[0]}`, true);
+    await refresh();
+    await refreshChangeBadge();
+  } catch (error) {
+    setStatus(`同步失败：${error.message}`, 'error');
+  } finally {
+    button.disabled = false;
+  }
+}
+
+/**
+ * 把「哪几部番被自动移进了补番库/已看完」明确告诉用户。
+ *
+ * 这一步很重要：自动归档本身是 D6/T8 要的行为，不能删；
+ * 但它会让番从「追番中」消失，用户会以为记录丢了（见 docs/交接说明-第二轮.md P0-5）。
+ * 所以必须主动说出来 —— 沉默的自动搬运就是「记录消失」。
+ */
+function reportArchiveMove(moved) {
+  if (!moved || moved.length === 0) return;
+  const names = moved.map((item) => `${item.title}（${item.to === 'backlog' ? '补番库' : '已看完'}）`);
+  toast(`已自动移动 ${moved.length} 部：${names.slice(0, 3).join('、')}${names.length > 3 ? ' 等' : ''}`);
+}
+
+/** 一键更新数据：当季 + 历史回填 + 官方名替换机翻 + 缺中文名的机翻。 */
+async function updateData() {
+  const button = $('#update-btn');
+  button.disabled = true;
+  setStatus('正在更新数据：抓取当季 → 回填历史季度 → 补中文名…（可能要 1~2 分钟）');
+
+  // 机翻是逐条串行的，进度只能靠轮询状态文案；先给一个会变的提示
+  let tick = 0;
+  const timer = setInterval(() => {
+    tick += 1;
+    setStatus(`正在更新数据…已等待 ${tick * 2} 秒（回填历史季度与机翻都比较慢，请勿关闭页面）`);
+  }, 2000);
+
+  try {
+    const result = await api(`/api/update?season=${encodeURIComponent(state.season)}&backfill=3`, { method: 'POST' });
+    const summary = result.summary;
+
+    const parts = [
+      `写入 ${summary.written} 部 / ${summary.episodes} 集`,
+      summary.machineFilled ? `机翻补齐 ${summary.machineFilled} 个中文名` : '',
+      summary.officialReplaced ? `官方名替换 ${summary.officialReplaced} 个` : '',
+      summary.movedToBacklog ? `${summary.movedToBacklog} 部移入补番库` : '',
+      summary.changeCount ? `检测到 ${summary.changeCount} 条改档` : '',
+      summary.failedProviders.length ? `${summary.failedProviders.length} 个源失败` : '',
+    ].filter(Boolean);
+
+    setStatus(`更新完成：${parts.join(' · ')}`, summary.failedProviders.length ? 'error' : 'ok');
+
+    reportArchiveMove(result.current?.moved ?? []);
+    if (summary.machineFilled) {
+      toast(
+        `已用机翻补上 ${summary.machineFilled} 个临时中文名（标了「临时机翻」）；` +
+          `官方译名一到，再点一次「更新数据」就会自动替换`,
+      );
+    }
+    if (summary.officialReplaced) {
+      toast(`官方译名替换掉了 ${summary.officialReplaced} 个临时机翻名`);
+    }
+    for (const provider of summary.failedProviders) toast(`${provider} 失败`, true);
+    if (summary.translationFailures) toast(`有 ${summary.translationFailures} 条机翻失败（不影响其它数据）`, true);
+
+    showUpdateDetail(result);
+    await refresh();
+    await refreshChangeBadge();
+  } catch (error) {
+    setStatus(`更新失败：${error.message}`, 'error');
+  } finally {
+    clearInterval(timer);
+    button.disabled = false;
+  }
+}
+
+/** 更新完成后把明细摊在界面上 —— 汇总成一句话会说谎，明细不会。 */
+function showUpdateDetail(result) {
+  const summary = result.summary;
+  const lines = [];
+
+  lines.push(
+    `<b>当季</b>：写入 ${summary.written - (result.archive?.totalWritten ?? 0)} 部 / ${
+      summary.episodes - (result.archive?.totalEpisodes ?? 0)
+    } 集`,
+  );
+
+  const seasons = result.archive?.seasons ?? [];
+  if (seasons.length > 0) {
+    const detail = seasons
+      .map((item) => {
+        const mark = item.status === 'fetched' ? '✓' : item.status === 'skipped' ? '·' : '!';
+        return `${mark} ${item.season}${item.status === 'fetched' ? `（${item.written} 部）` : item.note ? `（${item.note}）` : ''}`;
+      })
+      .join('　');
+    lines.push(`<b>历史回填</b>：${detail}`);
+  }
+
+  if (result.seasonsRepaired) {
+    lines.push(`<b>季度归属纠正</b>：${result.seasonsRepaired} 条（按各自的放送时刻重新归到正确的季度）`);
+  }
+  if (result.healed?.replaced) lines.push(`<b>官方译名替换临时机翻</b>：${result.healed.replaced} 部`);
+  if (result.translated?.count) {
+    const samples = (result.translated.titles ?? [])
+      .slice(0, 6)
+      .map((item) => `${esc(item.titleOriginal)} → ${esc(item.titleCn)}`)
+      .join('　');
+    lines.push(`<b>临时机翻补齐</b>：${result.translated.count} 部　<span class="change-msg">${samples}</span>`);
+  }
+  if (result.translated?.failed?.length) {
+    lines.push(
+      `<span style="color:var(--warn)"><b>机翻失败</b>：${result.translated.failed.length} 条（${
+        result.translated.failed[0]?.error ?? ''
+      }）</span>`,
+    );
+  }
+  if (result.backup) lines.push(`<b>更新前已自动备份</b>：<code>${esc(String(result.backup.path).split('\\').pop())}</code>`);
+
+  const panel = document.createElement('div');
+  panel.className = 'card dist';
+  panel.style.marginTop = '16px';
+  panel.innerHTML = `
+    <h3 class="section-title">上次「更新数据」的明细</h3>
+    <div class="update-lines">${lines.join('<br />')}</div>
+    <div class="update-actions">
+      <a class="btn btn-sm" href="/api/export" title="导出追番列表与进度">导出我的数据</a>
+      <button class="btn btn-sm" data-dismiss-update="1">知道了</button>
+    </div>`;
+  $('#app').prepend(panel);
+}
+
+/** 只补中文名（机翻）。官方译名一到，更新数据会自动替换。 */
+async function translateMissing() {
+  const button = $('#translate-btn');
+  button.disabled = true;
+  setStatus('正在为缺中文名的番做临时机翻…（逐条串行，可能要一会儿）');
+  try {
+    const result = await api(`/api/translate?season=${encodeURIComponent(state.season)}`, { method: 'POST' });
+    setStatus(
+      `机翻完成：补上 ${result.translatedCount} 个中文名` +
+        (result.skipped ? ` · 跳过 ${result.skipped} 部（纯拉丁原名等不需要翻）` : '') +
+        (result.failed.length ? ` · ${result.failed.length} 条失败` : '') +
+        ` · 本季仍缺中文名 ${result.remaining} 部`,
+      result.failed.length ? 'error' : 'ok',
+    );
+    if (result.translatedCount) {
+      toast(`已补上 ${result.translatedCount} 个临时中文名；官方译名一到，点「更新数据」会自动替换`);
+    } else {
+      toast('没有需要机翻的条目');
+    }
+    await refresh();
+  } catch (error) {
+    setStatus(`机翻失败：${error.message}`, 'error');
+  } finally {
+    button.disabled = false;
+  }
+}
+
+/** 重新拉数据并重绘当前视图（改完追番列表后调用）。 */
+async function refresh(reloadDetail = false) {
+  try {
+    if (state.view === 'week') await renderWeek();
+    else if (state.view === 'season') {
+      await loadOverview();
+      renderSeason();
+    } else if (state.view === 'my') await renderMy();
+    else if (state.view === 'changes') await renderChanges();
+    else if (state.view === 'search') void doSearch(state.searchQuery);
+
+    if (reloadDetail && state.detailKey) await openDetail(state.detailKey);
+  } catch (error) {
+    setStatus(error.message, 'error');
+  }
+}
+
+async function switchView(view) {
+  state.view = view;
+  $$('.tab').forEach((tab) => tab.classList.toggle('is-active', tab.dataset.view === view));
+
+  if (view === 'week') await renderWeek();
+  else if (view === 'season') {
+    if (!state.overview) await loadOverview();
+    renderSeason();
+  } else if (view === 'my') await renderMy();
+  else if (view === 'changes') await renderChanges();
+  else renderSearch();
+}
+
+// ---------------------------------------------------------------------------
+// 初始化
+// ---------------------------------------------------------------------------
+
+async function bootstrap() {
+  // 先恢复布局偏好，再拉数据 —— 排序口径要跟着请求一起发给服务端
+  state.perRow = readStoredNumber(LS_PER_ROW, PER_ROW_OPTIONS, PER_ROW_DEFAULT);
+  state.sort = readStoredString(
+    LS_SORT,
+    SORT_OPTIONS.map((option) => option.key),
+    'firstAir',
+  );
+  state.filtersOpen = localStorage.getItem(LS_FILTERS_OPEN) !== '0';
+
+  const health = await api('/api/health');
+  const current = await api(`/api/overview?season=&sort=${encodeURIComponent(state.sort)}`);
+
+  state.season = current.season.id;
+  state.selectedSeasons = [current.season.id];
+  state.overview = current;
+
+  const select = $('#season-select');
+  const seasons = [...new Set([current.season.id, ...current.availableSeasons])];
+  const subjectCounts = new Map((current.seasonSummaries ?? []).map((item) => [item.season, item.subjects]));
+  select.innerHTML = seasons
+    .map((id) => {
+      const count = subjectCounts.get(id);
+      const label = count === undefined ? `${id}（库里没有）` : `${id} · ${count} 部`;
+      return `<option value="${esc(id)}"${id === state.season ? ' selected' : ''}>${esc(label)}</option>`;
+    })
+    .join('');
+  $('#tab-my-count').textContent = String(current.totals.tracking + current.totals.backlog);
+  syncSeasonUi();
+
+  if (health.stats.subjects === 0) {
+    setStatus('本地库还是空的，点右上角「更新数据」开始（也可以先「只同步本季」快速看当季）');
+  }
+
+  await refreshChangeBadge();
+  await switchView('week');
+}
+
+// 顶部控制区的按钮自己绑了监听，所以要在事件委托里排除掉，
+// 否则点一次会跑两遍（「更新数据」跑两遍 = 两倍的源站请求与机翻额度）。
+// 这是加固时发现的既有缺陷：界面上点了会重复触发，只是以前的两个按钮恰好幂等才没暴露。
+const SELF_HANDLED = new Set(['update-btn', 'sync-btn', 'translate-btn']);
+
+/**
+ * 收起顶栏的「更多」菜单。
+ *
+ * `<details>` 自己管开合，但它**不会**在点别处时自动关 —— 不补这个的话菜单会一直挂着，
+ * 挡住下面的内容。点菜单里的按钮时也顺手关掉（动作本身照常执行）。
+ */
+function closeMoreMenu() {
+  const menu = $('#more-menu');
+  if (menu?.open) menu.open = false;
+}
+
+// 事件委托：所有按钮都在这里统一处理，避免给每个元素单独绑事件
+document.addEventListener('click', (event) => {
+  if (!event.target.closest('#more-menu')) closeMoreMenu();
+
+  const target = event.target.closest('button, a');
+  if (!target) {
+    if (event.target.id === 'modal-backdrop') closeDetail();
+    return;
+  }
+  if (target.id && SELF_HANDLED.has(target.id)) return;
+
+  // 「筛选」面板的开关：它只折叠/展开面板，不需要重新拉数据。
+  if (target.id === 'filter-toggle') {
+    state.filtersOpen = !state.filtersOpen;
+    store(LS_FILTERS_OPEN, state.filtersOpen ? '1' : '0');
+    renderSeason();
+    return;
+  }
+  // ⚠ 这里**不能**写 `if (target.closest('#filter-panel')) return;`。
+  //   那是把筛选块放在面板外面时的写法（点击委托只管面板外的元素）。
+  //   第五轮把筛选块折进面板之后，所有 data-toggle-filter / data-quick-filter /
+  //   data-per-row / data-sort 按钮**都在面板里** —— 加这句会把它们全部吃掉：
+  //   表现就是"点筛选块毫无反应、也不高亮"，而四个 <select> 照常能用
+  //   （它们走 change 事件，不经过点击委托）。这正是第六轮踩到的真 bug。
+  //   面板内部的交互本来就是靠点击委托统一处理的，所以这里直接往下走。
+
+  const dataset = target.dataset;
+
+  if (dataset.dismissUpdate) {
+    target.closest('.card')?.remove();
+    return;
+  }
+  if (dataset.seasonToggle) {
+    void toggleSeason(dataset.seasonToggle);
+    return;
+  }
+  if (dataset.weekOffset !== undefined) {
+    state.offset = Number(dataset.weekOffset);
+    void renderWeek();
+    return;
+  }
+  // ---- 全季总览的筛选 / 排序 / 每行几部：只重绘列表，不重绘面板（保住搜索框焦点） ----
+  if (dataset.toggleFilter) {
+    const dimension = dataset.toggleFilter;
+    const value = String(dataset.toggleValue ?? '');
+    const current = state.filters[dimension] ?? [];
+    const index = current.findIndex((item) => String(item) === value);
+    if (index >= 0) current.splice(index, 1);
+    else current.push(value);
+    state.filters[dimension] = current;
+    refreshSubjectList();
+    renderFilterPanelOnly();
+    return;
+  }
+  if (dataset.quickFilter) {
+    const value = dataset.quickFilter;
+    const current = state.filters.side ?? [];
+    const index = current.indexOf(value);
+    if (index >= 0) current.splice(index, 1);
+    else current.push(value);
+    state.filters.side = current;
+    refreshSubjectList();
+    renderFilterPanelOnly();
+    return;
+  }
+  if (dataset.clearFilters) {
+    state.filters = { weekdays: [], mediaTypes: [], genres: [], platforms: [], side: [] };
+    refreshSubjectList();
+    renderFilterPanelOnly();
+    return;
+  }
+  if (dataset.perRow) {
+    const perRow = Number(dataset.perRow);
+    if (PER_ROW_OPTIONS.includes(perRow)) {
+      state.perRow = perRow;
+      store(LS_PER_ROW, perRow);
+    }
+    refreshSubjectList();
+    renderFilterPanelOnly();
+    return;
+  }
+  if (dataset.sort) {
+    void changeSort(dataset.sort);
+    return;
+  }
+  if (dataset.myCategory) {
+    state.myCategory = dataset.myCategory;
+    void renderMy();
+    return;
+  }
+  if (dataset.changesFilter) {
+    state.showAllChanges = dataset.changesFilter === 'all';
+    void renderChanges();
+    return;
+  }
+  if (dataset.ackAll) {
+    void (async () => {
+      try {
+        const result = await api('/api/changes/ack', { method: 'POST', body: JSON.stringify({}) });
+        toast(`已标记 ${result.acknowledged} 条变更为已读`);
+        await renderChanges();
+      } catch (error) {
+        toast(error.message, true);
+      }
+    })();
+    return;
+  }
+  if (dataset.open) {
+    void openDetail(dataset.open);
+    return;
+  }
+  if (dataset.close) {
+    closeDetail();
+    return;
+  }
+  if (dataset.add) {
+    void addToList(dataset.add, dataset.category ?? 'tracking', dataset.reload === '1');
+    return;
+  }
+  if (dataset.addRemote !== undefined) {
+    const item = (state._remoteCache ?? [])[Number(dataset.addRemote)];
+    if (!item?.raw) return;
+    // 远程条目先落库，再入列表：服务端 add 需要库里已存在该 subject
+    void (async () => {
+      try {
+        setStatus('正在写入这部番…');
+        const written = await api(
+          `/api/search/import?season=${encodeURIComponent(state.season)}`,
+          { method: 'POST', body: JSON.stringify({ raw: item.raw }) },
+        );
+        // 季度回填结果要说出来：否则从搜索加入的番在全季总览里找不到，会让人以为"加进去的番没了"
+        if (written.season) {
+          toast(`已归到 ${written.season} 季，可在季度下拉框切过去查看`);
+        }
+        await addToList(written.subjectKey, dataset.category ?? 'tracking');
+        setStatus('');
+      } catch (error) {
+        toast(`写入失败：${error.message}`, true);
+      }
+    })();
+    return;
+  }
+  if (dataset.watched) {
+    const delta = Number(dataset.delta ?? 1);
+    void (async () => {
+      try {
+        const { subject } = await api(`/api/subject/${encodeURIComponent(dataset.watched)}`);
+        const next = Math.max(0, (subject.my?.watchedEps ?? 0) + delta);
+        await patchMy(dataset.watched, { watchedEps: next }, dataset.reload === '1');
+      } catch (error) {
+        toast(error.message, true);
+      }
+    })();
+    return;
+  }
+  if (dataset.category && dataset.to) {
+    void patchMy(dataset.category, { category: dataset.to }, dataset.reload === '1');
+    return;
+  }
+  if (dataset.remove) {
+    void removeFromList(dataset.remove, dataset.reload === '1');
+    return;
+  }
+});
+
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') {
+    // Esc 优先收菜单（它比详情弹窗更"浅"），没有菜单开着再关弹窗
+    const menu = $('#more-menu');
+    if (menu?.open) {
+      menu.open = false;
+      return;
+    }
+    closeDetail();
+  }
+});
+
+$('#update-btn').addEventListener('click', () => void updateData());
+$('#sync-btn').addEventListener('click', () => void syncSeason());
+$('#translate-btn').addEventListener('click', () => void translateMissing());
+
+/** 请求总览时带上"选中的季度们"和排序口径。 */
+function overviewQuery() {
+  const seasons = state.selectedSeasons.length > 0 ? state.selectedSeasons : [state.season];
+  return `season=${encodeURIComponent(seasons.join(','))}&sort=${encodeURIComponent(state.sort)}`;
+}
+
+/** 拉一次总览并把它应用到界面上（季度 / 排序变了都走这里）。 */
+async function loadOverview() {
+  state.overview = await api(`/api/overview?${overviewQuery()}`);
+  return state.overview;
+}
+
+/** 主季 = 选中的第一个季度。周视图、.ics 都是单季口径，用主季。 */
+function primarySeason() {
+  return state.selectedSeasons[0] ?? state.season;
+}
+
+/** 界面上的季度徽标 / .ics 链接 / 下拉框，都跟着"选中集合"走。 */
+function syncSeasonUi() {
+  const count = state.selectedSeasons.length;
+  const badge = $('#season-badge');
+  if (badge) {
+    badge.textContent =
+      count > 1
+        ? `${state.selectedSeasons[0]} 等 ${count} 季`
+        : (state.overview?.season?.label ?? primarySeason());
+  }
+  const ics = $('#ics-link');
+  if (ics) ics.href = `/api/ics?season=${encodeURIComponent(primarySeason())}&rule=${state.rule}`;
+  const select = $('#season-select');
+  if (select) select.value = primarySeason();
+}
+
+/** 点季度标签：选中 / 取消（可多选）。 */
+async function toggleSeason(seasonId) {
+  const index = state.selectedSeasons.indexOf(seasonId);
+  if (index >= 0) {
+    // 不允许一个都不选 —— 空集合会让请求回落到"当季"，和界面显示对不上
+    if (state.selectedSeasons.length === 1) {
+      toast('至少要留一个季度');
+      return;
+    }
+    state.selectedSeasons.splice(index, 1);
+  } else {
+    state.selectedSeasons.push(seasonId);
+  }
+  await applySeasonChange();
+}
+
+/** 单选切换季度（顶部下拉框用）：整体替换选中集合。 */
+async function selectSeason(seasonId) {
+  state.selectedSeasons = [seasonId];
+  await applySeasonChange();
+}
+
+async function applySeasonChange() {
+  state.season = primarySeason();
+  state.offset = 0;
+  try {
+    await loadOverview();
+    syncSeasonUi();
+    await refresh();
+  } catch (error) {
+    setStatus(error.message, 'error');
+  }
+}
+
+/** 切换排序：要重新问服务端要列表（数据库里做排序，不在前端排）。 */
+async function changeSort(sortKey) {
+  if (!SORT_OPTIONS.some((option) => option.key === sortKey)) return;
+  state.sort = sortKey;
+  store(LS_SORT, sortKey);
+  try {
+    await loadOverview();
+    renderSeason();
+  } catch (error) {
+    setStatus(error.message, 'error');
+  }
+}
+
+/**
+ * 只重绘筛选面板（不碰搜索框）。
+ * 点了筛选项/排序/每行部数之后调用：列表已经由 refreshSubjectList() 更新，
+ * 这里只需要把面板里的高亮、"当前排序"文字和各选项部数刷新一下。
+ */
+function renderFilterPanelOnly() {
+  if (!state.filtersOpen) return;
+  const host = $('#filter-panel');
+  if (!host) return;
+
+  // 重绘前先把"哪几栏是展开的"记下来：面板整体换节点，展开状态会丢，
+  // 不记的话用户展开「类型标签」后点一下就又被收起了，很难用。
+  for (const detail of $$('#filter-panel .filter-facet')) {
+    const dimension = detail.dataset.facet;
+    if (dimension) state.facetsOpen[dimension] = detail.open;
+  }
+
+  const wrapper = document.createElement('div');
+  wrapper.innerHTML = filterPanelHtml(baseFilteredSubjects());
+  host.replaceWith(wrapper.firstElementChild);
+
+  // 换了新节点，change 监听要重新绑
+  for (const el of $$('#filter-weekday, #filter-media, #filter-genre, #filter-platform')) {
+    el.addEventListener('change', onFilterSelectChange);
+  }
+  // 用户手动展开 / 收起也要记下来（否则下次重绘又回到默认）。
+  // 这里用**事件委托**挂在 document 上（见下面 addEventListener('toggle')）：
+  // 面板每次点选都会整个换节点，逐个绑监听很容易在某次重绘后漏绑。
+  syncFilterSelects();
+}
+
+/**
+ * 记住四栏的展开状态。
+ *
+ * `toggle` 事件在 `<details>` 上派发且会冒泡，所以挂在 document 上就够了 ——
+ * 面板整体重绘后不需要重新绑定，比"每次重绘给每个 details 绑一遍"稳。
+ */
+document.addEventListener('toggle', (event) => {
+  const detail = event.target;
+  const dimension = detail?.dataset?.facet;
+  if (!dimension) return;
+  state.facetsOpen[dimension] = Boolean(detail.open);
+}, true);
+
+/** 筛选面板里的四个下拉：单选，再点一次同一项即取消。 */
+function onFilterSelectChange(event) {
+  const value = event.target.value;
+  const dimension = {
+    'filter-weekday': 'weekdays',
+    'filter-media': 'mediaTypes',
+    'filter-genre': 'genres',
+    'filter-platform': 'platforms',
+  }[event.target.id];
+  if (!dimension) return;
+  state.filters[dimension] = value === '' ? [] : [value];
+  refreshSubjectList();
+  renderFilterPanelOnly();
+}
+
+$('#season-select').addEventListener('change', (event) => {
+  void selectSeason(event.target.value);
+});
+
+$('#rule-select').addEventListener('change', (event) => {
+  state.rule = event.target.value;
+  $('#ics-link').href = `/api/ics?season=${encodeURIComponent(state.season)}&rule=${state.rule}`;
+  if (state.view === 'week') void renderWeek();
+});
+
+$$('.tab').forEach((tab) => tab.addEventListener('click', () => void switchView(tab.dataset.view)));
+
+// 倒计时每分钟刷新一次（不重新拉数据，只改文本）
+setInterval(() => {
+  for (const el of $$('[data-countdown]')) {
+    el.textContent = countdownText(el.dataset.countdown);
+  }
+}, 30_000);
+
+bootstrap().catch((error) => {
+  $('#app').innerHTML = `<div class="empty" style="color:var(--danger)">初始化失败：${esc(error.message)}</div>`;
+});

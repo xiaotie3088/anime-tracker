@@ -1,0 +1,18 @@
+node_modules/
+# 本地数据一律不入库：anime.db 里有你的追番列表 / 进度 / 手动修正（不可重建），
+# backups 是它的历史快照。⚠ 别只忽略 *.db —— SQLite 的 -wal / -shm 里同样有数据，
+# 少写这一条会把你 4MB 左右的 WAL 一起传上去。
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/*.db-journal
+data/backups/
+data/cache/
+data/snapshots/
+data/probe-*/
+data/*.html
+# 离线 UI 预览页（scripts/preview-ui.ts 生成，含内嵌海报，几 MB，不入库）
+data/_preview/
+*.log
+.DS_Store
+.venv/
