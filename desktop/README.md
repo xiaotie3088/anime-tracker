@@ -1,5 +1,34 @@
 # 桌面端启动方式
 
+## ⚠ 第一次使用前：必须先装依赖
+
+**刚 `git clone` 下来的项目，直接双击快捷方式是跑不起来的。** 先在这个项目目录里执行一次：
+
+```bash
+pnpm install
+```
+
+没有 pnpm 的话，`npm install` 也一样。这一步只需要做一次。
+
+### 为什么
+
+三个数据源客户端与响应校验用了运行时依赖（`zod` / `undici`），而它们**没有**提交进仓库
+（`node_modules/` 在 `.gitignore` 里 —— 那是本机环境，本来也不该进版本库）。
+
+不装依赖直接启动，会在控制台看到：
+
+```
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'zod'
+    imported from ...\src\core\types.ts
+```
+
+启动器其实会先提醒一句（`[WARN] node_modules is missing ...`），
+但控制台一闪而过容易看漏，所以这里单独写清楚。
+
+**装完依赖之后**，本目录的快捷方式就完全正常了 —— 数据库和 `data\` 目录会在首次启动时自动创建。
+
+---
+
 ## 用法
 
 1. 双击本目录下的 **`创建桌面快捷方式.cmd`**（只需一次）。
@@ -91,6 +120,10 @@ launched: C:\Program Files\Google\Chrome\Application\chrome.exe
 5. 最后才退回 `where node`（这次降级会记进日志）
 
 全部失败就给出明确指引，而不是静默什么都不做。
+
+> 注：上面是 `start-anime-calendar.vbs`（静默启动器）的完整顺序。
+> `start-anime-calendar-debug.cmd` 只试前 3 个位置加 PATH 兜底 —— 两者都够用，
+> 因为第 4 个（`%APPDATA%\npm`）是 npm 全局安装的少见位置。
 
 ## 为什么不是真正的 exe
 
