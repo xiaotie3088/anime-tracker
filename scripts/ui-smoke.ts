@@ -279,7 +279,7 @@ const factory = new Function(
   'setInterval',
   'setTimeout',
   'location',
-  `${source}\n; return { renderSeason, renderWeek, getState: () => state };`,
+  `${source}\n; return { renderSeason, renderWeek, switchView, getState: () => state };`,
 );
 const app = factory(document, localStorage, fetchStub, () => 0, () => 0, { reload: () => {} });
 const state = app.getState() as Record<string, unknown>;
@@ -314,6 +314,20 @@ console.log(`#app 6 个子节点的 parent 分别 = ${appEl.children.map((c) => 
 console.log(`\n渲染后 #app 直接子元素数=${appEl.children.length}，HTML 长度=${appEl.innerHTML.length}`);
 
 const rowCount = () => appEl.querySelectorAll('.subject-row').length;
+
+/**
+ * 收集一个节点及其**所有后代**的文本。
+ *
+ * ⚠ 不能直接用 `el.textContent`：这个手写壳把文本累积到**解析时的栈顶节点**上
+ * （见 parseHtml 里 `stack[stack.length - 1].textContent += trimmed`），
+ * 父节点的 textContent 不会聚合子节点 —— 于是 `appEl.textContent` **恒为空串**，
+ * 拿它做 `includes()` 断言会**永远为真**（一条测不到任何东西的假守卫，这里踩过一次）。
+ */
+function collectText(el: El | null): string {
+  if (!el) return '';
+  return el.textContent + el.children.map((child) => collectText(child)).join('');
+}
+
 const total = rowCount();
 console.log(`初始列表行数=${total}`);
 
@@ -515,6 +529,105 @@ for (const n of [3, 4, 5, 6, 7]) {
   const howMany = [3, 4, 5, 6, 7].filter((m) => listEl?.classList.contains(`per-row-${m}`)).length;
   ok(`选「${n} 部」后只剩一个 per-row 类`, howMany === 1, `实际 ${howMany} 个`);
 }
+resetFilters();
+
+console.log('\n【G】总览页精简与季度全选');
+// 顶部那排统计卡片（172 本季番剧总数 / 放送中 / 未开播 / …）已按用户要求去掉。
+// 断言"不再渲染"而不是"数据没了" —— overview.totals 仍要用（我的追番徽章、季度说明里的总数）。
+// ⚠ 必须先切到总览视图：#app 的 innerHTML 每次渲染都会被整块替换，
+//   上一步停留在哪个视图不确定，直接查 .stat-row 可能查的是别的视图。
+state.overview = overview;
+await app.switchView('season');
+ok('顶部统计卡片已移除', appEl.querySelectorAll('.stat-row').length === 0);
+// 只挑**真的被删掉**的标签来查。
+// ⚠ 不要把「缺中文名」写进来：它同时是快速筛选栏里一个 chip 的文字（web/app.js 的快速筛选），
+//   那个 chip 必须保留 —— 写进来只会让断言在真实 DOM 下失败。
+// ⚠ 文本要用 collectText 收集后代：手写壳里父节点的 textContent 恒为空串（见该函数的注释）。
+const statLabels = ['本季番剧总数', '临时机翻名'];
+const appText = collectText(appEl);
+ok(
+  '统计卡片独有的文字一个都不剩',
+  statLabels.every((label) => !appText.includes(label)),
+  `仍出现=${statLabels.filter((label) => appText.includes(label)).join(', ')}（appText 长度=${appText.length}）`,
+);
+// 防"假守卫"自检：如果 collectText 拿不到任何文本，上面那条会永远为真 ——
+// 所以顺带断言文本确实收集到了（探针用一个**必然存在**的文字）。
+ok('文本收集本身是有效的（防假守卫自检）', appText.includes('库里已有的季度'), `appText 长度=${appText.length}`);
+ok(
+  '面板外壳没有被误删（toolbar 与筛选面板还在）',
+  Boolean(appEl.querySelector('#season-search')) && Boolean(appEl.querySelector('#filter-toggle')),
+);
+
+// 季度全选：按钮要排在季度标签**最前面**，点一次选中库里所有季度。
+const overviewSeasons = ((overview as { seasonSummaries?: { season: string }[] }).seasonSummaries ?? []).map(
+  (item) => item.season,
+);
+console.log(`    库里季度=${overviewSeasons.join(', ')}`);
+// 用带连字符的**属性名**找按钮，而不是 `b.dataset.seasonAll`：
+// 这个文件里找节点的既有口径是"属性名 + 精确值"（见 findChip 的 `b.attrs[attr] === value`），
+// dataset 的键是驼峰形态，两套混用容易在看代码的人那里产生误解。
+const findSeasonAll = () => appEl.querySelectorAll('button').find((b) => 'data-season-all' in b.attrs);
+const allBtn = findSeasonAll();
+ok('渲染出「全选」按钮', Boolean(allBtn), `文本=${allBtn?.textContent.trim() ?? '(没有)'}`);
+if (allBtn) {
+  const chipRow = allBtn.parent;
+  const firstChip = chipRow?.children[0];
+  ok(
+    '「全选」排在季度标签最前面',
+    firstChip === allBtn,
+    `第一个是 <${firstChip?.tag} class="${firstChip?.className}">`,
+  );
+  const wantAll = [state.season, ...overviewSeasons.filter((s) => s !== state.season)];
+  allBtn.click();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  const gotAll = (state.selectedSeasons as string[]).join(',');
+  ok(
+    `点「全选」选中全部 ${wantAll.length} 个季度（主季仍是 ${String(state.season)}）`,
+    gotAll === wantAll.join(','),
+    `实际=${gotAll}`,
+  );
+  const freshAll = findSeasonAll();
+  ok('全部选中时「全选」按钮显示为按下状态', freshAll?.classList.contains('is-active') ?? false);
+  // 再点一次要能回到"只选当季"：全选之后逐个点掉 8 个标签体验太差
+  freshAll?.click();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  ok(
+    '再点一次回到只选当季',
+    (state.selectedSeasons as string[]).join(',') === String(state.season),
+    `实际=${(state.selectedSeasons as string[]).join(',')}`,
+  );
+}
+
+// 导航栏里那几个 tab 在 index.html，**不在 #app 内**，这个手写壳量不到 ——
+// 那条断言放在 verify.ts（直接读 index.html），这里只确认总览视图没被改坏。
+console.log('\n【H】总览视图仍然正常');
+await app.switchView('season');
+ok('总览视图仍能渲染出番剧行', appEl.querySelectorAll('.subject-row').length > 0);
+
+// 全选之后列表会从 172 部变成全库 1000+ 部（9 个季度）。实测一次渲染耗时，
+// 免得"能出结果但界面卡死"这种问题要等用户来发现。
+console.log('\n【I】全选后的渲染规模（9 个季度一起渲染）');
+const allSeasons = ['2026-10', '2026-07', '2026-04', '2026-01', '2025-10', '2025-07', '2025-04', '2025-01', '2024-10'];
+state.overview = overview;
+state.season = '2026-10';
+state.selectedSeasons = allSeasons;
+const bigOverview = await fetchJson(
+  `/api/overview?season=${encodeURIComponent(allSeasons.join(','))}&sort=firstAir`,
+);
+state.overview = bigOverview;
+const renderStart = Date.now();
+app.renderSeason();
+const renderMs = Date.now() - renderStart;
+const bigRows = appEl.querySelectorAll('.subject-row').length;
+console.log(`    9 个季度：接口 ${(bigOverview as { subjects: unknown[] }).subjects.length} 条，渲染出 ${bigRows} 行，耗时 ${renderMs}ms`);
+ok('9 个季度一起渲染不抛错且行数匹配', bigRows === (bigOverview as { subjects: unknown[] }).subjects.length);
+// 上限放宽到 15 秒：这只手写壳比真实 DOM 慢得多，这里只拦"卡死"，不做性能验收。
+// 真实浏览器里的手感要人工确认（见票里的说明）。
+ok('单次渲染在 15 秒内完成（只是拦住卡死，不是性能验收）', renderMs < 15_000, `实际 ${renderMs}ms`);
+
+// 还原成单季，避免影响后续断言
+state.selectedSeasons = ['2026-10'];
+state.overview = overview;
 resetFilters();
 
 console.log(`\n结果：${failures === 0 ? '全部通过' : `${failures} 项失败`}`);

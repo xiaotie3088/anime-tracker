@@ -1429,6 +1429,7 @@ db.close();
 
 const stylesPath = new URL('../web/styles.css', import.meta.url);
 const stylesCss = readFileSync(stylesPath, 'utf8');
+const appJs = readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
 
 /**
  * 去掉 CSS 注释后再检查。
@@ -1490,8 +1491,20 @@ check('样式表里不再有"每行几部"的旧写法（--per-row-w / auto-fill
   assert.equal(/grid-template-columns\s*:\s*repeat\(\s*auto-fill/.test(stylesCode), false);
 });
 
+check('导航栏不再有「搜索 / 加番」入口，但搜索视图的代码仍保留', () => {
+  // 用户要求：只从导航拿掉入口，代码保留（以后想找回这个视图改一行就行）。
+  // 所以这里断言两件事同时成立：入口没了，而视图函数还在。
+  const indexHtml = readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
+  assert.equal(indexHtml.includes('search'), false, 'index.html 里不该再出现 search');
+  assert.equal(
+    (indexHtml.match(/data-view="/g) ?? []).length,
+    4,
+    `导航项应剩 4 个，实际 ${(indexHtml.match(/data-view="/g) ?? []).length} 个`,
+  );
+  assert.ok(appJs.includes('function renderSearch'), 'renderSearch 不该被删');
+});
+
 check('每个可选列数都有对应的 .per-row-N 规则（与 app.js 的 PER_ROW_OPTIONS 对齐）', () => {
-  const appJs = readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
   const list = /const PER_ROW_OPTIONS = \[([^\]]+)\]/.exec(appJs)?.[1] ?? '';
   const options = list
     .split(',')

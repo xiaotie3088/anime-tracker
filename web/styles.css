@@ -38,7 +38,7 @@
   --fs-md: 13.5px;
   --fs-lg: 15px;
   --fs-xl: 19px;
-  --fs-stat: 24px;
+  /* 原来的 --fs-stat: 24px 是给顶部统计卡片的数字用的，那张卡片已移除，令牌一并删除 */
 
   /* 海报尺寸：周视图卡片原来 44×62 太小、格子显空，放大一档 */
   --cover-week-w: 58px;
@@ -617,34 +617,10 @@ main { padding: 20px 22px 72px; max-width: 2200px; margin: 0 auto; }
    5. 全季总览
    ========================================================================== */
 
-.stat-row {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
-  gap: var(--gap);
-  margin-bottom: var(--gap-lg);
-}
-.stat {
-  padding: 13px 15px;
-  position: relative;
-  overflow: hidden;
-}
-/* 每张统计卡顶部一条渐变细线：比整块渐变克制 */
-.stat::before {
-  content: "";
-  position: absolute;
-  inset: 0 0 auto 0;
-  height: 2px;
-  background: var(--grad);
-  opacity: 0.75;
-}
-.stat .n {
-  font-size: var(--fs-stat);
-  font-weight: 700;
-  line-height: 1.25;
-  font-variant-numeric: tabular-nums;
-  letter-spacing: -0.4px;
-}
-.stat .l { font-size: var(--fs-xs); color: var(--text-dim); }
+/* 原来这里有一族 .stat-row / .stat 统计卡片样式（172 本季番剧总数 / 放送中 / …）。
+   用户要求界面更简洁，顶部那排统计卡片已移除，样式随之一并删掉 —— 留着就是死代码。
+   注意 overview.totals 的数据仍然要用（「我的追番」徽章、季度说明里的总数），
+   这里删掉的只是渲染与样式。 */
 
 .dist-grid {
   display: grid;
@@ -903,6 +879,14 @@ main { padding: 20px 22px 72px; max-width: 2200px; margin: 0 auto; }
   border-color: var(--accent-border);
   background: var(--accent-soft);
   color: var(--accent);
+  font-weight: 600;
+}
+/* 「全选」是**操作**而不是某个季度，所以用虚线边框把自己和季度标签区分开
+   （颜色也刻意不用强调色，免得看起来像"已经被选中的那一季"）。
+   虚线是形状差异，不依赖颜色 —— 色觉障碍下同样能分辨。 */
+.chip-all {
+  border-style: dashed;
+  color: var(--text);
   font-weight: 600;
 }
 

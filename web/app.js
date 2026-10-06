@@ -733,6 +733,18 @@ function seasonLibraryNotice(overview) {
   if (summaries.length === 0) return '';
 
   const selected = state.selectedSeasons.length > 0 ? state.selectedSeasons : [state.season];
+  // 「全选」按钮：放在季度标签**最前面**（用户诉求 2 —— 全选之后再逐个点掉 8 个标签太麻烦）。
+  // 再点一次的含义是"回到只选当季"：不这么设计的话，全选之后想回到单季没有任何快捷出路。
+  // ⚠ 判定"是否已全选"只看**每个季度是否都在选中集合里**，不要额外比长度：
+  //   选中集合里可能还含 `state.season`（若它不在 seasonSummaries 里），比长度会得出"没全选"，
+  //   而界面上看起来明明全选了 —— 按钮状态与点击行为就会不一致。
+  const allSelected = summaries.every((item) => selected.includes(item.season));
+  const allButton = `<button class="chip chip-all ${allSelected ? 'is-active' : ''}" data-season-all="1"
+      aria-pressed="${allSelected ? 'true' : 'false'}"
+      title="点一下选中库里所有季度（主季仍是当季）；再点一次回到只选当季">${
+        allSelected ? '✓ ' : ''
+      }全选${allSelected ? ' · 全部季度' : ''}</button>`;
+
   const chips = summaries
     .map((item) => {
       const active = selected.includes(item.season);
@@ -756,7 +768,7 @@ function seasonLibraryNotice(overview) {
         想让更早的季度也进库，点右上角「更新数据」，它会增量回填最近几个季度。
         ${isMulti ? '<br />⚠ 周视图与 .ics 导出按<b>主季</b>（第一个选中的季度）计算。' : ''}
       </p>
-      <div class="my-tabs">${chips}</div>
+      <div class="my-tabs">${allButton}${chips}</div>
     </div>`;
 }
 
@@ -817,7 +829,6 @@ function refreshSubjectList() {
 
 function renderSeason() {
   const overview = state.overview;
-  const totals = overview.totals;
 
   if (state.selectedSeasons.length === 0) state.selectedSeasons = [state.season];
 
@@ -830,20 +841,6 @@ function renderSeason() {
     overviewSideFilter().length;
 
   $('#app').innerHTML = `
-    <div class="stat-row">
-      <div class="stat card"><div class="n">${totals.all}</div><div class="l">${
-        state.selectedSeasons.length > 1 ? `选中 ${state.selectedSeasons.length} 季合计` : '本季番剧总数'
-      }</div></div>
-      <div class="stat card"><div class="n">${totals.airing}</div><div class="l">放送中</div></div>
-      <div class="stat card"><div class="n">${totals.upcoming}</div><div class="l">未开播</div></div>
-      <div class="stat card"><div class="n">${totals.tracking}</div><div class="l">我追的</div></div>
-      <div class="stat card"><div class="n">${totals.backlog}</div><div class="l">补番库</div></div>
-      <div class="stat card"><div class="n">${totals.withoutChineseTitle}</div><div class="l">缺中文名</div></div>
-      <div class="stat card" title="这些名字是机器翻译的临时译名，官方译名一到会自动替换">
-        <div class="n">${totals.machineTranslatedTitle ?? 0}</div><div class="l">临时机翻名</div>
-      </div>
-    </div>
-
     ${seasonLibraryNotice(overview)}
 
     <div class="toolbar">
@@ -1551,6 +1548,10 @@ document.addEventListener('click', (event) => {
     target.closest('.card')?.remove();
     return;
   }
+  if (dataset.seasonAll) {
+    void selectAllSeasons();
+    return;
+  }
   if (dataset.seasonToggle) {
     void toggleSeason(dataset.seasonToggle);
     return;
@@ -1752,6 +1753,27 @@ async function toggleSeason(seasonId) {
 /** 单选切换季度（顶部下拉框用）：整体替换选中集合。 */
 async function selectSeason(seasonId) {
   state.selectedSeasons = [seasonId];
+  await applySeasonChange();
+}
+
+/**
+ * 「全选」：选中库里所有季度；已经全选时再点一次 = 回到只选当季。
+ *
+ * 两个刻意的设计：
+ * 1. **主季（`selectedSeasons[0]`）保持为当前季**。周视图与 `.ics` 导出按主季算
+ *    （见 primarySeason 与下方那句警告），若把列表里最新的季度排到最前，
+ *    用户点一下"全选"就会连带改变周视图的内容 —— 那不是他要的效果。
+ * 2. **再点一次回到只选当季**。全选后想回到单季，否则得逐个点掉 8 个标签。
+ */
+async function selectAllSeasons() {
+  const all = (state.overview?.seasonSummaries ?? []).map((item) => item.season);
+  if (all.length === 0) return;
+
+  // 与 seasonLibraryNotice() 里的判定保持同一口径：只问"库里每个季度是否都已选中"，
+  // 不比较集合长度（原因见那里的注释）。
+  const isAllSelected = all.every((season) => state.selectedSeasons.includes(season));
+
+  state.selectedSeasons = isAllSelected ? [state.season] : [state.season, ...all.filter((s) => s !== state.season)];
   await applySeasonChange();
 }
 
