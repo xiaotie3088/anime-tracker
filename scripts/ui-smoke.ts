@@ -42,6 +42,8 @@ class El {
   href = '';
   disabled = false;
   open = false;
+  /** 详情弹窗的 `<div hidden>` 靠它判断开关（与 open 同理，布尔属性） */
+  hidden = false;
   classList = {
     // ⚠ 必须是**真会改 className** 的实现：真实 DOM 的 classList.add/remove 会改 className，
     //   早先这里是空函数，于是"代码里加了个类"在断言里永远看不到，测试会误报失败。
@@ -268,9 +270,31 @@ const fetchStub = async (url: string) => {
 
 // app.js 在模块顶层就直接给这些元素绑监听（拿不到就会抛），
 // 所以要先像 index.html 那样把它们放进文档里。
-for (const id of ['update-btn', 'sync-btn', 'translate-btn', 'season-select', 'rule-select', 'ics-link', 'more-menu']) {
+// `modal-backdrop` / `modal` 是 openDetail() 要用的（index.html 里也有），必须一并建出来。
+for (const id of [
+  'update-btn',
+  'sync-btn',
+  'translate-btn',
+  'season-select',
+  'rule-select',
+  'ics-link',
+  'more-menu',
+  'modal-backdrop',
+  'modal',
+]) {
   getById(id);
 }
+
+// 「复制番剧名」要真的调剪贴板。壳里没有 navigator，所以注入一个记录型的假剪贴板：
+// 这样断言的是"代码确实调了 writeText 并传了正确的文本"，而不是"按钮有没有渲染出来"。
+const copied: string[] = [];
+const fakeNavigator = {
+  clipboard: {
+    writeText: async (text: string) => {
+      copied.push(text);
+    },
+  },
+};
 
 const factory = new Function(
   'document',
@@ -279,9 +303,13 @@ const factory = new Function(
   'setInterval',
   'setTimeout',
   'location',
+  'navigator',
+  'window',
   `${source}\n; return { renderSeason, renderWeek, switchView, getState: () => state };`,
 );
-const app = factory(document, localStorage, fetchStub, () => 0, () => 0, { reload: () => {} });
+const app = factory(document, localStorage, fetchStub, () => 0, () => 0, { reload: () => {} }, fakeNavigator, {
+  matchMedia: () => ({ matches: false, addEventListener: () => {}, removeEventListener: () => {} }),
+});
 const state = app.getState() as Record<string, unknown>;
 
 // document 的监听器挂到根上，事件才能冒泡到它
@@ -411,21 +439,24 @@ for (const c of cases) {
 }
 resetFilters();
 
-console.log('\n【D】卡片按钮：没加入列表的番也要有「详情」');
+console.log('\n【D】卡片按钮：详情改成点整张卡片，「追番 / 补番 / 移除」保留');
 resetFilters();
 const rows = appEl.querySelectorAll('.subject-row');
 const notMine = rows.filter((r) => !r.querySelector('[data-remove]'));
 const sample = notMine[0];
 const sampleButtons = (sample?.querySelectorAll('button') ?? []).map((b) => b.textContent.trim());
 console.log(`    未加入列表的卡片样例按钮=[${sampleButtons.join(', ')}]`);
-ok('未加入列表的卡片有「详情」按钮', sampleButtons.includes('详情'));
+// 这一节用的是"逐卡片 querySelectorAll('button')"而不是 `.subject-row button`：
+// 这个手写壳的 matches() 不解析后代选择器，写成后代选择器会命中卡片 div 自己。
+ok('卡片上没有「详情」按钮了（改成点整张卡片）', !sampleButtons.includes('详情'));
 ok('未加入列表的卡片仍有「追番」「补番」', sampleButtons.includes('追番') && sampleButtons.includes('补番'));
-ok('「详情」排在「追番」之前', sampleButtons.indexOf('详情') < sampleButtons.indexOf('追番'));
+ok('卡片上有「复制番剧名」按钮', sampleButtons.includes('复制'));
 const mine = rows.find((r) => r.querySelector('[data-remove]'));
 if (mine) {
   const mineButtons = mine.querySelectorAll('button').map((b) => b.textContent.trim());
   console.log(`    已在列表的卡片按钮=[${mineButtons.join(', ')}]`);
-  ok('已在列表的卡片保留「详情 / 移除」', mineButtons.includes('详情') && mineButtons.includes('移除'));
+  // 注意：移除按钮的**文字**是「移除」，但它的危险语义靠 btn-danger 类表达，这里只查文字
+  ok('已在列表的卡片保留「移除」且没有「详情」', mineButtons.includes('移除') && !mineButtons.includes('详情'));
 }
 
 console.log('\n【E】筛选面板：四栏默认收起，可点开');
@@ -629,6 +660,118 @@ ok('单次渲染在 15 秒内完成（只是拦住卡死，不是性能验收）
 state.selectedSeasons = ['2026-10'];
 state.overview = overview;
 resetFilters();
+
+console.log('\n【J】点卡片弹详情，但点按钮不能同时弹详情');
+// 这是本票最容易出的 bug：卡片改成整块可点后，"追番 / 补番 / 移除 / 复制"必须不能连带弹详情。
+// 能不能在壳里测？能 —— 这些按钮本来就靠 document 级点击委托（壳里 document 的监听器挂在 docRoot 上，
+// El.dispatch 会从 target 一路冒泡到根），所以这条路径是真实的。
+// ⚠ 排版警告：这个壳的 matches() **不解析后代选择器** —— `.subject-row button` 会被理解成
+//   "同时是 .subject-row 又是 button"，结果命中**卡片 div 自己**（实测 172 个，按钮 0 个）。
+//   所以这里一律"对每张卡片单独 querySelectorAll('button')"，别写后代选择器。
+await app.switchView('season');
+const backdrop = docRoot.querySelectorAll('#modal-backdrop')[0];
+ok('测试壳里有详情弹窗容器', Boolean(backdrop), '若为 ✗，是壳没建这两个元素，不是业务代码的问题');
+const modalOf = () => docRoot.querySelectorAll('#modal')[0];
+const closeModal = () => {
+  if (backdrop) backdrop.hidden = true;
+  if (modalOf()) modalOf()!.innerHTML = '';
+};
+/** 取所有卡片上的按钮（配合壳不支持后代选择器，只能逐卡片取） */
+const cardButtons = (): El[] => appEl.querySelectorAll('.subject-row').flatMap((row) => row.querySelectorAll('button'));
+
+const notMineRow = appEl.querySelectorAll('.subject-row').find((r) => !r.querySelector('[data-remove]'));
+ok('找得到一部未加入列表的番（用于测试）', Boolean(notMineRow), `key=${notMineRow?.attrs['data-key']}`);
+if (backdrop && notMineRow) {
+  closeModal();
+  // 点卡片本身（不是按钮）
+  notMineRow.click();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  ok('点卡片弹出了详情', backdrop.hidden === false);
+  ok(
+    '详情内容是该番（弹窗里有标题）',
+    (modalOf()?.innerHTML ?? '').length > 0,
+    `modal 长度=${(modalOf()?.innerHTML ?? '').length}`,
+  );
+
+  // 点「追番」：不能连带弹详情
+  closeModal();
+  const addBtn = notMineRow.querySelectorAll('button').find((b) => 'data-add' in b.attrs);
+  ok('卡片上的「追番」按钮还在', Boolean(addBtn), `卡片按钮数=${notMineRow.querySelectorAll('button').length}`);
+  addBtn?.click();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  ok('点「追番」不会连带弹出详情', backdrop.hidden === true);
+}
+closeModal();
+
+console.log('\n【K】卡片上的「复制番剧名」按钮');
+state.overview = overview;
+await app.switchView('season');
+const rowsNow = appEl.querySelectorAll('.subject-row');
+const copyBtns = cardButtons().filter((b) => 'data-copy' in b.attrs);
+ok('每张卡片都有「复制」按钮', copyBtns.length === rowsNow.length, `实际 ${copyBtns.length} 个 / 卡片 ${rowsNow.length} 张`);
+const firstCopy = copyBtns[0];
+if (backdrop && firstCopy) {
+  // 复制要先确认"点它不会弹详情"，再确认"真的调了剪贴板、且传的是这张番的名字"
+  closeModal();
+  const copyRow = firstCopy.closest('.subject-row');
+  const cnTitle = (copyRow?.querySelector('.t-cn')?.textContent ?? '').trim();
+  const origTitle = (copyRow?.querySelector('.t-orig')?.textContent ?? '').trim();
+  const before = copied.length;
+  firstCopy.click();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  ok('点「复制」不会连带弹出详情', backdrop.hidden === true);
+  // 真正要锁的是"按钮携带的 key 与它所在卡片一致"（而不是拿它去比卡片节点）
+  const copyKey = firstCopy.attrs['data-copy'];
+  ok(
+    '「复制」按钮携带的 key 与所在卡片一致',
+    Boolean(copyKey) && copyKey === copyRow?.attrs['data-key'],
+    `按钮=${copyKey} 卡片=${copyRow?.attrs['data-key']}`,
+  );
+  ok('「复制」真的调了剪贴板', copied.length === before + 1, `copied=${JSON.stringify(copied)}`);
+  const text = copied[copied.length - 1] ?? '';
+  // 只复制中文名，不加原名：搜索引擎会把"中文名 原名"整串当短语，反而搜不到
+  ok(
+    '复制的内容就是这张番的中文名',
+    cnTitle.length > 0 && text === cnTitle,
+    `copied=${JSON.stringify(text)} cnTitle=${JSON.stringify(cnTitle)}`,
+  );
+  ok('复制内容里不带日文原名（否则贴到站外搜不到）', origTitle === '' || !text.includes(origTitle), `copied=${JSON.stringify(text)} orig=${JSON.stringify(origTitle)}`);
+}
+
+// 把「详情」按钮去掉之后，卡片上不该再有它 —— 弹详情改成点卡片了
+const detailBtns = cardButtons().filter((b) => 'data-open' in b.attrs);
+ok('卡片上不再有「详情」按钮', detailBtns.length === 0, `仍有 ${detailBtns.length} 个`);
+
+console.log('\n【L】卡片与按钮的键盘行为（keydown 路径）');
+// 为什么必须单独测这条：鼠标路径与键盘路径**走的是两段代码**。
+// 实测踩过的真 bug —— keydown 分支里用 `closest('[data-subject-row]')` 会**向上**命中卡片，
+// 于是焦点在按钮上按空格时，preventDefault() 吃掉了浏览器"Space → click"的默认转换，
+// 卡片内按钮**永远按不动**（键盘用户彻底用不了追番/补番/移除/复制），而且是静默的。
+state.overview = overview;
+await app.switchView('season');
+const keyTargets = appEl.querySelectorAll('.subject-row');
+const keyRow = keyTargets.find((r) => !r.querySelector('[data-remove]'));
+if (backdrop && keyRow) {
+  // ① 焦点在**卡片本身**：回车应打开详情
+  closeModal();
+  // 用对象承载"是否被 preventDefault"：`let x = false` 会被 TS 收窄成字面量 false，
+  // 后续 `x === true` 直接报"两个类型没有重叠"。
+  const cardKey = { prevented: false };
+  keyRow.dispatch('keydown', { key: 'Enter', preventDefault: () => (cardKey.prevented = true) });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  ok('卡片上按回车能打开详情', backdrop.hidden === false, `prevented=${cardKey.prevented}`);
+  ok('回车被 preventDefault 接管', cardKey.prevented === true);
+
+  // ② 焦点在卡片**内部的按钮**上：不得抢走浏览器的激活行为
+  closeModal();
+  const keyAdd = keyRow.querySelectorAll('button').find((b) => 'data-add' in b.attrs);
+  const buttonKey = { prevented: false };
+  keyAdd?.dispatch('keydown', { key: ' ', preventDefault: () => (buttonKey.prevented = true) });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  ok('在「追番」按钮上按空格不会弹出详情', backdrop.hidden === true);
+  ok('在「追番」按钮上按空格不会 preventDefault（否则按钮永远按不动）', buttonKey.prevented === false);
+}
+closeModal();
 
 console.log(`\n结果：${failures === 0 ? '全部通过' : `${failures} 项失败`}`);
 process.exitCode = failures === 0 ? 0 : 1;

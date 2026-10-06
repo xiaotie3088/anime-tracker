@@ -1504,6 +1504,28 @@ check('导航栏不再有「搜索 / 加番」入口，但搜索视图的代码�
   assert.ok(appJs.includes('function renderSearch'), 'renderSearch 不该被删');
 });
 
+check('点击委托里「卡片整体可点」的分支必须排在所有按钮分支之后', () => {
+  // 为什么用静态检查兜这件"顺序"：点卡片弹详情是靠"按钮分支都先 return"来实现的，
+  // 一旦有人把 dataset.subjectRow 那条挪到按钮分支前面，点「追番 / 移除 / 复制」
+  // 就会连带弹出详情 —— 而这类 bug 只有在真实浏览器里点一下才看得出来。
+  // 把"新人要记得加在前面"这个隐性约定变成 pnpm verify 里的确定性检查。
+  const lines = appJs.split('\n');
+  const handlerStart = lines.findIndex((line) => line.includes("document.addEventListener('click'"));
+  assert.ok(handlerStart >= 0, '没找到点击委托处理函数');
+  const handlerLines = lines.slice(handlerStart, handlerStart + 260);
+  const lineOf = (needle: string) => {
+    const index = handlerLines.findIndex((line) => line.includes(needle));
+    return index < 0 ? Number.POSITIVE_INFINITY : index;
+  };
+  const cardBranch = lineOf('if (dataset.subjectRow)');
+  for (const buttonBranch of ['if (dataset.add)', 'if (dataset.remove)', 'if (dataset.copy)']) {
+    assert.ok(
+      lineOf(buttonBranch) < cardBranch,
+      `${buttonBranch} 必须排在 if (dataset.subjectRow) 之前，否则点按钮会连带弹出详情`,
+    );
+  }
+});
+
 check('每个可选列数都有对应的 .per-row-N 规则（与 app.js 的 PER_ROW_OPTIONS 对齐）', () => {
   const list = /const PER_ROW_OPTIONS = \[([^\]]+)\]/.exec(appJs)?.[1] ?? '';
   const options = list

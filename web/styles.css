@@ -859,6 +859,28 @@ main { padding: 20px 22px 72px; max-width: 2200px; margin: 0 auto; }
 .subject-row .meta { font-size: var(--fs-xs); color: var(--text-dim); display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
 .subject-row .actions { display: flex; flex-direction: column; gap: 6px; justify-content: center; flex: none; }
 
+/* 可点卡片（详情改成点整张卡片打开，原来的「详情」按钮已去掉）。
+   用 data-interactive 而不是 :hover —— 鼠标悬停是"用户正在看"，这里是"这张卡片可交互"，
+   两件事分开表达；将来若某处卡片不可点，去掉这个属性即可，样式不用改。 */
+.subject-row[data-interactive] { cursor: pointer; }
+
+/* 「复制番剧名」：放在中文名右侧、比正文小一档，不抢标题的视觉重心。
+   失败时 copyTextToClipboard 会 toast 出名字，不会静默失败。 */
+.subject-row .copy-name {
+  margin-left: 6px;
+  padding: 1px 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-faint);
+  font-size: var(--fs-xs);
+  font-weight: 400;
+  cursor: pointer;
+  vertical-align: 1px;
+  transition: border-color 0.15s var(--ease), color 0.15s var(--ease);
+}
+.subject-row .copy-name:hover { border-color: var(--accent-border); color: var(--accent); }
+
 /* ==========================================================================
    6. 我的追番 / 补番库
    ========================================================================== */

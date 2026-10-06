@@ -342,10 +342,12 @@ function subjectRow(item) {
   const genres = [...new Set(item.genres)];
 
   return `
-    <div class="subject-row" data-key="${esc(item.key)}">
+    <div class="subject-row" data-key="${esc(item.key)}" data-subject-row="1"${cardClickAttrs()}>
       ${coverHtml(item.coverUrl, 'cover')}
       <div class="info">
-        <div class="t-cn">${esc(item.titleCn ?? '（无中文名）')} ${machineTag(item.titleCnSource)} ${inList}</div>
+        <div class="t-cn">${esc(item.titleCn ?? '（无中文名）')} ${machineTag(item.titleCnSource)} ${inList}${copyNameHtml(
+          item,
+        )}</div>
         <div class="t-orig">${esc(item.titleOriginal ?? '')}</div>
         <div class="meta">
           <span class="tag">${esc(mediaTypeLabel(item.mediaType))}</span>
@@ -370,16 +372,99 @@ function subjectRow(item) {
       <div class="actions">
         ${
           item.myCategory
-            ? `<button class="btn btn-sm" data-open="${esc(item.key)}">详情</button>
-               <button class="btn btn-sm btn-danger" data-remove="${esc(item.key)}">移除</button>`
-            : // 详情放在追番/补番**之前**：总得先看看是什么番、什么时候放，再决定追还是补。
-              // 原来只有"追番 / 补番"两个按钮，等于逼人在没信息的情况下做选择。
-              `<button class="btn btn-sm" data-open="${esc(item.key)}">详情</button>
-               <button class="btn btn-sm btn-primary" data-add="${esc(item.key)}" data-category="tracking">追番</button>
+            ? `<button class="btn btn-sm btn-danger" data-remove="${esc(item.key)}">移除</button>`
+            : // 追番 / 补番两个按钮：总得先看看是什么番、什么时候放，再决定追还是补 ——
+              // 想看详情**点整张卡片**即可（原来这里还有个「详情」按钮，已按需求去掉）
+              `<button class="btn btn-sm btn-primary" data-add="${esc(item.key)}" data-category="tracking">追番</button>
                <button class="btn btn-sm" data-add="${esc(item.key)}" data-category="backlog">补番</button>`
         }
       </div>
     </div>`;
+}
+
+/**
+ * 卡片可点：交给 `web/styles.css` 的 `[data-interactive]` 规则上指针光标与悬停反馈。
+ *
+ * 为什么不把 `style="cursor:pointer"` 直接写在元素上：这个项目有条硬约束 ——
+ * 样式只能来自 `styles.css` 的设计令牌，组件里不写死。（内联 cursor 虽不是色值，
+ * 但也属于"绕开样式表"，一旦哪天换了视觉方向就找不到出处。）
+ */
+function cardClickAttrs() {
+  return ' data-interactive="1" tabindex="0"';
+}
+
+/**
+ * 复制用的名字：**优先只给中文名**，没有中文名时才退回日文原名。
+ *
+ * 为什么不把"中文名 + 原名"拼起来：用户复制是为了**拿去别处搜这部番**
+ * （Bing / 番剧站）。搜索引擎会把整串当成一个短语，混了两种语言的查询通常一条也匹配不到，
+ * 用户还得手动删掉一半 —— 比只给一个名字更差。贴回本页搜索框虽然能命中
+ * （前端是 `includes` 匹配），但那不是这个按钮的主场景。
+ */
+function copyTextFor(item) {
+  const cn = String(item.titleCn ?? '').trim();
+  if (cn) return cn;
+  return String(item.titleOriginal ?? '').trim();
+}
+
+/**
+ * 「复制番剧名」按钮。
+ *
+ * 为什么要带 `data-copy="${key}"`：卡片改成整块可点之后，按钮必须能独立识别出来，
+ * 否则点击会冒泡到卡片、连带弹出详情（这是本改动最容易出的 bug）。
+ */
+function copyNameHtml(item) {
+  const text = copyTextFor(item);
+  if (!text) return '';
+  return `<button class="copy-name" data-copy="${esc(item.key)}" title="复制番剧名（去找番看的时候直接粘贴）" aria-label="复制番剧名">复制</button>`;
+}
+
+/**
+ * 复制文本到剪贴板。
+ *
+ * 页面是 `http://127.0.0.1:8787`，属安全上下文，`navigator.clipboard` 正常可用；
+ * 但要兜住"浏览器不支持 / 用户拒绝权限"两种失败 —— 退回 `execCommand`，
+ * 再不行就把名字显示出来让用户手动复制。**不要静默失败**。
+ */
+async function copyTextToClipboard(text) {
+  const clipboard = typeof navigator !== 'undefined' ? navigator.clipboard : undefined;
+  if (clipboard?.writeText) {
+    try {
+      await clipboard.writeText(text);
+      return true;
+    } catch {
+      /* 落到下面的兜底路径 */
+    }
+  }
+  try {
+    const area = document.createElement('textarea');
+    area.value = text;
+    document.body.appendChild(area);
+    area.select();
+    // ⚠ remove() 必须放 finally：execCommand 可能抛（权限策略等），
+    //   只放 try 里会让那个 textarea 永久留在页面上，而且它刚被 select() 过 ——
+    //   页面上会出现可见的选区异常。
+    try {
+      return document.execCommand?.('copy') ?? false;
+    } finally {
+      area.remove();
+    }
+  } catch {
+    /* 继续落到最后的提示 */
+  }
+  toast(`复制失败，名字是：${text}`);
+  return false;
+}
+
+/** 点卡片上的「复制」：复制番剧名，方便去别处搜这部番。 */
+async function copySubjectTitle(key) {
+  const item = (state.overview?.subjects ?? []).find((entry) => entry.key === key);
+  const text = item ? copyTextFor(item) : '';
+  if (!text) {
+    toast('这部番还没有名字可以复制', true);
+    return;
+  }
+  if (await copyTextToClipboard(text)) toast(`已复制：${text}`);
 }
 
 /**
@@ -947,7 +1032,7 @@ async function renderMy() {
         一集没看的不动
       </span>
     </div>
-    ${state.myCategory === 'backlog' ? '<div class="section-title">补番库：没看完的当季番与想看的老番都在这里，支持搜索「搜索 / 加番」加入任意老番</div>' : ''}
+    ${state.myCategory === 'backlog' ? '<div class="section-title">补番库：没看完的当季番与想看的老番都在这里。⚠ 界面里没有「加番」入口 —— 想加没在库里的番，用命令行：<code>pnpm add "番剧名"</code></div>' : ''}
     <div class="subject-list">${rows || '<div class="empty">这个分类还是空的</div>'}</div>`;
 }
 
@@ -1520,7 +1605,11 @@ function closeMoreMenu() {
 document.addEventListener('click', (event) => {
   if (!event.target.closest('#more-menu')) closeMoreMenu();
 
-  const target = event.target.closest('button, a');
+  // 除了按钮/链接，**可交互卡片**（整块可点，例如点番剧卡片弹详情）也要作为事件目标。
+  // ⚠ 不要为了图省事改成 `closest('*')`：那样点页面任何空白都会进来，
+  //   下面那些 `target.id === '...'` 分支的语义会被搅乱。
+  const target =
+    event.target.closest('button, a') ?? event.target.closest('[data-interactive]');
   if (!target) {
     if (event.target.id === 'modal-backdrop') closeDetail();
     return;
@@ -1546,6 +1635,14 @@ document.addEventListener('click', (event) => {
 
   if (dataset.dismissUpdate) {
     target.closest('.card')?.remove();
+    return;
+  }
+  // 点卡片上任意处都可以弹详情（原来的「详情」按钮已按需求去掉）。
+  // ⚠ **必须在按钮分支之后**：追番 / 补番 / 移除 / 复制点了就只是那件事，
+  //   不能连带弹详情。点击事件会从按钮冒泡到卡片，所以只靠"按钮自己 stopPropagation"
+  //   不够稳（少写一个就是 bug），这里用"先处理按钮分支、卡片分支放最后"的结构兜底。
+  if (dataset.copy) {
+    void copySubjectTitle(dataset.copy);
     return;
   }
   if (dataset.seasonAll) {
@@ -1683,6 +1780,13 @@ document.addEventListener('click', (event) => {
     void removeFromList(dataset.remove, dataset.reload === '1');
     return;
   }
+  // ⚠ 卡片整体可点这一条**必须放在最后**：上面任何按钮分支一旦命中就已经 return，
+  //   所以点「追番 / 补番 / 移除 / 复制」都不会走到这里、不会连带弹详情。
+  //   以后新增卡片内的按钮时，也要把它的分支加在这条**之前**。
+  if (dataset.subjectRow) {
+    void openDetail(dataset.key);
+    return;
+  }
 });
 
 document.addEventListener('keydown', (event) => {
@@ -1694,6 +1798,22 @@ document.addEventListener('keydown', (event) => {
       return;
     }
     closeDetail();
+    return;
+  }
+  // 键盘可达：卡片现在是"点一下弹详情"的交互元素，Tab 聚焦后回车/空格也要能打开。
+  // （只加鼠标点击会让键盘用户打不开详情 —— 第六轮刚统一过键盘焦点样式，不要退回去。）
+  // ⚠ `closest` 会**向上**遍历：焦点落在卡片里某个按钮上时它仍然命中卡片。
+  //   若不排除按钮，这里会出两个静默 bug：
+  //     · 空格：preventDefault 会阻止浏览器"keydown Space → click"的默认转换，
+  //       于是卡片内按钮**永远按不动**（键盘用户彻底用不了追番/补番/移除/复制）；
+  //     · 回车：浏览器在 keydown 阶段就派发了 click（按钮生效），这里再开一次详情 —— 多弹一个。
+  //   所以只在"焦点就在卡片本身"时接管。
+  if (event.key === 'Enter' || event.key === ' ') {
+    const row = event.target?.closest?.('[data-subject-row]');
+    if (row && !event.target.closest?.('button, a')) {
+      event.preventDefault();
+      void openDetail(row.dataset.key);
+    }
   }
 });
 
