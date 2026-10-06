@@ -29,19 +29,20 @@ import {
   addMyAnime,
   availableSeasons,
   backupDatabase,
-  findSubjectByExternalId,
   getSubjectDetail,
   getSubjectSeason,
   listChanges,
   listMyAnime,
   listSchedule,
   listSeasonSubjects,
+  listSyncRuns,
   listUpcoming,
   migrate,
   openDb,
   pruneBackups,
   removeMyAnime,
   resolveSeasonSort,
+  resolveSubjectIdentity,
   searchLocalSubjects,
   seasonSummaries,
   setBacklogPlan,
@@ -328,7 +329,7 @@ async function handleSync(url: URL, reply: Reply): Promise<void> {
   } catch {
     // 备份失败不阻断同步
   }
-  const result = await syncSeason(db, season);
+  const result = await syncSeason(db, season, { trigger: 'web', scope: 'season' });
   reply(200, {
     season: { id: season.id, label: season.label },
     written: result.written,
@@ -336,6 +337,8 @@ async function handleSync(url: URL, reply: Reply): Promise<void> {
     mergedAway: result.outcome.mergedAway,
     singleSourceCount: result.outcome.singleSourceCount,
     archive: result.archive,
+    /** 身份判定审计（票 A） */
+    identity: result.identity,
     /** 被自动归档移动的番的番名 —— 用户要靠这个知道「我的番去哪了」 */
     moved: result.archive.moved,
     reports: result.outcome.reports,
@@ -394,12 +397,16 @@ async function handleUpdate(url: URL, reply: Reply): Promise<void> {
     translate,
     translateLimit: Number.isFinite(limit) ? Math.max(0, limit) : 0,
     heal: url.searchParams.get('heal') === '1',
+    trigger: 'web',
   });
 
   reply(200, {
     season: { id: season.id, label: season.label },
     scope: result.scope,
     summary: result.summary,
+    // 身份判定审计（票 A）：界面上能看出"这次拦住了几条本来会变成新重复的行"
+    identity: result.identity,
+    runId: result.runId,
     current: {
       written: result.current.written,
       episodeCount: result.current.episodeCount,
@@ -620,6 +627,14 @@ const server = createServer((req, res) => {
         return;
       }
 
+      if (pathname === '/api/runs' && req.method === 'GET') {
+        // 运行记录（票 A）：跨运行留痕。?limit=N，默认 10。
+        const limitParam = Number(url.searchParams.get('limit') ?? 10);
+        const limit = Number.isFinite(limitParam) ? Math.max(1, Math.min(200, Math.floor(limitParam))) : 10;
+        reply(200, { runs: listSyncRuns(db, limit) });
+        return;
+      }
+
       if (pathname === '/api/overview' && req.method === 'GET') {
         handleOverview(url, reply);
         return;
@@ -741,20 +756,20 @@ const server = createServer((req, res) => {
           return;
         }
 
-        // 库里已有同一部番（例如季度同步已经落过）就复用它，避免产生重复记录
-        const existing = findSubjectByExternalId(db, {
-          bgmId: subject.bgmId,
-          anilistId: subject.anilistId,
-          malId: subject.malId,
-        });
-        if (existing) {
+        // 库里已有同一部番（例如季度同步已经落过）就复用它，避免产生重复记录。
+        // ⚠ 走统一的身份判定（票 A）：只按外部 ID 查会漏掉"老行没有 ID"这个主形态
+        //   （实测 384 行没有任何外部 ID），退到归一化标题才能命中。
+        const decision = resolveSubjectIdentity(db, subject);
+        if (decision.match !== 'none') {
+          const reused = getSubjectDetail(db, decision.suggestedKey);
           reply(200, {
-            subjectKey: existing.key,
+            subjectKey: decision.suggestedKey,
             reused: true,
-            title: existing.titleCn ?? existing.titleOriginal,
+            title: reused?.titleCn ?? reused?.titleOriginal ?? decision.suggestedKey,
+            matchedBy: decision.match,
             // 复用分支也要给出季度：界面靠它告诉用户这部番归在哪一季
             // （否则从搜索加入一部库里已有的番时，界面上不会提示去哪里找它）
-            season: getSubjectSeason(db, existing.key),
+            season: getSubjectSeason(db, decision.suggestedKey),
           });
           return;
         }

@@ -48,12 +48,14 @@ import type { Episode, RawSeasonAnime, Subject } from '../src/core/types.ts';
 import {
   acknowledgeChanges,
   addMyAnime,
+  applyIdentityAbsorption,
   applyMachineTitle,
   autoArchiveFinished,
   availableSeasons,
   backupDatabase,
   clearMachineTitle,
   countMachineTitles,
+  describeSyncRun,
   findSubjectByExternalId,
   getMeta,
   getSubjectDetail,
@@ -63,13 +65,16 @@ import {
   listMyAnime,
   listSchedule,
   listSeasonSubjects,
+  listSyncRuns,
   listTranslationCandidates,
   logChange,
   logChanges,
   migrate,
   openDb,
   pruneBackups,
+  recordSyncRun,
   repairSeasonAssignments,
+  resolveSubjectIdentity,
   SCHEMA_VERSION,
   searchLocalSubjects,
   seasonSubjectCount,
@@ -748,6 +753,282 @@ check('确认变更后不再出现在待处理列表里', () => {
   assert.equal(acknowledged, pending);
   assert.equal(listChanges(db).length, 0);
   assert.equal(stats(db).pendingChanges, 0);
+});
+
+// ---------------------------------------------------------------------------
+section('九之二、写库身份判定：同一部番不再出现两条（.scratch/duplicate-subjects/issues/01-票A）');
+// ---------------------------------------------------------------------------
+
+// 这一节要能证明的是**根因**：跨源聚类只在本次抓取的内存里做，写库是裸 UPSERT，
+// 主键会随"这次哪个源成功"漂移（bgm:<id> ↔ title:<归一化名>），旧行永不删除。
+// 所以每条断言都直接盯住"库里到底有几行"。
+
+/** 模拟 syncSeason 的写入流程：判定 -> 落库 -> 吸收脏行。 */
+function writeWithIdentity(db: DatabaseSync, incoming: Subject): ReturnType<typeof resolveSubjectIdentity> {
+  const decision = resolveSubjectIdentity(db, incoming);
+  const entry = { ...incoming, key: decision.suggestedKey };
+  upsertSubject(db, entry, entry.season ?? null);
+  for (const dirtyKey of decision.absorbKeys) applyIdentityAbsorption(db, dirtyKey, decision.suggestedKey);
+  return decision;
+}
+
+function countSubjects(db: DatabaseSync): number {
+  const row = db.prepare('SELECT COUNT(*) AS n FROM subject').get() as { n?: number } | undefined;
+  return Number(row?.n ?? 0);
+}
+
+check('只有标题的旧行，遇到同名但带 bgmId 的新数据 -> 命中旧行、总行数不增', () => {
+  const idDb = openDb(':memory:');
+  migrate(idDb);
+  // 老行：只有 yuc 的 title: 形态，一个外部 ID 都没有（实测 98 组重复全是这种）
+  upsertSubject(
+    idDb,
+    makeSubject('title:偶像大师', {
+      titleCn: '偶像大师',
+      season: '2026-10',
+      episodes: [makeEpisode(1, '2026-10-03T14:00:00.000Z')],
+      sources: ['yuc'],
+    }),
+    '2026-10',
+  );
+
+  const decision = writeWithIdentity(
+    idDb,
+    makeSubject('bgm:621073', {
+      bgmId: 621073,
+      titleCn: '偶像大师',
+      season: '2026-10',
+      episodes: [makeEpisode(1, '2026-10-03T14:00:00.000Z')],
+      sources: ['bangumi-data', 'yuc', 'anilist'],
+    }),
+  );
+
+  assert.equal(decision.match, 'title', '必须靠归一化标题命中旧行（只按 ID 查必然漏）');
+  assert.deepEqual(decision.absorbKeys, ['title:偶像大师'], '那条无 ID 的旧行应当被吸收');
+  assert.equal(countSubjects(idDb), 1, `同一部番只能有 1 行，实际 ${countSubjects(idDb)} 行`);
+  const keys = idDb.prepare('SELECT key, bgm_id FROM subject').all() as unknown as Array<{
+    key: string;
+    bgm_id: number | null;
+  }>;
+  assert.equal(keys[0]?.bgm_id, 621073, '带 ID 的那条应当活下来（稳定身份）');
+  idDb.close();
+});
+
+check('同一部番分两批写入（一批带 bgmId、一批只有标题）-> subject 只增加 1 行', () => {
+  const idDb = openDb(':memory:');
+  migrate(idDb);
+  writeWithIdentity(idDb, makeSubject('bgm:555', { bgmId: 555, titleCn: '分两批的番', season: '2026-10' }));
+  writeWithIdentity(
+    idDb,
+    makeSubject('title:分两批的番', { titleCn: '分两批的番', season: '2026-10', sources: ['yuc'] }),
+  );
+  assert.equal(countSubjects(idDb), 1, `两批写入只应有 1 行，实际 ${countSubjects(idDb)} 行`);
+  // 后一批没带 ID，但库里已有的 bgm_id 不能被清成 NULL（否则下次又退化成标题匹配）
+  const row = idDb.prepare('SELECT bgm_id FROM subject').get() as { bgm_id?: number | null } | undefined;
+  assert.equal(row?.bgm_id, 555, '只有标题的那次同步不得把已有的 bgm_id 清空');
+  idDb.close();
+});
+
+check('标题不同但 bgmId 相同 -> 仍按 ID 复用（第 1 层不能被第 2 层绕过）', () => {
+  const idDb = openDb(':memory:');
+  migrate(idDb);
+  upsertSubject(idDb, makeSubject('bgm:900', { bgmId: 900, titleCn: '第一版译名', season: '2026-10' }), '2026-10');
+  const decision = writeWithIdentity(
+    idDb,
+    makeSubject('bgm:900', { bgmId: 900, titleCn: '完全改过的译名', season: '2026-10' }),
+  );
+  assert.equal(decision.match, 'id');
+  assert.equal(decision.suggestedKey, 'bgm:900');
+  assert.equal(countSubjects(idDb), 1);
+  idDb.close();
+});
+
+check('跨季度同名 -> 不许并成一条（实测 49 组跨季度同名是两部不同的番）', () => {
+  const idDb = openDb(':memory:');
+  migrate(idDb);
+  upsertSubject(idDb, makeSubject('bgm:100', { bgmId: 100, titleCn: '天是红河岸', season: '2026-07' }), '2026-07');
+  const decision = resolveSubjectIdentity(
+    idDb,
+    makeSubject('title:天是红河岸', { titleCn: '天是红河岸', season: '2026-10', sources: ['yuc'] }),
+  );
+  assert.equal(decision.match, 'none', '季度不同就不该匹配');
+  idDb.close();
+});
+
+check('吸收旧行时 my_anime 必须跟着搬家（用户追番数据不能因 CASCADE 消失）', () => {
+  const idDb = openDb(':memory:');
+  migrate(idDb);
+  upsertSubject(idDb, makeSubject('title:女神', { titleCn: '和没有信徒的女神一起攻略异世界', season: '2026-10' }), '2026-10');
+  addMyAnime(idDb, 'title:女神', { category: 'tracking', watchedEps: 3 });
+
+  writeWithIdentity(
+    idDb,
+    makeSubject('bgm:621073', { bgmId: 621073, titleCn: '和没有信徒的女神一起攻略异世界', season: '2026-10' }),
+  );
+
+  assert.equal(countSubjects(idDb), 1);
+  const rows = idDb.prepare('SELECT subject_key, category, watched_eps FROM my_anime').all() as unknown as Array<{
+    subject_key: string;
+    category: string;
+    watched_eps: number;
+  }>;
+  assert.equal(rows.length, 1, '追番数据必须有且只有一条');
+  assert.equal(rows[0]?.subject_key, 'bgm:621073', '追番必须改指带 ID 的那条');
+  assert.equal(rows[0]?.watched_eps, 3, '进度不能丢');
+  assert.equal(rows[0]?.category, 'tracking');
+  idDb.close();
+});
+
+check('命中行带着另一个外部 ID -> 只报告冲突，不覆盖（那可能是真的另一部番）', () => {
+  const idDb = openDb(':memory:');
+  migrate(idDb);
+  // 库里那行是 `bgm:999` + `anilist:888`；本次数据 bgmId 相同、anilistId 却是 777。
+  // 说明数据源之间对不上（同名的两部番 / 某个源 ID 错），不能把库里的 888 改成 777。
+  upsertSubject(
+    idDb,
+    makeSubject('bgm:999', { bgmId: 999, anilistId: 888, titleCn: '对不上的番', season: '2026-10' }),
+    '2026-10',
+  );
+  const decision = resolveSubjectIdentity(
+    idDb,
+    makeSubject('bgm:999', { bgmId: 999, anilistId: 777, titleCn: '对不上的番', season: '2026-10' }),
+  );
+  assert.equal(decision.suggestedKey, 'bgm:999');
+  assert.equal(decision.idConflicts.length, 1, `应当报 1 条 ID 冲突，实际 ${decision.idConflicts.length} 条`);
+  assert.match(decision.idConflicts[0] ?? '', /anilist_id: 库里 888 vs 本次 777/);
+  idDb.close();
+});
+
+check('按 ID 命中时也要扫出同日同名的脏行并吸收（实测漏掉的那一组：転生成为魔剑）', () => {
+  const idDb = openDb(':memory:');
+  migrate(idDb);
+  // 真实库里的形态（已复核 `data/anime.db`）：
+  //   - `bgm:412008` 有 ID，`sources` 只有 yuc
+  //   - `title:転生したら剣でした` 一个 ID 都没有，同名同季
+  // 新数据带 bgmId -> 按 ID 直接命中 `bgm:412008`，**归一化标题那一层根本不会跑**；
+  // 不额外扫一遍的话，那条脏行会永远躺在库里（实跑真实同步时就是这么漏的）。
+  upsertSubject(
+    idDb,
+    makeSubject('bgm:412008', {
+      bgmId: 412008,
+      titleCn: '转生成为魔剑第2期',
+      titleOriginal: '転生したら剣でしたⅡ',
+      season: '2026-10',
+      sources: ['yuc'],
+    }),
+    '2026-10',
+  );
+  upsertSubject(
+    idDb,
+    makeSubject('title:転生したら剣でした', {
+      titleCn: '转生成为魔剑第2期',
+      titleOriginal: '転生したら剣でしたⅡ',
+      season: '2026-10',
+      sources: ['yuc'],
+    }),
+    '2026-10',
+  );
+  assert.equal(countSubjects(idDb), 2, '前置：库里确实是两条');
+
+  const decision = writeWithIdentity(
+    idDb,
+    makeSubject('bgm:412008', {
+      bgmId: 412008,
+      titleCn: '转生成为魔剑第2期',
+      titleOriginal: '転生したら剣でしたⅡ',
+      season: '2026-10',
+      sources: ['bangumi-data', 'yuc', 'anilist'],
+    }),
+  );
+
+  assert.equal(decision.match, 'id', '这次是按 ID 命中的');
+  assert.deepEqual(decision.absorbKeys, ['title:転生したら剣でした'], '那条无 ID 的脏行必须被挑出来');
+  assert.equal(countSubjects(idDb), 1, `脏行应当被吸收，实际还剩 ${countSubjects(idDb)} 行`);
+  idDb.close();
+});
+
+// ⚠ 这里**没有**测「保留行与被吸收行两条都挂在 my_anime 上」那个闸门：
+//   它需要"按 ID 命中一条、同时按标题命中另一条都被追番"的局面。闸门本身保留着
+//   （票 B 的批量合并路径会用到），但本票不假装测过它。
+
+check('只有 yuc 成功的那次同步（分集从 12 条退化到 1 条）不产生 episode-removed', () => {
+  const changeDb = openDb(':memory:');
+  migrate(changeDb);
+  const full = makeSubject('bgm:ren', {
+    titleCn: '只有源退化的番',
+    status: 'airing',
+    totalEps: 12,
+    episodes: Array.from({ length: 12 }, (_, i) =>
+      Object.assign(makeEpisode(i + 1, new Date(Date.UTC(2026, 9, 1 + i * 7, 15, 0)).toISOString()), {
+        airSource: 'anilist' as const,
+      }),
+    ),
+  });
+  upsertSubject(changeDb, full, '2026-10');
+
+  // 这次只有 yuc 成功：yuc 只给第 1 话（src/providers/yuc.ts:338-340）
+  const yucOnly = Object.assign({}, full, {
+    sources: ['yuc' as const],
+    episodes: [Object.assign(makeEpisode(1, '2026-10-01T15:00:00.000Z'), { airSource: 'yuc' as const })],
+  });
+  const changes = detectChanges(changeDb, yucOnly);
+  const removed = changes.filter((change) => change.kind === 'episode-removed');
+  assert.equal(removed.length, 0, `源降级不该报"排期消失"，实际报了 ${removed.length} 条`);
+
+  // 但该源**这次仍然在场**、分集却真的没了时，还是要报（不能把真删档一起吞掉）
+  const stillAnilist = Object.assign({}, full, {
+    sources: ['anilist' as const],
+    episodes: [Object.assign(makeEpisode(1, '2026-10-01T15:00:00.000Z'), { airSource: 'anilist' as const })],
+  });
+  const realRemoval = detectChanges(changeDb, stillAnilist).filter((change) => change.kind === 'episode-removed');
+  assert.equal(realRemoval.length, 11, `源在场时仍要报删除，实际 ${realRemoval.length} 条`);
+  changeDb.close();
+});
+
+check('运行记录（sync_run）能写能读：跨运行留痕，且不因写账失败中断同步', () => {
+  const runDb = openDb(':memory:');
+  migrate(runDb);
+  const id = recordSyncRun(runDb, {
+    startedAt: '2026-10-06T12:00:00.000Z',
+    trigger: 'test',
+    scope: 'season',
+    seasons: ['2026-10'],
+    providers: [{ provider: 'yuc', ok: true, items: 12 }],
+    written: 12,
+    episodes: 40,
+    mergedAway: 3,
+    identityAbsorbed: 1,
+    identitySkipped: 0,
+    error: null,
+  });
+  assert.ok(typeof id === 'number' && id > 0, '应当返回新行的 id');
+
+  const runs = listSyncRuns(runDb, 5);
+  assert.equal(runs.length, 1);
+  assert.deepEqual(runs[0]?.seasons, ['2026-10']);
+  assert.equal(runs[0]?.identityAbsorbed, 1);
+  assert.match(describeSyncRun(runs[0]!), /写入 12 部/);
+
+  // 表被删掉也要**安全返回 null**，不能抛错打断同步
+  runDb.exec('DROP TABLE sync_run');
+  assert.equal(
+    recordSyncRun(runDb, {
+      startedAt: '2026-10-06T12:00:00.000Z',
+      trigger: 'test',
+      scope: 'season',
+      seasons: [],
+      providers: [],
+      written: 0,
+      episodes: 0,
+      mergedAway: 0,
+      identityAbsorbed: 0,
+      identitySkipped: 0,
+      error: null,
+    }),
+    null,
+    '写账失败只能返回 null',
+  );
+  runDb.close();
 });
 
 // ---------------------------------------------------------------------------

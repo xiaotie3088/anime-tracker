@@ -25,6 +25,7 @@ import { yucProvider } from '../providers/yuc.ts';
 import type { Provider } from '../providers/provider.ts';
 import { detectChanges, detectTotalEpsChange, type DetectedChange } from './changes.ts';
 import {
+  applyIdentityAbsorption,
   applyMachineTitle,
   autoArchiveFinished,
   backupDatabase,
@@ -32,7 +33,9 @@ import {
   listTranslationCandidates,
   logChanges,
   pruneBackups,
+  recordSyncRun,
   repairSeasonAssignments,
+  resolveSubjectIdentity,
   seasonSubjectCount,
   upsertSubjects,
   type ArchiveResult,
@@ -106,17 +109,90 @@ export type SyncResult = {
   changes: DetectedChange[];
   /** 写库后被纠正季度归属的条目数 */
   seasonRepaired: number;
+  /** 身份判定审计（票 A）：主键漂移被拦住之后发生了什么 */
+  identity: IdentityAudit;
+  /** 本次同步的运行记录 id（sync_run，NULL 表示写账失败 —— 不影响同步本身） */
+  runId: number | null;
 };
+
+/**
+ * 身份判定审计（票 A）。
+ *
+ * 为什么要把这些**结构化**返回而不是只打日志：`.scratch/duplicate-subjects/issues/01-票A`
+ * 的验收要求能回答"这一次更新里，有没有产生新的分叉、有没有哪条脏行因为闸门没过而留下"。
+ * 日志是给人看的，这份是给 `runFullUpdate` 的 summary 与 UI 用的。
+ */
+export type IdentityAudit = {
+  /** 原 key -> 命中 key，把主键漂移拦住并**吸收**掉的（这些就是本来会变成新重复的） */
+  absorbed: Array<{ from: string; to: string; reason: string; title: string }>;
+  /** 本该吸收却因闸门没通过而**留下**的（留给票 B 的 dry-run 报告） */
+  skipped: Array<{ key: string; target: string; reason: string }>;
+  /** 命中行带着另一个外部 ID：只补空位不当覆盖 */
+  conflicts: Array<{ key: string; detail: string }>;
+};
+
+function emptyIdentityAudit(): IdentityAudit {
+  return { absorbed: [], skipped: [], conflicts: [] };
+}
+
+function describeSubject(subject: Subject): string {
+  return subject.titleCn ?? subject.titleOriginal ?? subject.titleEn ?? subject.key;
+}
 
 /**
  * 抓取当季并落库。任何单一数据源失败都不会中断整体。
  *
- * 关键顺序：**先比对变更，再写入**。写完之后旧值就不存在了。
+ * 关键顺序：**先判定身份 → 再比对变更 → 最后写入**。
+ *   1. 身份（`resolveSubjectIdentity`，票 A）：把会漂移的主键纠回库里已有的那一行，
+ *      并把该吸收的无 ID 脏行吸收掉；
+ *   2. 变更：写完之后旧值就不存在了，所以必须在写之前比；
+ *   3. 写入。
+ * ⚠ 1 必须在 2 之前：否则 `detectChanges()` 会拿**新 key** 去比**旧 key** 的行，
+ *   库里的分集一条都对不上，整部番会被误判成"新增分集"。
  */
-export async function syncSeason(db: DatabaseSync, season: SeasonInfo): Promise<SyncResult> {
-  const outcome = await fetchSeason(season);
+export async function syncSeason(
+  db: DatabaseSync,
+  season: SeasonInfo,
+  context: { trigger?: 'cli' | 'web' | 'test'; scope?: 'season' | 'archive-season'; parentRunId?: number | null } = {},
+): Promise<SyncResult> {
+  const startedAt = new Date().toISOString();
+  let outcome: FetchOutcome;
+  try {
+    outcome = await fetchSeason(season);
+  } catch (error) {
+    // 抓取整体失败（三个源全炸）也要留痕：否则"某天数据不对"时又是无据可查
+    const runId = recordSyncRun(db, {
+      startedAt,
+      trigger: context.trigger ?? null,
+      scope: context.scope ?? 'season',
+      seasons: [season.id],
+      providers: [],
+      written: 0,
+      episodes: 0,
+      mergedAway: 0,
+      identityAbsorbed: 0,
+      identitySkipped: 0,
+      error: error instanceof Error ? error.message : String(error),
+      parentRunId: context.parentRunId ?? null,
+    });
+    throw Object.assign(error instanceof Error ? error : new Error(String(error)), { runId });
+  }
 
   if (outcome.subjects.length === 0) {
+    const runId = recordSyncRun(db, {
+      startedAt,
+      trigger: context.trigger ?? null,
+      scope: context.scope ?? 'season',
+      seasons: [season.id],
+      providers: outcome.reports,
+      written: 0,
+      episodes: 0,
+      mergedAway: outcome.mergedAway,
+      identityAbsorbed: 0,
+      identitySkipped: 0,
+      error: null,
+      parentRunId: context.parentRunId ?? null,
+    });
     return {
       outcome,
       written: 0,
@@ -124,21 +200,65 @@ export async function syncSeason(db: DatabaseSync, season: SeasonInfo): Promise<
       archive: emptyArchiveResult(),
       changes: [],
       seasonRepaired: 0,
+      identity: emptyIdentityAudit(),
+      runId,
     };
   }
 
-  // 1) 写入之前先把变更比出来
-  const detected: DetectedChange[] = [];
+  // 1) 身份判定：决定这一批每一条该写进哪一行。
+  //    ⚠ 必须在 detectChanges 之前 —— 见上面的说明。
+  const identity = emptyIdentityAudit();
+  const resolved: Subject[] = [];
+  const decisions: Array<{ decision: ReturnType<typeof resolveSubjectIdentity>; subject: Subject }> = [];
   for (const subject of outcome.subjects) {
+    const decision = resolveSubjectIdentity(db, subject);
+    const entry: Subject = decision.remapped ? { ...subject, key: decision.suggestedKey } : subject;
+    for (const detail of decision.idConflicts) {
+      identity.conflicts.push({ key: decision.suggestedKey, detail });
+    }
+    resolved.push(entry);
+    decisions.push({ decision, subject: entry });
+  }
+
+  // 2) 写入之前先把变更比出来（用的必须是 resolve 之后的 key）
+  const detected: DetectedChange[] = [];
+  for (const subject of resolved) {
     detected.push(...detectChanges(db, subject));
     const totalEpsChange = detectTotalEpsChange(db, subject);
     if (totalEpsChange) detected.push(totalEpsChange);
   }
 
-  // 2) 落库
-  const written = upsertSubjects(db, outcome.subjects, season.id);
+  // 3) 落库
+  const written = upsertSubjects(db, resolved, season.id);
 
-  // 3) 变更写进日志（放在落库之后，避免日志里引用到还不存在的条目）
+  // 3.5) 吸收脏行（票 A）：**必须放在落库之后** —— 被 repoint 的 my_anime 有外键指向保留行，
+  //      保留行还不存在时 repoint 会 FOREIGN KEY constraint failed（实测踩到过）。
+  //
+  //      ⚠ 即使这次是**按 bgm_id 命中**库里那条带 ID 的行，也照样要吸收：
+  //      实测就是这个缺口漏掉了真正的重复 —— 按 ID 命中之后归一化标题那层根本不会跑，
+  //      而同一部番的 `title:<归一化名>` 脏行还躺在库里，永远碰不到它。
+  for (const { decision, subject } of decisions) {
+    for (const dirtyKey of decision.absorbKeys) {
+      const result = applyIdentityAbsorption(db, dirtyKey, decision.suggestedKey);
+      if (result.absorbed) {
+        identity.absorbed.push({
+          from: dirtyKey,
+          to: decision.suggestedKey,
+          reason: decision.reason,
+          title: describeSubject(subject),
+        });
+      } else {
+        // 闸门没过：**不删也不动引用**，只报告，留给票 B 的 dry-run 报告
+        identity.skipped.push({
+          key: dirtyKey,
+          target: decision.suggestedKey,
+          reason: result.reason ?? '未说明',
+        });
+      }
+    }
+  }
+
+  // 4) 变更写进日志（放在落库之后，避免日志里引用到还不存在的条目）
   if (detected.length > 0) {
     logChanges(
       db,
@@ -159,13 +279,31 @@ export async function syncSeason(db: DatabaseSync, season: SeasonInfo): Promise<
   // 所以写完之后按「条目自己的放送时刻」统一纠一遍（见 db.ts 的说明）。
   const seasonRepaired = repairSeasonAssignments(db, season.id);
 
+  const episodeCount = resolved.reduce((sum, subject) => sum + subject.episodes.length, 0);
+  const runId = recordSyncRun(db, {
+    startedAt,
+    trigger: context.trigger ?? null,
+    scope: context.scope ?? 'season',
+    seasons: [season.id],
+    providers: outcome.reports,
+    written,
+    episodes: episodeCount,
+    mergedAway: outcome.mergedAway,
+    identityAbsorbed: identity.absorbed.length,
+    identitySkipped: identity.skipped.length,
+    error: null,
+    parentRunId: context.parentRunId ?? null,
+  });
+
   return {
     outcome,
     written,
-    episodeCount: outcome.subjects.reduce((sum, subject) => sum + subject.episodes.length, 0),
+    episodeCount,
     archive,
     changes: detected,
     seasonRepaired,
+    identity,
+    runId,
   };
 }
 
@@ -292,6 +430,10 @@ export async function syncArchive(
     minSubjects?: number;
     intervalMs?: number;
     onProgress?: (message: string) => void;
+    /** 谁触发的（写进 sync_run） */
+    trigger?: 'cli' | 'web' | 'test';
+    /** 挂到哪一次「一键更新」下（每季一行 sync_run，靠它串起来） */
+    parentRunId?: number | null;
   } = {},
 ): Promise<ArchiveSyncResult> {
   const { force = false, minSubjects = 1, intervalMs = 1_000, onProgress } = options;
@@ -319,7 +461,11 @@ export async function syncArchive(
     onProgress?.(`正在回填 ${seasonId}…`);
 
     try {
-      const synced = await syncSeason(db, seasonFromId(seasonId));
+      const synced = await syncSeason(db, seasonFromId(seasonId), {
+        ...(options.trigger ? { trigger: options.trigger } : {}),
+        scope: 'archive-season',
+        parentRunId: options.parentRunId ?? null,
+      });
       const written = synced.written;
       result.totalWritten += written;
       result.totalEpisodes += synced.episodeCount;
@@ -550,6 +696,13 @@ export type FullUpdateResult = {
   translated: TranslateResult;
   /** 自动备份结果（用户数据不可重建，同步前必须先备份） */
   backup: { path: string; bytes: number } | null;
+  /**
+   * 身份判定审计（票 A）：这次更新里主键漂移被拦住了几条（= 本来会变成新重复的）、
+   * 有几条脏行因为闸门没过而留下、有几个外部 ID 冲突。
+   */
+  identity: IdentityAudit;
+  /** 本次「一键更新」在 sync_run 里的 id（回填的每一季是它的子行） */
+  runId: number | null;
   /** 汇总成一句话，直接可以显示在界面上 */
   summary: {
     written: number;
@@ -561,6 +714,10 @@ export type FullUpdateResult = {
     changeCount: number;
     failedProviders: string[];
     translationFailures: number;
+    /** 身份判定吸收掉的重复行数（0 = 这次没有新的分叉） */
+    identityAbsorbed: number;
+    /** 该吸收却没吸收、留给票 B 清理的条数 */
+    identitySkipped: number;
   };
   /** 被自动归档移动的番（用户诉求 5：让这个行为可见） */
   moved: ArchiveResult['moved'];
@@ -624,6 +781,8 @@ export async function runFullUpdate(
      * 默认关闭：官方译名真正到达时，syncSeason 的 UPSERT 已经自动替换了它。
      */
     heal?: boolean;
+    /** 谁触发的：只用于写 sync_run 的运行记录 */
+    trigger?: 'cli' | 'web' | 'test';
     onProgress?: (message: string) => void;
   } = {},
 ): Promise<FullUpdateResult> {
@@ -634,6 +793,7 @@ export async function runFullUpdate(
     translate = true,
     translateLimit = 0,
     heal = false,
+    trigger,
     onProgress,
   } = options;
 
@@ -668,7 +828,7 @@ export async function runFullUpdate(
   pruneBackups();
 
   onProgress?.(`正在抓取 ${mainSeason.label}…`);
-  const current = await syncSeason(db, mainSeason);
+  const current = await syncSeason(db, mainSeason, { ...(trigger ? { trigger } : {}), scope: 'season' });
 
   onProgress?.(
     scope.mode === 'seasons'
@@ -690,6 +850,9 @@ export async function runFullUpdate(
         force,
         intervalMs: 1_000,
         onProgress,
+        ...(trigger ? { trigger } : {}),
+        // 回填的每一季都挂到「这次一键更新」下 —— 否则又回到"无法判定重复来自哪次运行"
+        parentRunId: current.runId,
       });
     }
   } catch (error) {
@@ -756,6 +919,14 @@ export async function runFullUpdate(
   const failedProviders = current.outcome.reports.filter((report) => !report.ok).map((report) => report.provider);
   const movedToBacklog = current.archive.toBacklog.length;
   const movedToFinished = current.archive.toFinished.length;
+  // 身份审计只覆盖当季那一次（回填的每一季各自写了自己的 sync_run 行）
+  const identity = current.identity;
+  if (identity.absorbed.length > 0 || identity.skipped.length > 0 || identity.conflicts.length > 0) {
+    onProgress?.(
+      `身份判定：拦住主键漂移并吸收重复 ${identity.absorbed.length} 条，` +
+        `留给清理 ${identity.skipped.length} 条，外部 ID 冲突 ${identity.conflicts.length} 条`,
+    );
+  }
 
   return {
     season: mainSeason.id,
@@ -772,6 +943,8 @@ export async function runFullUpdate(
     healed,
     translated,
     backup: backup ? { path: backup.path, bytes: backup.bytes } : null,
+    identity,
+    runId: current.runId,
     summary: {
       written: current.written + archive.totalWritten,
       episodes: current.episodeCount + archive.totalEpisodes,
@@ -782,6 +955,8 @@ export async function runFullUpdate(
       changeCount: current.changes.length,
       failedProviders,
       translationFailures: translated.failed.length,
+      identityAbsorbed: identity.absorbed.length,
+      identitySkipped: identity.skipped.length,
     },
     moved: current.archive.moved,
   };

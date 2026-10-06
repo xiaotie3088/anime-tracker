@@ -146,3 +146,39 @@ CREATE TABLE IF NOT EXISTS source_record (
 );
 
 CREATE INDEX IF NOT EXISTS idx_source_record_lookup ON source_record(source, kind, fetched_at);
+
+-- ---------------------------------------------------------------------------
+-- 每次同步的运行记录
+-- ---------------------------------------------------------------------------
+
+-- 为什么需要它（.scratch/duplicate-subjects/issues/01-票A）：
+--   「同一部番两条记录」这条 bug 排查时**无法判定**重复是"同一次更新的当季 pass +
+--   回填 pass"造成的，还是"点了两次更新"造成的 —— 因为跨运行完全没有留痕：
+--   source_record 表 0 行（代码里根本没有任何地方写它），launcher.log 只记浏览器与服务启动。
+--   修好身份判定之后，"新增不再分叉"也需要一张账才能自证。
+--
+-- 这是**运行记录，不是缓存**：只追加、不参与抓取判断，可以随时清空（见 clearFetchedData）。
+CREATE TABLE IF NOT EXISTS sync_run (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  started_at        TEXT    NOT NULL,
+  finished_at       TEXT,
+  -- 'cli' | 'web' | 'test'：谁触发的
+  trigger           TEXT,
+  -- 'season' | 'archive-season'：这一行是当季抓取还是回填某一季
+  scope             TEXT,
+  -- 本次抓取的季度列表（JSON 数组）
+  seasons           TEXT    NOT NULL DEFAULT '[]',
+  -- 每个源的成败与条数（JSON 数组，与 sync.ts 的 ProviderReport 同构）
+  providers         TEXT    NOT NULL DEFAULT '[]',
+  written           INTEGER NOT NULL DEFAULT 0,
+  episodes          INTEGER NOT NULL DEFAULT 0,
+  merged_away       INTEGER NOT NULL DEFAULT 0,
+  identity_absorbed INTEGER NOT NULL DEFAULT 0,
+  identity_skipped  INTEGER NOT NULL DEFAULT 0,
+  error             TEXT,
+  -- 这一行属于哪次「一键更新」（回填的每一季都挂到同一次更新下）。
+  -- 已存在的库由 db.ts 的 ensureColumn 自动补上这一列。
+  parent_run_id     INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_sync_run_time ON sync_run(started_at);

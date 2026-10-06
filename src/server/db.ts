@@ -15,6 +15,7 @@ import { DatabaseSync } from 'node:sqlite';
 import path from 'node:path';
 
 import { shouldArchiveToBacklog } from '../core/backlog.ts';
+import { normalizeTitle } from '../core/merge.ts';
 import { decideMachineTranslation } from '../core/mt.ts';
 import { seasonOf, shiftSeason } from '../core/time.ts';
 import type { AiringStatus, Episode, Platform, Subject, TitleCnSource, TrackCategory } from '../core/types.ts';
@@ -25,7 +26,14 @@ const SCHEMA_SQL = readFileSync(new URL('./schema.sql', import.meta.url), 'utf8'
 export const DEFAULT_DB_PATH = path.join(DATA_DIR, 'anime.db');
 /** 备份目录：用户数据（追番列表 / 进度 / 补番库）不可重建，所以要有兜底。 */
 export const BACKUP_DIR = path.join(DATA_DIR, 'backups');
-export const SCHEMA_VERSION = 2;
+/**
+ * 库结构版本。
+ *
+ *   2 -> 3：新增 `sync_run`（每次同步的运行记录，见 schema.sql 与票 A）。
+ *           `migrate()` 里 `db.exec(SCHEMA_SQL)` 本身是幂等的 `IF NOT EXISTS`，
+ *           所以新表不需要额外迁移语句 —— 提版本号是为了让"库是新的还是旧的"可查。
+ */
+export const SCHEMA_VERSION = 3;
 
 /** node:sqlite 只接受 null / number / string / bigint / Uint8Array，布尔和 undefined 必须转换。 */
 type BindValue = null | number | string | bigint | Uint8Array;
@@ -72,6 +80,9 @@ export function migrate(db: DatabaseSync): void {
   // 临时机翻译名（见 docs/决策记录.md D8）。历史数据这两列为 NULL，语义上等于 official。
   ensureColumn(db, 'subject', 'title_cn_source', 'TEXT');
   ensureColumn(db, 'subject', 'title_cn_source_at', 'TEXT');
+  // 运行记录（票 A）：新表由 schema.sql 建，但**已存在的库**建表时还没有这一列，
+  // 而 `CREATE TABLE IF NOT EXISTS` 不会给老表补列 —— 所以这里显式补。
+  ensureColumn(db, 'sync_run', 'parent_run_id', 'INTEGER');
   setMeta(db, 'schema_version', String(SCHEMA_VERSION));
   setMeta(db, 'migrated_at', nowIso());
 }
@@ -139,7 +150,20 @@ const SUBJECT_COLUMNS = [
  *   - 官方名到了（excluded.title_cn 非空）-> 覆盖机翻名，并把出处改回 'official'
  *   - 官方名还没到（excluded.title_cn 为空）-> 原样保留机翻名与出处
  */
-const PRESERVE_WHEN_EMPTY = ['title_cn', 'title_cn_source', 'title_cn_source_at'] as const;
+const PRESERVE_WHEN_EMPTY = [
+  'title_cn',
+  'title_cn_source',
+  'title_cn_source_at',
+  // 外部 ID 也要保住（票 A 实测踩到过）：一次「只有 yuc 成功」的同步里，
+  // 融合结果**没有任何外部 ID**，如果按 `bgm_id = excluded.bgm_id` 写下去，
+  // 库里已经识别出来的 `bgm_id` 就被清成了 NULL ——
+  // 而身份判定正是靠它认人，清掉之后下一次又会退化成按标题匹配。
+  // 语义：这一列这次没给值就保留旧值；给了值（说明数据源这次认出了它）就覆盖。
+  'bgm_id',
+  'anilist_id',
+  'mal_id',
+  // bili_season_id 不在列清单里（见 SUBJECT_COLUMNS），所以这里也不用写
+] as const;
 
 /** 由列清单生成 UPSERT，避免手写 27 个占位符时数错。 */
 function buildUpsert(
@@ -674,6 +698,419 @@ export function searchLocalSubjects(db: DatabaseSync, keyword: string, limit = 2
     )
     .all(...bindAll([like, like, like, limit])) as unknown as SubjectRefRow[];
   return rows.map(toSubjectRef);
+}
+
+// ---------------------------------------------------------------------------
+// 写库前的「找已有番」身份判定（票 A：.scratch/duplicate-subjects/issues/01-票A）
+// ---------------------------------------------------------------------------
+
+/** 身份判定用的整行投影（比 SUBJECT_REF_SELECT 多出外部 ID 与来源，吸收旧行要用）。 */
+const SUBJECT_ID_SELECT =
+  'SELECT s.key, s.bgm_id, s.anilist_id, s.mal_id, s.bili_season_id, s.title_cn, s.title_original, s.title_en, s.aliases, s.sources, s.season, s.title_cn_source, s.total_eps, s.duration_min, s.status FROM subject AS s';
+
+/**
+ * 季度是否兼容：两侧都拿到季度、且互不相同时**否决**匹配。
+ *
+ * 为什么必须有这道否决 —— 实测有 49 组**跨季度**同名条目：
+ * 同名但季度不同的两部番（重制版、续作、同名新作）是**两部不同的番**，不能并成一条。
+ * 季度缺失（补番库老番、只有标题的脏数据）一律视为"未知"，不参与否决 ——
+ * 否则"新数据有季度、老行没有"就会漏配，而那正是重复产生的主形态。
+ */
+function seasonCompatible(rowSeason: string | null, subjectSeason: string | null | undefined): boolean {
+  const a = (rowSeason ?? '').trim();
+  const b = (subjectSeason ?? '').trim();
+  if (a === '' || b === '') return true;
+  return a === b;
+}
+
+/**
+ * 在库里找「同一部番」的行，顺序不可颠倒：
+ *   1. 外部 ID（bgm / anilist / mal）
+ *   2. 归一化标题（`normalizeTitle()` 同口径）
+ *   3. 都没有 -> 新建
+ *
+ * 第 2 步是**必须的**：现状是"新数据有 ID、老行没 ID"（实测 384 行没有任何外部 ID），
+ * 只按 ID 查必然漏，而漏一次就多一条重复。
+ *
+ * 标题怎么比 —— 分两轮，先严后宽，且**只有第一轮没命中才放宽**：
+ *   1. 归一化后**相等**（`normalizeTitle()` 已剥掉 `第N季` / `Season N` / `Ⅱ` / `PartN`）
+ *   2. 归一化后一方包含另一方（库里的「夏日重现第二季」vs 新数据的「夏日重现」）
+ *      —— 因为 `normalizeTitle()` 剥不掉 `第2クール` / `Part.2` / `2nd&3rd STAGE`。
+ *
+ * 放宽就有误配风险，所以三道防线：短标题（归一化后 < 4 字符）不参与包含匹配；
+ * 季度不同的直接否决（实测 49 组跨季度同名，是**两部不同的番**）；
+ * 多行命中时按 `sources` 条数取胜，且**是否真的吸收**另有更严格的闸门
+ * （见 `absorbSubjectRow`）。
+ */
+function findSubjectsByTitle(db: DatabaseSync, subject: Subject): TitleMatchRow[] {
+  const exact = new Set<string>();
+  const loose = new Set<string>();
+  for (const text of [subject.titleCn, subject.titleOriginal, subject.titleEn, ...(subject.aliases ?? [])]) {
+    const value = (text ?? '').trim();
+    if (value === '') continue;
+    const normalized = normalizeTitle(value);
+    // 归一化后不到 2 个字符的（"犬"、"9"）太容易误配，两轮都不参与
+    if (normalized.length < 2) continue;
+    exact.add(normalized);
+    if (normalized.length >= 4) loose.add(normalized);
+  }
+  if (exact.size === 0) return [];
+
+  // 先用 LIKE 把候选收窄（归一化是 JS 侧的事，SQL 做不了）。
+  // LIKE 在 SQLite 里对 ASCII 是不区分大小写的，而这里两边都已经是 normalizeTitle 的结果，
+  // 所以中文/日文路径不受影响。
+  const select = SUBJECT_ID_SELECT;
+  const probes = [...exact];
+  const filters: string[] = [];
+  const params: unknown[] = [];
+  const columns = ['s.title_cn', 's.title_original', 's.title_en', 's.aliases'];
+  for (const probe of probes) {
+    for (const column of columns) filters.push(`${column} LIKE ?`);
+    params.push(`%${probe}%`, `%${probe}%`, `%${probe}%`, `%${probe}%`);
+  }
+  const candidates = db.prepare(`${select} WHERE ${filters.join(' OR ')}`).all(...bindAll(params)) as unknown as
+    TitleMatchRow[];
+
+  const byKey = new Map<string, TitleMatchRow>();
+  for (const row of candidates) byKey.set(row.key, row);
+
+  const rowKeysOf = (row: TitleMatchRow): string[] => {
+    let aliases: string[] = [];
+    try {
+      const parsed: unknown = JSON.parse(row.aliases ?? '[]');
+      if (Array.isArray(parsed)) aliases = parsed.filter((item): item is string => typeof item === 'string');
+    } catch {
+      aliases = [];
+    }
+    const normalized = [row.title_cn, row.title_original, row.title_en, ...aliases]
+      .map((text) => normalizeTitle((text ?? '').trim()))
+      .filter((text) => text.length >= 2);
+    return [...new Set([...normalized, ...aliases])];
+  };
+
+  // 轮 1：归一化后相等
+  const exactHits: TitleMatchRow[] = [];
+  const looseHits: TitleMatchRow[] = [];
+  for (const row of byKey.values()) {
+    if (!seasonCompatible(row.season, subject.season)) continue;
+
+    const rowKeys = rowKeysOf(row);
+    if (rowKeys.some((key) => exact.has(key))) {
+      exactHits.push(row);
+      continue;
+    }
+    if (rowKeys.some((key) => [...loose].some((probe) => key.includes(probe) || probe.includes(key)))) {
+      looseHits.push(row);
+    }
+  }
+
+  const pool = exactHits.length > 0 ? exactHits : looseHits;
+  // 信息更全的（`sources` 条数多）排在前面 —— 那条才是"正主"，
+  // 只有 yuc 的脏条目排在后面等着被吸收。
+  pool.sort((a, b) => sourceCount(b) - sourceCount(a));
+  return pool;
+}
+
+function sourceCount(row: { sources: string | null }): number {
+  return parseJsonArray<string>(row.sources).length;
+}
+
+type TitleMatchRow = SubjectRefRow & {
+  bgm_id: number | null;
+  anilist_id: number | null;
+  mal_id: number | null;
+  bili_season_id: number | null;
+  title_en: string | null;
+  aliases: string | null;
+  sources: string | null;
+};
+
+export type IdentityMatch = 'id' | 'title';
+export type IdentityStatus = 'new' | 'reused' | 'absorbed';
+
+/**
+ * 写库前的身份判定结果。见 `resolveSubjectIdentity()`。
+ *
+ * ⚠ 这是**建议值**：调用方必须把 `subject.key` 改成 `suggestedKey` 再去写库与比对变更，
+ * 否则 `detectChanges()` 会拿新 key 去比旧 key 的行，把整部番误判成"新增分集"。
+ */
+export type IdentityResolution = {
+  /** 这次应该写进哪一行 */
+  suggestedKey: string;
+  /** 原 key 与 suggestedKey 不同（= 主键漂移被拦住） */
+  remapped: boolean;
+  match: IdentityMatch | 'none';
+  status: IdentityStatus;
+  /** 命中依据（日志用） */
+  reason: 'bgm' | 'anilist' | 'mal' | 'title' | 'new';
+  /** 命中行带着另一个外部 ID：只报告，不改写库行为 */
+  idConflicts: string[];
+  /**
+   * **另外**要吸收掉的同名脏行（无外部 ID 的那些）。
+   *
+   * 为什么单独列出来 —— 实测踩到过的漏配：新数据按 `bgm_id` 命中了库里那条**带 ID**的行，
+   * 于是归一化标题那一层根本不会跑；而同一部番的 `title:<归一化名>` 脏行**还躺在库里**，
+   * 每一次同步都命中带 ID 的那条、永远碰不到它 —— 两条行就永久并存了。
+   * 所以按 ID 命中之后**还要再按标题扫一遍**，把这些脏行挑出来吸收。
+   */
+  absorbKeys: string[];
+};
+
+/**
+ * 判定「这次要写的这部番，该写进库里哪一行」，以及有哪些脏行该被吸收。
+ *
+ * 这是票 A 的核心：跨源聚类（`mergeSubjects()`）只在**本次抓取的内存里**做，
+ * 从不回查数据库；写库又是裸 UPSERT，主键 `subject.key` 会随"这次哪个源成功"漂移
+ * （`bgm:<id>` ↔ `title:<归一化名>`），旧行永不删除 —— 于是同一部番两行并存。
+ * 实测 98 组重复全部是「一条有外部 ID + 一条只有 yuc 的 `title:` 条目」。
+ *
+ * 判定顺序（不可颠倒）：外部 ID → 归一化标题 → 都没有才新建。
+ *
+ * ⚠ 调用时机：必须在 `detectChanges()` **之前**。
+ *
+ * ⚠ 本函数**只做判定，不写库**。真正吸收要靠 `applyIdentityAbsorption()`
+ *   **在保留行写入之后**调用 —— 被 repoint 的 `my_anime` 有外键指向保留行，
+ *   保留行还不存在时 repoint 会 FOREIGN KEY constraint failed（实测踩到过）。
+ */
+export function resolveSubjectIdentity(db: DatabaseSync, subject: Subject): IdentityResolution {
+  // 1) 外部 ID
+  let byId: TitleMatchRow | undefined;
+  let idReason: IdentityResolution['reason'] = 'new';
+  if (subject.bgmId) {
+    byId = lookupSubjectByColumn(db, 'bgm_id', subject.bgmId);
+    if (byId) idReason = 'bgm';
+  }
+  if (!byId && subject.anilistId) {
+    byId = lookupSubjectByColumn(db, 'anilist_id', subject.anilistId);
+    if (byId) idReason = 'anilist';
+  }
+  if (!byId && subject.malId) {
+    byId = lookupSubjectByColumn(db, 'mal_id', subject.malId);
+    if (byId) idReason = 'mal';
+  }
+
+  // 2) 归一化标题（按 ID 命中之后**仍然要查**：见 absorbKeys 的说明）
+  const byTitle: TitleMatchRow[] = findSubjectsByTitle(db, subject);
+
+  // 3) 选择"写进哪一行"，并挑出要吸收的脏行
+  const primary = byId ?? byTitle[0];
+  if (!primary) {
+    return {
+      suggestedKey: subject.key,
+      remapped: false,
+      match: 'none',
+      status: 'new',
+      reason: 'new',
+      idConflicts: [],
+      absorbKeys: [],
+    };
+  }
+
+  // 保留哪一行：**带外部 ID 的那一行**更稳定。
+  // 命中行是"只有标题、没有 ID"的脏行，而本次数据带着 ID 时，就写本次这个 key
+  //（前提是它还没被别的行占用）。理由：`title:<归一化名>` 是会漂移的形态，
+  // 让带 ID 的记录活下来才是长期稳定的。
+  let primaryRow = primary;
+  const byIdHasId = byId !== undefined && hasExternalId(byId);
+  if (!byIdHasId && hasExternalId(subject) && !subjectKeyExists(db, subject.key)) {
+    const wasTitleOnly = primaryRow.key !== subject.key;
+    if (wasTitleOnly) {
+      console.warn(
+        `[identity] 主键漂移被拦住：写进 ${subject.key}，准备吸收 ${primaryRow.key}` +
+          `（依据 ${byId ? idReason : 'title'}，命中行是「${primaryRow.title_cn ?? primaryRow.title_original ?? primaryRow.key}」）`,
+      );
+    }
+    primaryRow = {
+      ...primaryRow,
+      key: subject.key,
+      bgm_id: subject.bgmId ?? primaryRow.bgm_id,
+      anilist_id: subject.anilistId ?? primaryRow.anilist_id,
+      mal_id: subject.malId ?? primaryRow.mal_id,
+    };
+  }
+
+  const reason: IdentityResolution['reason'] = byId ? idReason : 'title';
+  const absorbKeys = [...new Set([primary.key, ...byTitle.map((row) => row.key)])].filter(
+    (key) => key !== primaryRow.key,
+  );
+  if (absorbKeys.length > 0) {
+    console.warn(`[identity] ${subject.key} 命中 ${primaryRow.key}，另有同日同名脏行待吸收：${absorbKeys.join('、')}`);
+  }
+
+  return {
+    suggestedKey: primaryRow.key,
+    remapped: primaryRow.key !== subject.key,
+    match: byId ? 'id' : 'title',
+    status: 'reused',
+    reason,
+    idConflicts: collectIdConflicts(primaryRow, reason, subject),
+    absorbKeys,
+  };
+}
+
+/**
+ * 吸收一条脏行：按顺序在**同一个事务**里
+ *   1. 把 `my_anime` / `schedule_override` / `change_log` 里指向它的引用 repoint 到保留行；
+ *   2. `DELETE FROM subject` 删掉它（`episode` 靠 `ON DELETE CASCADE` 一起走）。
+ *
+ * ⚠ **必须在保留行写进库之后调用** —— `my_anime` 有外键指向 `subject(key)`，
+ *   保留行还不存在时 repoint 会 `FOREIGN KEY constraint failed`（实测踩到过）。
+ *
+ * 两道闸门（只保护"不丢东西"，不阻止合并本身）：
+ *   a. 不是一条**有内容的有 ID 记录**（"两条都带 ID 的重复"属于票 B 的清理）；无 ID 的随便吸收；
+ *   b. `my_anime` 不能两边都有 —— 用户追的是哪一条、进度怎么并，是**人工判断**。
+ *
+ * ⚠ 闸门没过或抛错时**不删、也不改任何引用**：一次写库不该因为一条脏行就动用户数据。
+ *   整段独立 try/catch + 独立事务，抛错也只返回原因（绝不冒泡打断同步）。
+ */
+export function applyIdentityAbsorption(
+  db: DatabaseSync,
+  target: string,
+  keepKey: string,
+): { absorbed: boolean; reason?: string } {
+  const row = db
+    .prepare(`${SUBJECT_ID_SELECT} WHERE s.key = ?`)
+    .get(...bindAll([target])) as unknown as TitleMatchRow | undefined;
+  if (!row) return { absorbed: false, reason: '该行已不存在' };
+  if (target === keepKey) return { absorbed: false, reason: '保留行与目标行相同' };
+
+  // 闸门 a：**有内容的有 ID 记录**不删。
+  // 无 ID 的行（实测 98 组重复全是这种）照吸收；"有 ID 但一条分集都没有"的也行
+  //（那种行没有信息量，删掉不丢东西，而留着就是永久并存的第二行）。
+  const episodes = db
+    .prepare('SELECT ep_number, air_at_utc FROM episode WHERE subject_key = ?')
+    .all(...bindAll([target])) as unknown as Array<{ ep_number: number; air_at_utc: string | null }>;
+  if ((row.bgm_id || row.anilist_id || row.mal_id) && episodes.length > 0) {
+    const reason = '它是带外部 ID 且有分集的记录（两条都带 ID 的重复属于票 B 的清理）';
+    console.warn(`[identity] ${target} ${reason}，不吸收`);
+    return { absorbed: false, reason };
+  }
+
+  // 闸门 b：用户数据不能两边都有
+  const keepTracked = db.prepare('SELECT 1 AS x FROM my_anime WHERE subject_key = ?').get(...bindAll([keepKey]));
+  const targetTracked = db.prepare('SELECT 1 AS x FROM my_anime WHERE subject_key = ?').get(...bindAll([target]));
+  if (keepTracked && targetTracked) {
+    const reason = '两条都挂在「我的追番」上（用户追的是哪条、进度怎么并需要人工判断）';
+    console.warn(`[identity] ${target} 与 ${keepKey} ${reason}，留给票 B 的 dry-run 报告`);
+    return { absorbed: false, reason };
+  }
+
+  try {
+    db.exec('BEGIN');
+    repointSubjectReferences(db, target, keepKey);
+    db.prepare('DELETE FROM subject WHERE key = ?').run(...bindAll([target]));
+    db.exec('COMMIT');
+  } catch (error) {
+    try {
+      db.exec('ROLLBACK');
+    } catch {
+      // 已经在事务外（例如 BEGIN 自己就失败了）—— 不必再 rollback
+    }
+    const reason = `吸收失败：${error instanceof Error ? error.message : String(error)}`;
+    console.warn(`[identity] ${target} ${reason}（已回滚，旧行与引用都保持原样）`);
+    return { absorbed: false, reason };
+  }
+  console.warn(`[identity] 已吸收 ${target}（分集与引用已并入 ${keepKey}）`);
+  return { absorbed: true };
+}
+
+/** 只关心四个 ID 列，所以 Subject 与库里读出来的行都能传进来。 */
+function hasExternalId(value: {
+  bgmId?: number | undefined;
+  anilistId?: number | undefined;
+  malId?: number | undefined;
+  biliSeasonId?: number | undefined;
+  bgm_id?: number | null;
+  anilist_id?: number | null;
+  mal_id?: number | null;
+  bili_season_id?: number | null;
+}): boolean {
+  return Boolean(
+    value.bgmId ??
+      value.anilistId ??
+      value.malId ??
+      value.biliSeasonId ??
+      value.bgm_id ??
+      value.anilist_id ??
+      value.mal_id ??
+      value.bili_season_id,
+  );
+}
+
+function subjectKeyExists(db: DatabaseSync, key: string): boolean {
+  return db.prepare('SELECT 1 AS x FROM subject WHERE key = ?').get(...bindAll([key])) !== undefined;
+}
+
+function lookupSubjectByColumn(db: DatabaseSync, column: string, value: number): TitleMatchRow | undefined {
+  const row = db
+    .prepare(`${SUBJECT_ID_SELECT} WHERE s.${column} = ? LIMIT 1`)
+    .get(...bindAll([value])) as unknown as TitleMatchRow | undefined;
+  return row;
+}
+
+/**
+ * 命中行若带着**另一个**外部 ID，只报告、不覆盖（见 resolveSubjectIdentity 的 idConflicts）。
+ *
+ * 为什么只报告：库里那行可能是**真的另一部番**（同名不同作品），把本次的 ID 覆盖上去
+ * 等于把 B 番的 ID 写到 A 番身上。写库时 UPSERT 只会把新 ID 写进**保留行**，
+ * 这里报告的是"数据源之间对不上"的信号，交给人工判断。
+ */
+function collectIdConflicts(
+  row: { bgm_id: number | null; anilist_id: number | null; mal_id: number | null },
+  reason: IdentityResolution['reason'],
+  subject: Subject,
+): string[] {
+  // 命中依据就是那个 ID 时，它当然相等，不用报；只报**其他**两个字段上的不一致
+  const conflicts: string[] = [];
+  const check = (label: string, field: string, inRow: number | null | undefined, incoming: number | undefined): void => {
+    if (reason === field) return;
+    if (inRow && incoming && inRow !== incoming) conflicts.push(`${label}: 库里 ${inRow} vs 本次 ${incoming}`);
+  };
+  check('bgm_id', 'bgm', row.bgm_id, subject.bgmId);
+  check('anilist_id', 'anilist', row.anilist_id, subject.anilistId);
+  check('mal_id', 'mal', row.mal_id, subject.malId);
+  for (const conflict of conflicts) console.warn(`[identity] 外部 ID 不一致，以本次写入值为准：${conflict}`);
+  return conflicts;
+}
+
+/**
+ * 吸收旧行：按顺序在**同一个事务**里
+ *   1. 把 `my_anime` / `schedule_override` / `change_log` 里指向旧 key 的引用 repoint 到新 key；
+ *   2. `DELETE FROM subject` 删掉旧行（`episode` 靠 `ON DELETE CASCADE` 一起走）。
+ *
+ * ⚠ 只有三道闸门全过才删（否则只报告，留给票 B 的 dry-run 报告）：
+ *   a. 旧行**没有任何外部 ID** —— 有 ID 的重复属于清理，不属于写路径；
+ *   b. 旧行没有"本次没带出来、且有时刻"的分集 —— 删除会 CASCADE 掉分集，不能丢真数据；
+ *   c. `my_anime` 不能两边都有 —— 用户追的是哪一条、进度怎么并，是**人工判断**，不自动取舍。
+ *
+ * ⚠ 失败时**不删、也不改任何引用**：一次写库不该因为一条脏行就动用户数据。
+ */
+/**
+ * 把指向旧 key 的引用改指新 key。
+ *
+ * 为什么不能只 `DELETE` 了事：`my_anime.subject_key` 是**主键**且 `ON DELETE CASCADE`
+ * （schema.sql），删 `subject` 行会连带删掉用户真实在用的追番与进度。
+ *
+ * ⚠ 必须在目标行已经写进库之后调用：`my_anime` 有外键指向 `subject(key)`，
+ *   目标行不存在时这里会 `FOREIGN KEY constraint failed`（实测踩到过）。
+ */
+function repointSubjectReferences(db: DatabaseSync, fromKey: string, toKey: string): void {
+  // 目标已有同集号的手动修正时，保留目标那条、丢掉重复（OR IGNORE + 随后的 DELETE）
+  db.prepare(
+    `INSERT OR IGNORE INTO schedule_override (subject_key, ep_number, air_at_utc, pub_at_utc, reason, updated_at)
+     SELECT ?, ep_number, air_at_utc, pub_at_utc, reason, updated_at FROM schedule_override WHERE subject_key = ?`,
+  ).run(...bindAll([toKey, fromKey]));
+  db.prepare('DELETE FROM schedule_override WHERE subject_key = ?').run(...bindAll([fromKey]));
+  // change_log 是历史账，没有外键，直接改指保留行即可
+  db.prepare('UPDATE change_log SET subject_key = ? WHERE subject_key = ?').run(...bindAll([toKey, fromKey]));
+  // ⚠ my_anime 放在最后、且用 OR IGNORE：两边都有时保留目标那条
+  //（闸门 c 已经拦下"两边都有"的情况，这里是二次保险，不能让它抛错中断吸收）
+  db.prepare(
+    `INSERT OR IGNORE INTO my_anime
+       (subject_key, category, watched_eps, notify_enabled, planned_weekday_jst, planned_eps_per_day, priority, note, added_at, updated_at)
+     SELECT ?, category, watched_eps, notify_enabled, planned_weekday_jst, planned_eps_per_day, priority, note, added_at, updated_at
+       FROM my_anime WHERE subject_key = ?`,
+  ).run(...bindAll([toKey, fromKey]));
 }
 
 export type ArchivedSubject = {
@@ -1391,12 +1828,176 @@ export function clearFetchedData(db: DatabaseSync): { subjects: number } {
     db.exec('DELETE FROM my_anime');
     db.exec('DELETE FROM schedule_override');
     db.exec('DELETE FROM subject');
+    // 运行记录是"账"，不是抓取数据 —— 但 reset 的语义就是"从头来过"，连带清掉才对
+    db.exec('DELETE FROM sync_run');
     db.exec('COMMIT');
   } catch (error) {
     db.exec('ROLLBACK');
     throw error;
   }
   return { subjects: Number(before?.n ?? 0) };
+}
+
+// ---------------------------------------------------------------------------
+// 每次同步的运行记录（票 A）
+// ---------------------------------------------------------------------------
+
+/**
+ * 一次同步的运行记录（`sync_run` 一行）。
+ *
+ * 为什么要有它 —— `.scratch/duplicate-subjects/issues/01-票A` 的「根因」第 7 点：
+ * 重复是"同一次更新的当季 pass + 回填 pass"造成的，还是"点了两次更新"造成的？
+ * **无法判定**，因为跨运行完全没有留痕（`source_record` 表 0 行，代码里根本没人写它）。
+ * 修好身份判定之后，"新增不再分叉"也要靠这张账来自证。
+ */
+export type SyncRunInput = {
+  startedAt: string;
+  trigger: 'cli' | 'web' | 'test' | null;
+  scope: 'season' | 'archive-season' | null;
+  seasons: readonly string[];
+  providers: readonly unknown[];
+  written: number;
+  episodes: number;
+  mergedAway: number;
+  identityAbsorbed: number;
+  identitySkipped: number;
+  error: string | null;
+  parentRunId?: number | null;
+};
+
+export type SyncRunRow = {
+  id: number;
+  startedAt: string;
+  finishedAt: string | null;
+  trigger: string | null;
+  scope: string | null;
+  seasons: string[];
+  providers: Array<{ provider?: string; ok?: boolean; items?: number }>;
+  written: number;
+  episodes: number;
+  mergedAway: number;
+  identityAbsorbed: number;
+  identitySkipped: number;
+  error: string | null;
+  parentRunId: number | null;
+};
+
+const SYNC_RUN_COLUMNS = [
+  'started_at',
+  'finished_at',
+  'trigger',
+  'scope',
+  'seasons',
+  'providers',
+  'written',
+  'episodes',
+  'merged_away',
+  'identity_absorbed',
+  'identity_skipped',
+  'error',
+  'parent_run_id',
+] as const;
+
+/**
+ * 写一条运行记录，返回它的 id。
+ *
+ * ⚠ **绝不能因为写账失败就中断同步**：这张表是凭证，不是数据。
+ * 所以整段包在 try/catch 里，失败只打日志、返回 null。
+ */
+export function recordSyncRun(db: DatabaseSync, run: SyncRunInput): number | null {
+  try {
+    const finishedAt = nowIso();
+    db.prepare(
+      `INSERT INTO sync_run (${SYNC_RUN_COLUMNS.join(', ')})
+       VALUES (${SYNC_RUN_COLUMNS.map(() => '?').join(', ')})`,
+    ).run(
+      ...bindAll([
+        run.startedAt,
+        finishedAt,
+        run.trigger,
+        run.scope,
+        JSON.stringify(run.seasons),
+        JSON.stringify(run.providers),
+        run.written,
+        run.episodes,
+        run.mergedAway,
+        run.identityAbsorbed,
+        run.identitySkipped,
+        run.error,
+        run.parentRunId ?? null,
+      ]),
+    );
+    const row = db.prepare('SELECT last_insert_rowid() AS id').get() as { id?: number } | undefined;
+    return typeof row?.id === 'number' ? row.id : null;
+  } catch (error) {
+    console.warn(`[sync_run] 运行记录写入失败（不影响同步）：${error instanceof Error ? error.message : String(error)}`);
+    return null;
+  }
+}
+
+/** 最近 N 次同步的运行记录（新的在前）。 */
+export function listSyncRuns(db: DatabaseSync, limit = 20): SyncRunRow[] {
+  const rows = db
+    .prepare(
+      `SELECT id, started_at, finished_at, trigger, scope, seasons, providers, written, episodes,
+              merged_away, identity_absorbed, identity_skipped, error, parent_run_id
+         FROM sync_run ORDER BY id DESC LIMIT ?`,
+    )
+    .all(...bindAll([limit])) as unknown as Array<{
+    id: number;
+    started_at: string;
+    finished_at: string | null;
+    trigger: string | null;
+    scope: string | null;
+    seasons: string | null;
+    providers: string | null;
+    written: number;
+    episodes: number;
+    merged_away: number;
+    identity_absorbed: number;
+    identity_skipped: number;
+    error: string | null;
+    parent_run_id: number | null;
+  }>;
+
+  return rows.map((row) => ({
+    id: row.id,
+    startedAt: row.started_at,
+    finishedAt: row.finished_at,
+    trigger: row.trigger,
+    scope: row.scope,
+    seasons: parseJsonArray<string>(row.seasons),
+    providers: parseJsonArray<{ provider?: string; ok?: boolean; items?: number }>(row.providers).filter(
+      (item) => typeof item === 'object' && item !== null,
+    ),
+    written: row.written,
+    episodes: row.episodes,
+    mergedAway: row.merged_away,
+    identityAbsorbed: row.identity_absorbed,
+    identitySkipped: row.identity_skipped,
+    error: row.error,
+    parentRunId: row.parent_run_id,
+  }));
+}
+
+/** 把运行记录打成一行中文，给 CLI 用。 */
+export function describeSyncRun(run: SyncRunRow): string {
+  const when = run.startedAt.replace('T', ' ').slice(0, 16);
+  const where = run.scope === 'archive-season' ? '回填' : '当季';
+  const failed = run.providers.filter((provider) => provider.ok === false).map((provider) => provider.provider ?? '?');
+  const parts = [
+    `${when}Z`,
+    `#${run.id}`,
+    `${run.trigger ?? '?'}/${where}`,
+    run.seasons.join(',') || '—',
+    `写入 ${run.written} 部 / ${run.episodes} 集`,
+    `去重合并 ${run.mergedAway}`,
+    `身份吸收 ${run.identityAbsorbed}`,
+  ];
+  if (run.identitySkipped > 0) parts.push(`待清理 ${run.identitySkipped}`);
+  if (failed.length > 0) parts.push(`失败源 ${failed.join('/')}`);
+  if (run.error) parts.push(`错误：${run.error.slice(0, 80)}`);
+  return parts.join('  |  ');
 }
 
 export type DbStats = {

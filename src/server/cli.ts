@@ -42,14 +42,17 @@ import {
   clearFetchedData,
   clearMyAnime,
   countMachineTitles,
-  findSubjectByExternalId,
+  describeSyncRun,
   getMyAnime,
+  getSubjectDetail,
   listBackups,
   listChanges,
   listMyAnime,
   listSchedule,
+  listSyncRuns,
   migrate,
   openDb,
+  resolveSubjectIdentity,
   searchLocalSubjects,
   stats,
   upsertSubjects,
@@ -245,7 +248,7 @@ async function cmdSync(args: ParsedArgs): Promise<void> {
     console.log(
       `\x1b[1m回填历史季度\x1b[0m 最近 ${count} 个季度（到 ${toSeason}）${force ? '（强制重抓）' : '（增量）'}\n`,
     );
-    const result = await syncArchive(db, { toSeason, backfill: count, force, intervalMs: 1_000 });
+    const result = await syncArchive(db, { toSeason, backfill: count, force, intervalMs: 1_000, trigger: 'cli' });
     printArchiveResult(result);
     db.close();
     return;
@@ -254,7 +257,7 @@ async function cmdSync(args: ParsedArgs): Promise<void> {
   const season = seasonId ? seasonFromId(seasonId) : seasonOf(new Date());
 
   console.log(`\x1b[1m${season.label}（${season.id}）\x1b[0m  同步中…\n`);
-  const result = await syncSeason(db, season);
+  const result = await syncSeason(db, season, { trigger: 'cli', scope: 'season' });
   printProviderReports(result.outcome.reports);
 
   if (result.written === 0) {
@@ -373,6 +376,7 @@ async function cmdUpdate(args: ParsedArgs): Promise<void> {
     force: args.flags.has('force'),
     translate,
     translateLimit: limit,
+    trigger: 'cli',
     onProgress: (message) => console.log(`  \x1b[2m${message}\x1b[0m`),
   });
 
@@ -459,6 +463,34 @@ async function cmdTranslate(args: ParsedArgs): Promise<void> {
   console.log(
     `\n这些是\x1b[33m临时\x1b[0m译名：官方译名一出现，运行 update 就会被自动替换（库里标记为 machine）。` +
       `\n当前库里临时机翻名共 ${countMachineTitles(db)} 部。`,
+  );
+  db.close();
+}
+
+/** 最近几次同步的运行记录（票 A：跨运行留痕 —— 「同一部番两条记录」就是无据可查排查出来的）。 */
+function cmdRuns(args: ParsedArgs): void {
+  const limitFlag = Number(flagString(args, 'limit') ?? 10);
+  const limit = Number.isFinite(limitFlag) ? Math.max(1, Math.min(200, Math.floor(limitFlag))) : 10;
+  const db = openDb();
+  migrate(db);
+  const runs = listSyncRuns(db, limit);
+  if (runs.length === 0) {
+    console.log('还没有运行记录（引入了 sync_run 之后才会开始记）。');
+    db.close();
+    return;
+  }
+  console.log(`\x1b[1m最近 ${runs.length} 次同步\x1b[0m（新的在前）\n`);
+  for (const run of runs) {
+    console.log(`  ${describeSyncRun(run)}`);
+    for (const provider of run.providers) {
+      const mark = provider.ok === false ? '\x1b[31m失败\x1b[0m' : 'ok';
+      console.log(`      ${String(provider.provider ?? '?').padEnd(12)} ${mark}  ${provider.items ?? 0} 条`);
+    }
+  }
+  console.log(
+    '\n口径：一行 = 一次 syncSeason（当季一次、回填的每一季各一次）。' +
+      '\n「身份吸收」是被拦住的主键漂移条数（这些本来会变成新的重复行）；' +
+      '\n「待清理」是闸门没通过、留给票 B dry-run 报告的那些。',
   );
   db.close();
 }
@@ -583,38 +615,46 @@ async function cmdAdd(args: ParsedArgs): Promise<void> {
   const db = openDb();
   migrate(db);
 
-  // 关键：先查库里有没有同一部番。
-  // 季度同步落库的是多源融合后的「富记录」（有中文名、有分集时刻），
-  // 如果直接写入搜索结果的单源记录，同一部番就会变成两份。
-  const existing = findSubjectByExternalId(db, {
-    bgmId: chosen.bgmId,
-    anilistId: chosen.anilistId,
-    malId: chosen.malId,
-  });
-
-  if (existing) {
-    addMyAnime(db, existing.key, { category, watchedEps });
-    console.log(`\n已加入「${TRACK_CATEGORY_LABELS[category]}」：${existing.titleCn ?? existing.titleOriginal ?? existing.key}`);
-    console.log('（复用了季度同步已落库的条目，因此保留了中文名与分集时刻）');
-    reportBacklog(db, existing.key, category, watchedEps);
-    db.close();
-    return;
-  }
-
+  // 先融合出「规范条目」，再拿它做身份判定。
+  // 为什么必须先融合：搜索结果只带单源的原始字段，而库里那条是**多源融合**的富记录
+  // （有中文名、有分集时刻）；不融合就无法用同一套口径（归一化标题、外部 ID）去比对。
   const merged = mergeSubjects([[chosen]]);
-  const subject = merged.subjects[0];
-  if (!subject) {
+  const candidate = merged.subjects[0];
+  if (!candidate) {
     console.log('融合结果为空，放弃。');
     db.close();
     return;
   }
 
-  upsertSubjects(db, [subject], null);
-  addMyAnime(db, subject.key, { category, watchedEps });
+  // 关键：先查库里有没有同一部番。季度同步落库的是多源融合后的「富记录」，
+  // 如果直接写入搜索结果的单源记录，同一部番就会变成两份。
+  //
+  // ⚠ 用 resolveSubjectIdentity 而不是只按 ID 查（票 A）：实测 384 行**没有任何外部 ID**，
+  //   只按 ID 查必然漏 —— 而漏一次就多一条重复。这个函数会退到归一化标题匹配。
+  const decision = resolveSubjectIdentity(db, candidate);
 
-  console.log(`\n已加入「${TRACK_CATEGORY_LABELS[category]}」：${subject.titleCn ?? subject.titleOriginal ?? subject.key}`);
+  if (decision.match !== 'none') {
+    addMyAnime(db, decision.suggestedKey, { category, watchedEps });
+    const hit = getSubjectDetail(db, decision.suggestedKey);
+    console.log(
+      `\n已加入「${TRACK_CATEGORY_LABELS[category]}」：${hit?.titleCn ?? hit?.titleOriginal ?? decision.suggestedKey}`,
+    );
+    console.log(
+      decision.match === 'title'
+        ? '（靠标题匹配复用了库里已有的条目 —— 因此保留了中文名与分集时刻）'
+        : '（复用了季度同步已落库的条目，因此保留了中文名与分集时刻）',
+    );
+    reportBacklog(db, decision.suggestedKey, category, watchedEps);
+    db.close();
+    return;
+  }
+
+  upsertSubjects(db, [candidate], null);
+  addMyAnime(db, candidate.key, { category, watchedEps });
+
+  console.log(`\n已加入「${TRACK_CATEGORY_LABELS[category]}」：${candidate.titleCn ?? candidate.titleOriginal ?? candidate.key}`);
   console.log('（本地库中原本没有这部番，已单独写入；因此可能缺中文名 —— 接上 Bangumi 后会补全）');
-  reportBacklog(db, subject.key, category, watchedEps);
+  reportBacklog(db, candidate.key, category, watchedEps);
 
   if (results.length > 1) {
     console.log(`\n（共 ${results.length} 条结果，若选错了可加 --index=N 重试）`);
@@ -826,6 +866,7 @@ function cmdHelp(): void {
                                 本周更新日历（默认按真实钟点归属）
   changes [--all] [--ack]       延期/改档检测结果；--ack 标记已读
   backups                       查看数据库备份与库里的季度（追番列表是资产，必须有备份）
+  runs [--limit=N]              最近几次同步的运行记录（哪次运行、抓了哪几季、各源成败）
   reset [--all | --changes]     清空我的追番列表；--all 连番剧数据一起清空
   archive                       手动触发「播完没看完 -> 补番库」
   stats                          数据库统计
@@ -878,6 +919,9 @@ async function main(): Promise<void> {
       break;
     case 'backups':
       cmdBackups();
+      break;
+    case 'runs':
+      cmdRuns(args);
       break;
     case 'reset':
       cmdReset(args);

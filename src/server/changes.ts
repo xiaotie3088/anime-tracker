@@ -85,6 +85,11 @@ export function detectChanges(
   const title = subject.titleCn ?? subject.titleOriginal ?? subject.key;
   const changes: DetectedChange[] = [];
   const freshByNumber = new Map(subject.episodes.map((episode) => [episode.epNumber, episode]));
+  // 这次运行**实际参与了**的源（`mergeSubjects()` 由本次融合的原始条目算出，见 merge.ts:265）。
+  // 实测教训（.scratch/duplicate-subjects/issues/01-票A）：yuc 只给第 1 话
+  // （providers/yuc.ts:338-340），于是"只有 yuc 成功"的一次运行会把第 2..N 话
+  // 全判成"消失了"—— 实测 2772 条 `episode-removed` **100% 是假报警**。
+  const sourcesPresent = new Set<string>(subject.sources ?? []);
 
   for (const old of existing) {
     const fresh = freshByNumber.get(old.ep_number);
@@ -92,6 +97,12 @@ export function detectChanges(
     // 原本有确定的时刻，这次却没了 —— 多半是撤档或时间被撤回
     if (!fresh) {
       if (old.air_at_utc) {
+        // 关键：**源降级**造成的"消失"不是变更。
+        // `delayed` / `advanced` 两个分支早就有这道过滤（见下面 sourceRank 的比较），
+        // 删除分支以前没有 —— 那正是 2772 条假报警的成因。
+        // 判据：库里这条时刻的源这次仍然在场才允许报删除；该源这次一条都没给
+        // （或它本来就是 null，例如手动修正）时，这只是"这次没抓到"，不是"消失了"。
+        if (old.air_source && !sourcesPresent.has(old.air_source)) continue;
         changes.push({
           subjectKey: subject.key,
           title,
