@@ -16,3 +16,5 @@ data/_preview/
 *.log
 .DS_Store
 .venv/
+# 工程技能的本地状态：issue / spec / 分诊记录都在这里，默认不入库（想版本化就删掉这行）
+.scratch/
