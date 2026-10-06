@@ -55,7 +55,7 @@ import {
   upsertSubjects,
 } from './db.ts';
 import { changeKindLabel, describeChangeItem } from './changes.ts';
-import { fetchSeason, runFullUpdate, syncArchive, syncSeason, translateMissingTitles } from './sync.ts';
+import { DEFAULT_BACKFILL, fetchSeason, runFullUpdate, resolveArchiveSeasons, syncArchive, syncSeason, translateMissingTitles } from './sync.ts';
 import type { ArchiveSyncResult, ProviderReport } from './sync.ts';
 
 
@@ -227,18 +227,20 @@ async function cmdSync(args: ParsedArgs): Promise<void> {
         db.close();
         return;
       }
-      const sorted = [...ids].sort();
-      const fromSeason = sorted[0] as string;
-      const toSeason = sorted[sorted.length - 1] as string;
-      console.log(`\x1b[1m回填历史季度\x1b[0m ${fromSeason} ~ ${toSeason}${force ? '（强制重抓）' : '（增量）'}\n`);
-      const result = await syncArchive(db, { fromSeason, toSeason, force, intervalMs: 1_000 });
+      // ⚠ 这里原来是把 ids 排序后取 [首, 末] 当成 from/to 区间 —— 于是"只回填指定季度"
+      //   实际上会把中间的季度一起抓了（和帮助里写的意思不符）。现在直接把列表交给
+      //   syncArchive 的 seasons 路径：**只抓列的这些**，一个不多。
+      console.log(
+        `\x1b[1m回填历史季度\x1b[0m ${ids.join('、')}${force ? '（强制重抓）' : '（增量）'}\n`,
+      );
+      const result = await syncArchive(db, { seasons: ids, force, intervalMs: 1_000 });
       printArchiveResult(result);
       db.close();
       return;
     }
 
     const backfill = Number(backfillFlag);
-    const count = Number.isFinite(backfill) && backfill > 0 ? Math.floor(backfill) : 4;
+    const count = Number.isFinite(backfill) && backfill > 0 ? Math.floor(backfill) : DEFAULT_BACKFILL;
     const toSeason = seasonId ?? seasonOf(new Date()).id;
     console.log(
       `\x1b[1m回填历史季度\x1b[0m 最近 ${count} 个季度（到 ${toSeason}）${force ? '（强制重抓）' : '（增量）'}\n`,
@@ -321,12 +323,22 @@ function printArchiveResult(result: ArchiveSyncResult): void {
 /**
  * 一键更新数据：当季抓取 + 历史季度回填 + 官方名替换机翻 + 缺中文名的机翻。
  * 与 Web 界面的「更新数据」按钮走的是同一条链路（runFullUpdate）。
+ *
+ * 范围两种表达方式（`--seasons` 优先，同时给时 `--backfill` 被忽略并明说）：
+ *   --seasons=2026-10,2024-10   自己挑季度（按给定顺序，跳过中间季度，可以是库里没有的）
+ *   --backfill=3                当季 + 往回数几季（含当季，最小 1）
  */
 async function cmdUpdate(args: ParsedArgs): Promise<void> {
   const seasonId = flagString(args, 'season');
-  const season = seasonId ? seasonFromId(seasonId) : seasonOf(new Date());
-  const backfillFlag = Number(flagString(args, 'backfill') ?? 3);
-  const backfill = Number.isFinite(backfillFlag) ? Math.max(0, Math.floor(backfillFlag)) : 3;
+  const seasonsFlag = flagString(args, 'seasons');
+  const seasons = (seasonsFlag ?? '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
+  // 显式挑季度时"主季"是列表第一个（与界面多选季度时主季 = 第一个选中的同一套约定）
+  const season = seasons.length > 0 ? seasonFromId(seasons[0] as string) : seasonId ? seasonFromId(seasonId) : seasonOf(new Date());
+  const backfillFlag = Number(flagString(args, 'backfill') ?? DEFAULT_BACKFILL);
+  const backfill = Number.isFinite(backfillFlag) ? Math.max(1, Math.floor(backfillFlag)) : DEFAULT_BACKFILL;
   const mustTranslate = args.flags.has('translate');
   const noTranslate = args.flags.has('no-translate');
   const translate = mustTranslate || !noTranslate;
@@ -337,14 +349,27 @@ async function cmdUpdate(args: ParsedArgs): Promise<void> {
   migrate(db);
 
   console.log(`\x1b[1m一键更新数据\x1b[0m  ${season.label}（${season.id}）`);
+  if (seasons.length > 0) {
+    console.log(
+      `范围：你挑的 ${seasons.length} 个季度 —— ${seasons.join('、')}` +
+        `${args.flags.has('force') ? '（强制重抓）' : '（增量：库里已有数据的季度会跳过）'}` +
+        `${flagString(args, 'backfill') !== undefined ? '；--backfill 同时给了，已忽略（以 --seasons 为准）' : ''}`,
+    );
+  } else {
+    console.log(
+      `范围：当季 + 往回 ${backfill - 1} 季（含当季共 ${backfill} 季）` +
+        `${args.flags.has('force') ? '（强制重抓）' : '（增量：库里已有数据的季度会跳过）'}`,
+    );
+  }
   console.log(
-    `回填最近 ${backfill} 个季度${args.flags.has('force') ? '（强制重抓）' : '（增量）'}，` +
-      `${translate ? `机翻${limit > 0 ? ` 上限 ${limit} 条` : '（不限条数）'}` : '不做机翻'}\n`,
+    `预计耗时：每季约 10~30 秒（含季度间 1 秒间隔${translate ? '），机翻每条约 0.7 秒' : '）'}\n`,
   );
 
   const result = await runFullUpdate(db, {
     season,
-    backfill,
+    // ⚠ 有 --seasons 时**不要**再传 backfill：两个都传就成了"同时给了"，
+    //   报告里的 scope.backfillIgnored 会一直为真（明明是这里塞的默认值）。
+    ...(seasons.length > 0 ? { seasons } : { backfill }),
     force: args.flags.has('force'),
     translate,
     translateLimit: limit,
@@ -354,11 +379,18 @@ async function cmdUpdate(args: ParsedArgs): Promise<void> {
   console.log('');
   printProviderReports(result.current.reports);
   console.log(
-    `\n当季写入 ${result.current.written} 部 / ${result.current.episodeCount} 集` +
+    `\n主季 ${result.scope.seasons[0]} 写入 ${result.current.written} 部 / ${result.current.episodeCount} 集` +
       (result.current.changes.length ? `，检测到 ${result.current.changes.length} 条改档` : ''),
   );
   printMoved(result.current.archive);
-  if (backfill > 0) {
+  if (result.scope.mode === 'seasons') {
+    console.log('');
+    console.log(
+      `\x1b[1m你挑的季度\x1b[0m（${result.scope.seasons.join('、')}）` +
+        `${result.scope.backfillIgnored ? '；--backfill 已忽略' : ''}`,
+    );
+    printArchiveResult(result.archive);
+  } else if (result.scope.backfill > 1) {
     console.log('');
     printArchiveResult(result.archive);
   }
@@ -779,7 +811,9 @@ function cmdHelp(): void {
          --seasons=2026-04,2026-07  只回填指定季度
          --force                已有数据的季度也重抓
   update [--season=2026-10]     一键更新数据（当季 + 历史回填 + 机翻 + 汇总报告）
-         --backfill=3           回填几个季度（含当季，默认 3）
+         --seasons=2026-10,2024-10  只更新这几个季度（按给定顺序；可以挑库里没有的老季度）
+         --backfill=3           当季 + 往回数几季（含当季，默认 3，最小 1）
+         --force                已有数据的季度也重抓
          --no-translate         跳过机翻阶段（更快）
          --limit=20             机翻条数上限
   translate [--season=2026-10 | --all] [--limit=N]

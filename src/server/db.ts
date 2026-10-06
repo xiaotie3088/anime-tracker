@@ -792,24 +792,35 @@ type TranslationRow = {
 /**
  * 找出「值得机翻」的条目，并顺手给出该不该翻的判定。
  *
- * 传 season 时只在这个季度里找；不传则全库（补番库里的老番也能翻）。
+ * `season` 支持**多季**（与本文件里 `listSeasonSubjects` 同一套口径）：
+ *   传单个季度 id 或季度数组时只在这些季度里找；传 `null`/不传才是全库。
+ *   ⚠ 「更新范围可控」那条需求要求"用户勾了哪几季就翻哪几季"——**不要**为了省事传 null，
+ *     那会翻掉用户没选的季度：慢，而且免费接口额度有限。
  * 默认只返回需要翻的，`includeSkipped` 用于让调用方展示「为什么这些没翻」。
  */
 export function listTranslationCandidates(
   db: DatabaseSync,
-  options: { season?: string | null; limit?: number; includeSkipped?: boolean } = {},
+  options: {
+    season?: string | readonly string[] | null;
+    limit?: number;
+    includeSkipped?: boolean;
+  } = {},
 ): TranslationCandidate[] {
   const { season = null, limit = 0, includeSkipped = false } = options;
+  const seasons = (season == null ? [] : Array.isArray(season) ? [...season] : [season as string]).filter(
+    (id): id is string => typeof id === 'string' && id.trim() !== '',
+  );
+  const placeholders = seasons.map(() => '?').join(', ');
 
   const rows = db
     .prepare(
       `SELECT key, title_cn, title_cn_source, title_original, title_en, season, status
        FROM subject
        WHERE (title_cn IS NULL OR title_cn = '')
-       ${season ? 'AND season = ?' : ''}
+       ${seasons.length ? `AND season IN (${placeholders})` : ''}
        ORDER BY season IS NULL, season DESC, title_original`,
     )
-    .all(...bindAll(season ? [season] : [])) as unknown as TranslationRow[];
+    .all(...seasons) as unknown as TranslationRow[];
 
   const out: TranslationCandidate[] = [];
   for (const row of rows) {

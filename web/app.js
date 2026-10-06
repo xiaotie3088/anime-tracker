@@ -164,6 +164,8 @@ const state = {
   showAllChanges: false,
   searchQuery: '',
   detailKey: null,
+  /** 「更新数据」范围选择器的临时状态（picked = 勾中的季度 id，只在对话框开着时有效） */
+  updateScope: null,
 };
 
 // ---------------------------------------------------------------------------
@@ -189,6 +191,9 @@ async function api(path, options = {}) {
 let statusTimer = null;
 function setStatus(text, kind = '') {
   const el = $('#status');
+  // 顶栏状态位不在（例如被测试壳漏建、或页面结构以后改了）不该让整条动作链崩掉 ——
+  // 这里只是"报个状态"，不值得抛异常打断后面的抓取。
+  if (!el) return;
   el.textContent = text;
   el.className = `status${kind ? ` is-${kind}` : ''}`;
   if (statusTimer) clearTimeout(statusTimer);
@@ -1534,21 +1539,226 @@ function reportArchiveMove(moved) {
   toast(`已自动移动 ${moved.length} 部：${names.slice(0, 3).join('、')}${names.length > 3 ? ' 等' : ''}`);
 }
 
-/** 一键更新数据：当季 + 历史回填 + 官方名替换机翻 + 缺中文名的机翻。 */
-async function updateData() {
+// ---------------------------------------------------------------------------
+// 「更新数据」的季度范围选择（.scratch/update-scope）
+// ---------------------------------------------------------------------------
+
+/** 选择器里额外列出"再往前"多少个季度（库里还没有的那些就是从这里挑的）。 */
+const UPDATE_OLDER_SEASONS = 16;
+
+/**
+ * 季度 id 前后移位（`'2026-01'` 往前一季 → `'2025-10'`）。
+ *
+ * ⚠ 故意与 `src/core/time.ts` 的 `shiftSeason()` **同一套算法**（year*4 + 月份下标）：
+ *   季度是 `YYYY-NN`（NN 只能是 01/04/07/10），纯 id 运算，不涉及时区 ——
+ *   这是这条链路上唯一允许前端自己算的季度逻辑（"UTC 转本地取星期"那种才是禁区）。
+ *   ui-smoke 里有一条跨年断言（2026-01 往前 = 2025-10）盯着它。
+ */
+function shiftSeasonId(id, offset) {
+  const match = /^(\d{4})-(\d{2})$/.exec(String(id).trim());
+  if (!match) return String(id);
+  const months = [1, 4, 7, 10];
+  const index = Number(match[1]) * 4 + months.indexOf(Number(match[2]));
+  if (!Number.isFinite(index)) return String(id);
+  const next = index + offset;
+  const month = months[((next % 4) + 4) % 4];
+  return `${Math.floor(next / 4)}-${String(month).padStart(2, '0')}`;
+}
+
+/**
+ * 范围选择器的候选季度：**库里已有的（从新到旧）+ 从最早那季再往前 N 季**。
+ *
+ * 后者就是用户点名要的"本地都没有的季度" —— 它们照样能勾、照样会真的去抓。
+ */
+function updateSeasonCandidates() {
+  const library = state.overview?.seasonSummaries ?? [];
+  const counts = new Map(library.map((item) => [item.season, item.subjects]));
+  const ids = [...new Set([state.season, ...counts.keys()])].filter(Boolean).sort().reverse();
+  const candidates = ids.map((id) => ({ id, subjects: counts.get(id) ?? 0, inLibrary: counts.has(id) }));
+  let cursor = candidates[candidates.length - 1]?.id ?? state.season;
+  for (let step = 0; step < UPDATE_OLDER_SEASONS; step += 1) {
+    cursor = shiftSeasonId(cursor, -1);
+    if (!counts.has(cursor) && !candidates.some((item) => item.id === cursor)) {
+      candidates.push({ id: cursor, subjects: 0, inLibrary: false });
+    }
+  }
+  return candidates;
+}
+
+/** 打开范围选择器时先把它重置成"默认只更新当季"（用户的心智：一键更新）。 */
+function openUpdateDialog() {
+  state.updateScope = { picked: new Set([state.season].filter(Boolean)), extra: [], force: false };
+  const modal = $('#modal');
+  if (!modal) return;
+  modal.innerHTML = updateScopeDialogHtml();
+  $('#modal-backdrop').hidden = false;
+  updateScopeSummaryText();
+}
+
+function closeUpdateDialog() {
+  const backdrop = $('#modal-backdrop');
+  if (backdrop) backdrop.hidden = true;
+  state.updateScope = null;
+}
+
+/** 对话框里的季度行：库里已有的标部数，没有的明确标"库里没有"；手填的排在最前面。 */
+function updateScopeDialogHtml() {
+  const scope = state.updateScope ?? { picked: new Set(), force: false };
+  const manual = (scope.extra ?? []).map((id) => ({ id, subjects: 0, inLibrary: false, manual: true }));
+  const candidates = [
+    ...manual,
+    ...updateSeasonCandidates().filter((item) => !manual.some((picked) => picked.id === item.id)),
+  ];
+  const rows = candidates
+    .map(
+      (item) => `
+      <label class="scope-item">
+        <input type="checkbox" data-scope-season="${esc(item.id)}"${scope.picked.has(item.id) ? ' checked' : ''} />
+        <span class="scope-id">${esc(item.id)}</span>
+        <span class="scope-note">${item.manual ? '手动加的' : item.inLibrary ? `库里 ${item.subjects} 部` : '库里没有'}</span>
+      </label>`,
+    )
+    .join('');
+  return `
+    <div class="modal-head">
+      <div class="h-info">
+        <h2>更新数据：这次抓哪些季度</h2>
+        <div class="orig">默认只更新当季；勾多季会依次抓，每季之间留 1 秒间隔</div>
+      </div>
+      <button class="close-x" data-close="1">×</button>
+    </div>
+    <div class="modal-body">
+      <div class="scope-presets">
+        <button class="btn btn-sm" data-scope-preset="current">只勾当季</button>
+        <button class="btn btn-sm" data-scope-preset="recent">当季 + 最近 3 季（老规矩）</button>
+        <button class="btn btn-sm" data-scope-preset="library">库里全部季度</button>
+        <button class="btn btn-sm" data-scope-preset="none">全不勾</button>
+      </div>
+      <div class="scope-grid">${rows}</div>
+      <div class="scope-add">
+        <label class="field"><span>其它季度（库里没有的也能填）</span>
+          <input type="text" id="scope-extra" placeholder="YYYY-NN，例如 2020-01" />
+        </label>
+        <button class="btn btn-sm" data-scope-add="1">加进来</button>
+      </div>
+      <label class="scope-force">
+        <input type="checkbox" id="scope-force"${scope.force ? ' checked' : ''} />
+        <span>重抓已选季度：不勾时，库里已有数据的季度会跳过（增量，省时间也少打源站）</span>
+      </label>
+      <div class="filter-note" id="scope-summary"></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-primary" data-scope-start="1">开始更新</button>
+      <button class="btn" data-close="1">取消</button>
+    </div>`;
+}
+
+/** 已选摘要 + 预计耗时（勾选框一变动就就地刷新，不重绘整个对话框）。 */
+function updateScopeSummaryText() {
+  const host = $('#scope-summary');
+  const scope = state.updateScope;
+  if (!host || !scope) return;
+  const picked = [...scope.picked].sort().reverse();
+  const libraryIds = new Set((state.overview?.seasonSummaries ?? []).map((item) => item.season));
+  const lines = [];
+  if (picked.length === 0) {
+    lines.push('<b>还没勾任何季度</b> —— 至少勾一个才能开始');
+  } else {
+    lines.push(`<b>已选 ${picked.length} 季</b>：${esc(picked.join('、'))}`);
+    lines.push(
+      `预计 <b>${picked.length * 10}~${picked.length * 30} 秒</b>` +
+        `（每季约 10~30 秒，另有季间 1 秒间隔；机翻每条约 0.7 秒，按缺中文名的条数另算）`,
+    );
+    const fresh = picked.filter((id) => !libraryIds.has(id));
+    if (fresh.length) {
+      lines.push(`其中 <b>${esc(fresh.join('、'))}</b> 库里还没有，这次会真的去抓（老季度源站可能查不到，会如实报告）`);
+    }
+    if (!scope.force && picked.some((id) => libraryIds.has(id))) {
+      lines.push('库里已有数据的季度会<span class="scope-skip">跳过</span>；要重抓就勾上面的开关');
+    }
+  }
+  host.innerHTML = lines.join('<br />');
+}
+
+/** 应用某个预设（只勾当季 / 老规矩 / 库里全部 / 全不勾）。 */
+function applyScopePreset(name) {
+  const scope = state.updateScope;
+  if (!scope) return;
+  const library = (state.overview?.seasonSummaries ?? []).map((item) => item.season);
+  if (name === 'current') scope.picked = new Set([state.season].filter(Boolean));
+  else if (name === 'library') scope.picked = new Set([...library, state.season].filter(Boolean));
+  else if (name === 'none') scope.picked = new Set();
+  else if (name === 'recent') {
+    const picked = [];
+    let cursor = state.season;
+    for (let step = 0; step < 3; step += 1) {
+      picked.push(cursor);
+      cursor = shiftSeasonId(cursor, -1);
+    }
+    scope.picked = new Set(picked.filter(Boolean));
+  }
+  const modal = $('#modal');
+  if (modal) modal.innerHTML = updateScopeDialogHtml();
+  updateScopeSummaryText();
+}
+
+/** 「加进来」：把手填的季度 id 校验后塞进候选并勾上（库里没有的也能加）。 */
+function addScopeSeason() {
+  const input = $('#scope-extra');
+  const scope = state.updateScope;
+  if (!input || !scope) return;
+  const id = String(input.value ?? '').trim();
+  if (!/^\d{4}-(01|04|07|10)$/.test(id)) {
+    toast('季度要写成 YYYY-NN，月份只能是 01 / 04 / 07 / 10，例如 2020-01', true);
+    return;
+  }
+  scope.extra = [...new Set([...(scope.extra ?? []), id])];
+  scope.picked.add(id);
+  const modal = $('#modal');
+  if (modal) modal.innerHTML = updateScopeDialogHtml();
+  updateScopeSummaryText();
+}
+
+/** 开始更新：把勾中的季度交给既有的全流程接口。 */
+function startScopedUpdate() {
+  const scope = state.updateScope;
+  const picked = [...(scope?.picked ?? [])].sort().reverse();
+  if (picked.length === 0) {
+    toast('至少勾一个季度', true);
+    return;
+  }
+  const force = Boolean(scope?.force);
+  closeUpdateDialog();
+  void updateData({ seasons: picked, force });
+}
+
+/**
+ * 一键更新数据：抓取选中季度（默认只当季）+ 官方名替换机翻 + 缺中文名的机翻。
+ *
+ * 范围由对话框给（`seasons` 显式列表）。服务端也支持 `backfill=N` 那种"当季 + 往回 N 季"，
+ * 但界面统一走显式列表 —— 用户看到的勾选与真正抓的季度就是同一份东西，不用换算。
+ */
+async function updateData({ seasons = [], force = false } = {}) {
   const button = $('#update-btn');
-  button.disabled = true;
-  setStatus('正在更新数据：抓取当季 → 回填历史季度 → 补中文名…（可能要 1~2 分钟）');
+  if (button) button.disabled = true;
+  const label =
+    seasons.length > 0
+      ? `${seasons.length} 个季度（${seasons.join('、')}）`
+      : '当季 + 历史回填';
+  setStatus(`正在更新数据：抓取 ${label} → 补中文名…（可能要 1~2 分钟）`);
 
   // 机翻是逐条串行的，进度只能靠轮询状态文案；先给一个会变的提示
   let tick = 0;
   const timer = setInterval(() => {
     tick += 1;
-    setStatus(`正在更新数据…已等待 ${tick * 2} 秒（回填历史季度与机翻都比较慢，请勿关闭页面）`);
+    setStatus(`正在更新数据…已等待 ${tick * 2} 秒（多季抓取与机翻都比较慢，请勿关闭页面）`);
   }, 2000);
 
   try {
-    const result = await api(`/api/update?season=${encodeURIComponent(state.season)}&backfill=3`, { method: 'POST' });
+    const params = new URLSearchParams({ season: state.season });
+    if (seasons.length > 0) params.set('seasons', seasons.join(','));
+    if (force) params.set('force', '1');
+    const result = await api(`/api/update?${params.toString()}`, { method: 'POST' });
     const summary = result.summary;
 
     const parts = [
@@ -1575,26 +1785,40 @@ async function updateData() {
     for (const provider of summary.failedProviders) toast(`${provider} 失败`, true);
     if (summary.translationFailures) toast(`有 ${summary.translationFailures} 条机翻失败（不影响其它数据）`, true);
 
-    showUpdateDetail(result);
     await refresh();
     await refreshChangeBadge();
+    // ⚠ 明细必须放在 refresh() **之后**：refresh() 会重绘整个视图（`#app.innerHTML = …`），
+    //   先 prepend 进去的明细面板会被整块抹掉 —— 原来就是先建明细再 refresh，
+    //   于是「上次更新的明细」从来没在界面上出现过（这次写 ui-smoke 断言才发现）。
+    showUpdateDetail(result);
   } catch (error) {
     setStatus(`更新失败：${error.message}`, 'error');
   } finally {
     clearInterval(timer);
-    button.disabled = false;
+    if (button) button.disabled = false;
   }
 }
 
 /** 更新完成后把明细摊在界面上 —— 汇总成一句话会说谎，明细不会。 */
 function showUpdateDetail(result) {
   const summary = result.summary;
+  const scope = result.scope;
   const lines = [];
 
+  // 先把"这次到底抓了哪几季"摆在最上面：范围没看清，下面的数字就没法解释
+  if (scope) {
+    const how = scope.mode === 'seasons' ? `你挑的 ${scope.seasons.length} 季` : `当季 + 往回 ${scope.backfill - 1} 季`;
+    lines.push(
+      `<b>本次范围</b>：${esc(how)} —— ${esc(scope.seasons.join('、'))}` +
+        `${scope.force ? '（重抓已选季度）' : '（增量：已有数据的跳过）'}` +
+        `${scope.backfillIgnored ? '　<span class="change-msg">backfill 参数已忽略（以挑的季度为准）</span>' : ''}`,
+    );
+  }
+
   lines.push(
-    `<b>当季</b>：写入 ${summary.written - (result.archive?.totalWritten ?? 0)} 部 / ${
-      summary.episodes - (result.archive?.totalEpisodes ?? 0)
-    } 集`,
+    `<b>主季 ${esc(scope?.seasons?.[0] ?? result.season ?? '')}</b>：写入 ${
+      summary.written - (result.archive?.totalWritten ?? 0)
+    } 部 / ${summary.episodes - (result.archive?.totalEpisodes ?? 0)} 集`,
   );
 
   const seasons = result.archive?.seasons ?? [];
@@ -1605,7 +1829,7 @@ function showUpdateDetail(result) {
         return `${mark} ${item.season}${item.status === 'fetched' ? `（${item.written} 部）` : item.note ? `（${item.note}）` : ''}`;
       })
       .join('　');
-    lines.push(`<b>历史回填</b>：${detail}`);
+    lines.push(`<b>各季结果</b>：${detail}`);
   }
 
   if (result.seasonsRepaired) {
@@ -1901,6 +2125,19 @@ document.addEventListener('click', (event) => {
     closeDetail();
     return;
   }
+  // ---- 「更新数据」范围选择器（.scratch/update-scope） ----
+  if (dataset.scopePreset) {
+    applyScopePreset(dataset.scopePreset);
+    return;
+  }
+  if (dataset.scopeAdd) {
+    addScopeSeason();
+    return;
+  }
+  if (dataset.scopeStart) {
+    startScopedUpdate();
+    return;
+  }
   if (dataset.add) {
     void addToList(dataset.add, dataset.category ?? 'tracking', dataset.reload === '1');
     return;
@@ -1986,7 +2223,8 @@ document.addEventListener('keydown', (event) => {
   }
 });
 
-$('#update-btn').addEventListener('click', () => void updateData());
+// 「更新数据」先问范围（默认只更新当季），再走全流程 —— 见 openUpdateDialog
+$('#update-btn').addEventListener('click', () => openUpdateDialog());
 $('#sync-btn').addEventListener('click', () => void syncSeason());
 $('#translate-btn').addEventListener('click', () => void translateMissing());
 
@@ -2162,6 +2400,27 @@ document.addEventListener('toggle', (event) => {
 
 $('#season-select').addEventListener('change', (event) => {
   void selectSeason(event.target.value);
+});
+
+/**
+ * 范围选择器里的勾选框走 `change`（不是点击委托）：在真实浏览器里点 `<label>` 或复选框
+ * 都会派发 change，而在测试壳里也能直接 `dispatch('change')` —— 两边同一条路径。
+ * 这里**只更新摘要文案，不重绘对话框**，所以"其它季度"那个输入框不会被打断。
+ */
+document.addEventListener('change', (event) => {
+  const target = event.target;
+  if (target?.dataset?.scopeSeason !== undefined) {
+    if (state.updateScope) {
+      if (target.checked) state.updateScope.picked.add(target.dataset.scopeSeason);
+      else state.updateScope.picked.delete(target.dataset.scopeSeason);
+    }
+    updateScopeSummaryText();
+    return;
+  }
+  if (target?.id === 'scope-force') {
+    if (state.updateScope) state.updateScope.force = Boolean(target.checked);
+    updateScopeSummaryText();
+  }
 });
 
 $('#rule-select').addEventListener('change', (event) => {

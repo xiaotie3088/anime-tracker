@@ -42,6 +42,8 @@ class El {
   href = '';
   disabled = false;
   open = false;
+  /** 勾选框的当前状态（与真实 DOM 一样：属性 checked 只决定**初始**状态，之后看这个属性值） */
+  checked = false;
   /** 详情弹窗的 `<div hidden>` 靠它判断开关（与 open 同理，布尔属性） */
   hidden = false;
   classList = {
@@ -149,8 +151,25 @@ class El {
     const siblings = this.parent.children;
     siblings.splice(siblings.indexOf(this), 1);
   }
-  prepend() {}
-  append() {}
+  /**
+   * `append` / `appendChild` / `prepend` 必须**真的插进子节点**：
+   * `showUpdateDetail()` 是靠 `$('#app').prepend(panel)` 把"上次更新的明细"摆到列表上面的，
+   * 早先这里写成空函数，于是"报告里能不能看出每一季的结果"根本测不到（假绿）。
+   */
+  append(...nodes: El[]) {
+    for (const node of nodes) {
+      node.parent = this;
+      this.children.push(node);
+    }
+  }
+  appendChild(node: El | null) {
+    if (node) this.append(node);
+    return node;
+  }
+  prepend(...nodes: El[]) {
+    for (const node of nodes) node.parent = this;
+    this.children.unshift(...nodes);
+  }
   removeAttribute() {}
   setAttribute() {}
 
@@ -194,10 +213,11 @@ function parseHtml(html: string, parent: El | null): El[] {
       if (attr[1] === 'id') el.id = attr[2] ?? '';
       if (attr[1] === 'class') el.className = attr[2] ?? '';
       if (attr[1] === 'href') el.href = attr[2] ?? '';
-      // 布尔属性：只要出现就算 true（`<details open>` / `<div hidden>` 的属性值是空串，
-      // 不能按"值是否非空"来判断 —— 真实浏览器就是这么认的）
+      // 布尔属性：只要出现就算 true（`<details open>` / `<div hidden>` / `<input checked>`
+      // 的属性值是空串，不能按"值是否非空"来判断 —— 真实浏览器就是这么认的）
       if (attr[1] === 'open') el.open = true;
       if (attr[1] === 'hidden') el.hidden = true;
+      if (attr[1] === 'checked') el.checked = true;
       if (attr[1].startsWith('data-')) {
         const key = attr[1].slice(5).replace(/-([a-z])/g, (_, c: string) => c.toUpperCase());
         el.dataset[key] = attr[2] ?? '';
@@ -262,8 +282,56 @@ const fetchJson = async (p: string) => {
 const health = await fetchJson('/api/health');
 const overview = await fetchJson('/api/overview?season=2026-10&sort=firstAir');
 const week = await fetchJson('/api/week?season=2026-10&rule=clock&offset=0');
+
+/** 记录壳里真的发出去过哪些请求（断言"更新范围"有没有正确拼进 query）。 */
+const requestedUrls: string[] = [];
+/**
+ * `/api/update` 的假响应：让「开始更新」这条链路真的跑完（否则 result.summary 是 undefined，
+ * 会掉进 catch，测不出"报告里能看出每一季的结果"）。形状与 server.ts 的 reply 一致。
+ */
+const fakeUpdateResult = {
+  season: { id: '2026-10', label: '2026秋' },
+  scope: {
+    mode: 'seasons',
+    seasons: ['2026-10', '2024-10'],
+    backfill: 3,
+    backfillIgnored: false,
+    force: false,
+    translateSeasons: ['2026-10', '2024-10'],
+  },
+  summary: {
+    written: 120,
+    episodes: 300,
+    officialReplaced: 0,
+    machineFilled: 0,
+    movedToBacklog: 0,
+    movedToFinished: 0,
+    changeCount: 0,
+    failedProviders: [],
+    translationFailures: 0,
+  },
+  current: { written: 90, episodeCount: 200, reports: [], moved: [], changes: [] },
+  archive: {
+    seasons: [
+      { season: '2026-10', status: 'skipped', written: 0, episodeCount: 0, note: '库里已有 172 部，跳过', reports: [] },
+      { season: '2024-10', status: 'fetched', written: 30, episodeCount: 100, reports: [] },
+    ],
+    totalWritten: 30,
+    totalEpisodes: 100,
+  },
+  seasonsRepaired: 0,
+  healed: { replaced: 0, kept: 0 },
+  translated: { count: 0, skipped: 0, candidates: 0, titles: [], failed: [] },
+  backup: { path: 'data/backups/anime-2026-10-06.db', bytes: 1024 },
+};
+
 const fetchStub = async (url: string) => {
-  const body = String(url).includes('/api/week') ? week : String(url).includes('/api/health') ? health : overview;
+  const target = String(url);
+  requestedUrls.push(target);
+  if (target.includes('/api/update')) {
+    return { ok: true, status: 200, text: async () => JSON.stringify(fakeUpdateResult) };
+  }
+  const body = target.includes('/api/week') ? week : target.includes('/api/health') ? health : overview;
   return { ok: true, status: 200, text: async () => JSON.stringify(body) };
 };
 
@@ -282,6 +350,8 @@ for (const id of [
   'more-menu',
   'modal-backdrop',
   'modal',
+  // 顶栏状态位：setStatus() 会写它（index.html 里也有）
+  'status',
 ]) {
   getById(id);
 }
@@ -991,6 +1061,152 @@ if (backdrop && keyRow) {
   ok('在「追番」按钮上按空格不会 preventDefault（否则按钮永远按不动）', buttonKey.prevented === false);
 }
 closeModal();
+
+// ---------------------------------------------------------------------------
+// 【M】「更新数据」的季度范围选择器（.scratch/update-scope）
+// ---------------------------------------------------------------------------
+//
+// ⚠ 勾选框的"初始是否勾上"由属性 `checked` 决定（壳里与真实浏览器同一套语义），
+//   之后以 `.checked` 属性值为准 —— 断言时别把两者搞混。
+
+console.log('\n【M】更新数据：先选要抓哪些季度（默认只更新当季）');
+state.view = 'season';
+state.season = '2026-10';
+state.selectedSeasons = ['2026-10'];
+state.overview = overview;
+app.renderSeason();
+requestedUrls.length = 0;
+
+// ⚠ `#update-btn` 在顶栏（index.html 里）、对话框挂在 `#modal` 下 —— **都不在 `#app` 内**，
+//   所以这一节一律从 docRoot 查节点。
+const updateBtn = docRoot.querySelector('#update-btn');
+const modalBox = () => docRoot.querySelectorAll('#modal')[0];
+const scopeBoxes = () =>
+  modalBox()
+    ?.querySelectorAll('input')
+    .filter((input) => 'data-scope-season' in input.attrs) ?? [];
+const pickedIds = () =>
+  scopeBoxes()
+    .filter((input) => input.checked)
+    .map((input) => input.attrs['data-scope-season'] ?? '')
+    .sort();
+const toggleSeasonBox = (season: string) => {
+  const box = scopeBoxes().find((input) => input.attrs['data-scope-season'] === season);
+  if (!box) return false;
+  box.checked = !box.checked;
+  box.dispatch('change');
+  return true;
+};
+const findInDialog = (attr: string, value: string) =>
+  docRoot.querySelectorAll('button').find((b) => b.attrs[attr] === value);
+const presetBtn = (name: string) => findInDialog('data-scope-preset', name);
+const scopeSummary = () => modalBox()?.querySelector('#scope-summary')?.innerHTML ?? '';
+
+ok('渲染出「更新数据」按钮', Boolean(updateBtn));
+updateBtn?.click();
+ok('点它是**先开范围对话框**（不是立刻开抓）', backdrop?.hidden === false && requestedUrls.length === 0);
+ok('对话框里列出了季度勾选框', scopeBoxes().length > 0, `实际 ${scopeBoxes().length} 个`);
+
+const librarySeasons = ((overview as { seasonSummaries?: { season: string }[] }).seasonSummaries ?? []).map(
+  (item) => item.season,
+);
+const candidates = scopeBoxes().map((input) => input.attrs['data-scope-season'] ?? '');
+ok(
+  '候选里既有库里已有的季度',
+  librarySeasons.every((season) => candidates.includes(season)),
+  `库里=${librarySeasons.join(',')}`,
+);
+const notInLibrary = candidates.filter((season) => !librarySeasons.includes(season));
+ok('候选里也有**库里没有**的季度（用户明确要求）', notInLibrary.length > 0, `例如 ${notInLibrary.slice(0, 3).join(',')}`);
+ok(
+  '库里没有的那些标了「库里没有」',
+  (modalBox()?.querySelectorAll('.scope-note') ?? []).some((note) => note.textContent.includes('库里没有')),
+);
+
+ok('默认只勾当季（保住"一键更新"的心智）', pickedIds().join(',') === '2026-10', `实际 ${pickedIds().join(',')}`);
+ok('摘要里写了预计耗时', /预计/.test(scopeSummary()) && /秒/.test(scopeSummary()), scopeSummary().slice(0, 80));
+
+// 勾上第二个季度 → 摘要与请求范围都要跟着变
+if (toggleSeasonBox('2024-10')) {
+  ok('勾上第二季后摘要变成「已选 2 季」', scopeSummary().includes('已选 2 季'), scopeSummary().slice(0, 60));
+  ok('摘要里提示了这一季库里没有', scopeSummary().includes('2024-10'), scopeSummary().slice(0, 120));
+} else {
+  ok('能找到 2024-10 这个候选（库里没有也要能勾）', false, `候选=${candidates.slice(0, 8).join(',')}`);
+}
+
+// 强制重抓开关
+const forceBox = modalBox()?.querySelector('#scope-force');
+if (forceBox) {
+  forceBox.checked = true;
+  forceBox.dispatch('change');
+  ok('「重抓已选季度」开关写进了 state', (state.updateScope as { force?: boolean } | null)?.force === true);
+} else {
+  ok('对话框里有「重抓已选季度」开关', false);
+}
+
+// 预设：跨年的那一条走的是前端的季度移位（2026-01 往前一季必须是 2025-10）
+state.season = '2026-01';
+app.renderSeason();
+updateBtn?.click();
+presetBtn('recent')?.click();
+ok(
+  '「当季 + 最近 3 季」跨年正确（2026-01 → 2025-10 → 2025-07）',
+  pickedIds().join(',') === '2025-07,2025-10,2026-01',
+  `实际 ${pickedIds().join(',')}`,
+);
+presetBtn('current')?.click();
+ok('「只勾当季」回到单季', pickedIds().join(',') === '2026-01', `实际 ${pickedIds().join(',')}`);
+presetBtn('library')?.click();
+ok(
+  '「库里全部季度」把库里的都勾上',
+  librarySeasons.every((season) => pickedIds().includes(season)),
+  `实际 ${pickedIds().length} 季`,
+);
+
+// 手填一个库里没有的老季度
+const extraInput = modalBox()?.querySelector('#scope-extra');
+if (extraInput) {
+  extraInput.value = '2020-13'; // 月份不合法 → 必须被拦住
+  findInDialog('data-scope-add', '1')?.click();
+  ok('手填非法季度被拦住（不会静默加进去）', !pickedIds().includes('2020-13'), `picked=${pickedIds().length}`);
+  const reopened = modalBox()?.querySelector('#scope-extra');
+  if (reopened) reopened.value = '2020-01';
+  findInDialog('data-scope-add', '1')?.click();
+  ok('手填 2020-01 能加进来并自动勾上', pickedIds().includes('2020-01'), `picked=${pickedIds().join(',')}`);
+} else {
+  ok('对话框里有"其它季度"输入框', false);
+}
+
+// 「全不勾」+ 开始更新：必须被拦住，不能白发一次请求
+presetBtn('none')?.click();
+requestedUrls.length = 0;
+findInDialog('data-scope-start', '1')?.click();
+ok('一个季度都没勾时不会发请求（也不关对话框）', requestedUrls.length === 0 && backdrop?.hidden === false);
+
+// 回到 2026-10 那一季，全勾 + 强制重抓，真的发一次
+state.season = '2026-10';
+app.renderSeason();
+updateBtn?.click();
+scopeBoxes().forEach((input) => {
+  input.checked = true;
+});
+scopeBoxes()[0]?.dispatch('change');
+const forceAgain = modalBox()?.querySelector('#scope-force');
+if (forceAgain) {
+  forceAgain.checked = true;
+  forceAgain.dispatch('change');
+}
+requestedUrls.length = 0;
+findInDialog('data-scope-start', '1')?.click();
+const updateUrl = requestedUrls.find((url) => url.includes('/api/update')) ?? '';
+ok('请求带上了 seasons 参数（勾中的季度列表）', /seasons=/.test(updateUrl), updateUrl);
+ok('seasons 里含当季与库里没有的老季度', /2026-10/.test(decodeURIComponent(updateUrl)) && /20\d\d-\d\d/.test(updateUrl), updateUrl);
+ok('请求带上了 force=1（勾了重抓）', /force=1/.test(updateUrl), updateUrl);
+ok('开始更新后对话框关掉了', backdrop?.hidden === true);
+await new Promise((resolve) => setTimeout(resolve, 40));
+const reportText = collectText(appEl);
+ok('报告里能看出每一季的结果（各季结果 + 跳过的说明）', reportText.includes('各季结果') && reportText.includes('2024-10'));
+ok('报告里写明了本次范围', reportText.includes('本次范围') && reportText.includes('你挑的'));
 
 console.log(`\n结果：${failures === 0 ? '全部通过' : `${failures} 项失败`}`);
 process.exitCode = failures === 0 ? 0 : 1;

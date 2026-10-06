@@ -38,6 +38,7 @@ import {
   parseHhmmJst,
   resolveAiringSlot,
   seasonDateRange,
+  seasonFromId,
   seasonOf,
   shiftSeason,
   toLiteralJstTime,
@@ -77,7 +78,7 @@ import {
   stats,
   upsertSubject,
 } from '../src/server/db.ts';
-import { healMachineTitles } from '../src/server/sync.ts';
+import { healMachineTitles, archiveSkipDecision, DEFAULT_BACKFILL, resolveArchiveSeasons, translateMissingTitles } from '../src/server/sync.ts';
 
 // ---------------------------------------------------------------------------
 // 极简测试骨架
@@ -1539,6 +1540,157 @@ check('每个可选列数都有对应的 .per-row-N 规则（与 app.js 的 PER_
       `styles.css 缺少 .per-row-${option} 的列数规则`,
     );
   }
+});
+
+// ---------------------------------------------------------------------------
+section('十六、更新范围可控：自己挑季度（.scratch/update-scope）');
+// ---------------------------------------------------------------------------
+//
+// 这一段**刻意不碰网络**：抓取与机翻请求属于 `pnpm verify:api` 的活。
+// 所以把"要抓哪几季"和"这一季要不要跳过"抽成了纯函数（`resolveArchiveSeasons` /
+// `archiveSkipDecision`），在这里断言它们；`syncArchive` 的循环就是照这两个函数的输出跑的。
+
+check('给定 seasons 时按给定顺序、跳过中间季度，一个不多一个不少', () => {
+  assert.deepEqual(resolveArchiveSeasons({ seasons: ['2026-10', '2024-10'] }), ['2026-10', '2024-10']);
+  // 2025-01 / 2025-04 / … 这些**中间季度一个都不能出现**（这是本票的核心）
+  const picked = resolveArchiveSeasons({ seasons: ['2026-10', '2024-10', '2020-01'] });
+  assert.deepEqual(picked, ['2026-10', '2024-10', '2020-01']);
+});
+
+check('seasons 去重、去空白，且不去排序（用户给的顺序就是抓取顺序）', () => {
+  assert.deepEqual(resolveArchiveSeasons({ seasons: [' 2026-04 ', '2026-10', '2026-04', ''] }), [
+    '2026-04',
+    '2026-10',
+  ]);
+});
+
+check('库里没有的季度照样按顺序去抓（老季度不会被推导逻辑吃掉）', () => {
+  const seasons = resolveArchiveSeasons({ seasons: ['2020-01'] });
+  assert.deepEqual(seasons, ['2020-01']);
+  // 顺带确认 seasonFromId / shiftSeason 对远古季度也能给出正常的 id 与标签
+  const old = seasonFromId('2020-01');
+  assert.equal(old.id, '2020-01');
+  assert.ok(old.label.includes('2020'), `标签应该带年份，实际 ${old.label}`);
+  assert.equal(shiftSeason('2020-01', -1), '2019-10');
+  assert.equal(shiftSeason('2020-01', 1), '2020-04');
+});
+
+check('seasons 优先于 backfill：同时给时只用 seasons 的列表', () => {
+  const both = resolveArchiveSeasons({ seasons: ['2024-10'], toSeason: '2026-10', backfill: 4 });
+  assert.deepEqual(both, ['2024-10']);
+});
+
+check('backfill 档位：含当季往回数，且最小 1（0 / 负数都不会推出"未来季度"）', () => {
+  assert.deepEqual(resolveArchiveSeasons({ toSeason: '2026-10', backfill: 3 }), [
+    '2026-04',
+    '2026-07',
+    '2026-10',
+  ]);
+  assert.deepEqual(resolveArchiveSeasons({ toSeason: '2026-10', backfill: 1 }), ['2026-10']);
+  // ⚠ 这两条是防回归：旧实现 backfill=0 → fromSeason = 当季之后 → 一路推 64 个未来季度
+  assert.deepEqual(resolveArchiveSeasons({ toSeason: '2026-10', backfill: 0 }), ['2026-10']);
+  assert.deepEqual(resolveArchiveSeasons({ toSeason: '2026-10', backfill: -5 }), ['2026-10']);
+  assert.deepEqual(resolveArchiveSeasons({ toSeason: '2026-10' }), ['2026-04', '2026-07', '2026-10']);
+  assert.equal(DEFAULT_BACKFILL, 3, '默认档位只有一处来源');
+});
+
+check('显式给了空的 seasons 就抓 0 季（不能掉回 backfill 推导）', () => {
+  // 防的是一个很隐蔽的回归：主季已经单独抓过、回填阶段没有别的季度时，若把空数组
+  // 当成"没给 seasons"，就会突然去抓一串**没人要求过**的季度。
+  assert.deepEqual(resolveArchiveSeasons({ seasons: [] }), []);
+});
+
+check('from/to 写反了自动换过来；跨年也对', () => {
+  assert.deepEqual(resolveArchiveSeasons({ fromSeason: '2026-07', toSeason: '2026-01' }), [
+    '2026-01',
+    '2026-04',
+    '2026-07',
+  ]);
+  assert.deepEqual(resolveArchiveSeasons({ fromSeason: '2025-10', toSeason: '2026-04' }), [
+    '2025-10',
+    '2026-01',
+    '2026-04',
+  ]);
+  // 守卫上限还在（不让一个畸形区间把源站打穿）
+  assert.ok(resolveArchiveSeasons({ fromSeason: '1990-01', toSeason: '2030-01' }).length <= 64);
+});
+
+check('增量判定：库里已有的季度跳过，force / minSubjects 能改变结论', () => {
+  // 1) 库里**没有**的季度绝不能被误判成 skip（老季度 404 也要真去试一次）
+  assert.equal(archiveSkipDecision(0).skip, false);
+  // 2) 已有数据 → 跳过，且理由里要说清怎么重抓
+  const skipped = archiveSkipDecision(31);
+  assert.equal(skipped.skip, true);
+  assert.ok((skipped.note ?? '').includes('force'), `跳过理由要提到 force，实际：${skipped.note}`);
+  // 3) force → 不跳过（重抓）
+  assert.equal(archiveSkipDecision(31, { force: true }).skip, false);
+  // 4) minSubjects 的口径
+  assert.equal(archiveSkipDecision(3, { minSubjects: 5 }).skip, false);
+  assert.equal(archiveSkipDecision(5, { minSubjects: 5 }).skip, true);
+});
+
+check('archiveSkipDecision 与库里的实际条数对得上（内存库真查一次）', () => {
+  const scopeDb = openDb(':memory:');
+  migrate(scopeDb);
+  // 两个季度：一个有数据、一个库里根本没有（2020-01）
+  upsertSubject(scopeDb, makeSubject('scope:1', { titleCn: '有数据的番' }), '2026-10');
+  assert.equal(seasonSubjectCount(scopeDb, '2026-10'), 1);
+  assert.equal(seasonSubjectCount(scopeDb, '2020-01'), 0);
+  assert.equal(archiveSkipDecision(seasonSubjectCount(scopeDb, '2026-10')).skip, true);
+  assert.equal(archiveSkipDecision(seasonSubjectCount(scopeDb, '2020-01')).skip, false);
+  // 顺带把"这次要抓哪几季"的整条链路合起来看一遍
+  assert.deepEqual(resolveArchiveSeasons({ seasons: ['2026-10', '2020-01'] }), ['2026-10', '2020-01']);
+  scopeDb.close();
+});
+
+// 机翻那几个条目刻意"连原文都没有"（titleCn / titleOriginal 都不给）：
+// 判定结果是「没有可翻译的原名」→ translateMissingTitles 会在 pending 阶段跳过它们，
+// 于是这一段**既验证了季度筛选，又不会真的发翻译请求**（离线的 pnpm verify 不该打网络）。
+// 注意：这类条目属于"被跳过"，所以查询时要带 includeSkipped（translateMissingTitles 自己就是这么查的）。
+const mtScopeDb = openDb(':memory:');
+migrate(mtScopeDb);
+for (const [key, season] of [
+  ['mt:2026', '2026-10'],
+  ['mt:2024', '2024-10'],
+  ['mt:2020', '2020-01'],
+] as const) {
+  upsertSubject(mtScopeDb, makeSubject(key), season);
+}
+
+check('机翻覆盖范围：勾中的季度都翻、没勾的一条都不碰（不传 null 全库翻）', () => {
+  const twoSeasons = listTranslationCandidates(mtScopeDb, {
+    season: ['2026-10', '2024-10'],
+    includeSkipped: true,
+  });
+  assert.equal(twoSeasons.length, 2, `勾两季应该只有 2 条候选，实际 ${twoSeasons.length}`);
+  assert.deepEqual(
+    [...new Set(twoSeasons.map((item) => item.season))].sort(),
+    ['2024-10', '2026-10'],
+  );
+  assert.equal(
+    twoSeasons.some((item) => item.season === '2020-01'),
+    false,
+    '没勾的季度一条都不该出现',
+  );
+  // 确认这几条确实"没有可翻译的原名"（也正因为如此，下面那步不会发网络请求）
+  assert.ok(
+    twoSeasons.every((item) => item.skipReason === '没有可翻译的原名'),
+    `候选应当被判定为"没有可翻译的原名"，实际：${twoSeasons.map((item) => item.skipReason).join(' / ')}`,
+  );
+
+  // 单季仍然照旧
+  assert.equal(listTranslationCandidates(mtScopeDb, { season: '2026-10', includeSkipped: true }).length, 1);
+  // 不传才是全库（三条都在）——「全库翻」只允许显式调用
+  assert.equal(listTranslationCandidates(mtScopeDb, { includeSkipped: true }).length, 3);
+});
+
+const scopedTranslation = await translateMissingTitles(mtScopeDb, { season: ['2026-10', '2024-10'] });
+
+check('translateMissingTitles 把季度数组原样传到候选查询（计数只覆盖勾中的两季）', () => {
+  assert.equal(scopedTranslation.candidates, 2, `机翻候选应该只覆盖勾中的两季，实际 ${scopedTranslation.candidates}`);
+  assert.equal(scopedTranslation.translated.length, 0);
+  assert.equal(scopedTranslation.failed.length, 0, '没有可用原文的条目应算"跳过"，不是失败');
+  mtScopeDb.close();
 });
 
 // ---------------------------------------------------------------------------

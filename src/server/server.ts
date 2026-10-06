@@ -53,7 +53,7 @@ import {
 } from './db.ts';
 import { changeKindLabel, describeChangeItem } from './changes.ts';
 import { buildIcs, icsFileName } from './ics.ts';
-import { runFullUpdate, syncSeason, translateMissingTitles } from './sync.ts';
+import { DEFAULT_BACKFILL, runFullUpdate, syncSeason, translateMissingTitles } from './sync.ts';
 
 const PORT = Number(process.env.PORT ?? 8787);
 const HOST = process.env.HOST ?? '127.0.0.1';
@@ -361,22 +361,35 @@ async function handleSync(url: URL, reply: Reply): Promise<void> {
  *   当季抓取 → 历史季度增量回填 → 官方名替换临时机翻 → 缺中文名的做临时机翻 → 汇总报告
  *
  * 参数（都可省略）：
- *   season=2026-10   指定季度，默认当季
- *   backfill=3       回填最近几个季度（含当季），0 表示不回填
+ *   season=2026-10   指定季度，默认当季。**显式挑了 seasons 时，主季 = 你挑的第一个**
+ *   seasons=2026-10,2024-10
+ *                    自己挑要抓哪些季度：按给定顺序、**跳过中间季度**、
+ *                    可以是**库里没有的**老季度。给了它就以它为准，`backfill` 被忽略
+ *                    （不是静默忽略：报告里的 scope.backfillIgnored 会说，界面也显示）
+ *   backfill=3       回填最近几个季度（含当季，最小 1 —— 0 等同于只抓当季）
  *   translate=0      关掉机翻（跑批量翻译很慢）
  *   limit=N          机翻条数上限
  *   force=1          已有数据的季度也重抓
  */
 async function handleUpdate(url: URL, reply: Reply): Promise<void> {
   const season = resolveSeason(url.searchParams.get('season'));
-  const backfill = Number(url.searchParams.get('backfill') ?? 3);
+  // ⚠ 逗号分隔而不是多个同名参数：URLSearchParams.get() 只取第一个，多写几个会静默丢参数
+  const seasons = (url.searchParams.get('seasons') ?? '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const backfillParam = Number(url.searchParams.get('backfill') ?? DEFAULT_BACKFILL);
   const translate = url.searchParams.get('translate') !== '0';
   const limit = Number(url.searchParams.get('limit') ?? 0);
   const force = url.searchParams.get('force') === '1';
 
   const result = await runFullUpdate(db, {
     season,
-    backfill: Number.isFinite(backfill) ? Math.max(0, backfill) : 3,
+    // ⚠ 有 seasons 时**不要**再传 backfill：传了就变成"两个都给了"，
+    //   报告里的 scope.backfillIgnored 会一直为真（明明是服务端自己塞的默认值）。
+    ...(seasons.length > 0
+      ? { seasons }
+      : { backfill: Number.isFinite(backfillParam) ? backfillParam : DEFAULT_BACKFILL }),
     force,
     translate,
     translateLimit: Number.isFinite(limit) ? Math.max(0, limit) : 0,
@@ -385,6 +398,7 @@ async function handleUpdate(url: URL, reply: Reply): Promise<void> {
 
   reply(200, {
     season: { id: season.id, label: season.label },
+    scope: result.scope,
     summary: result.summary,
     current: {
       written: result.current.written,

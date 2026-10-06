@@ -190,6 +190,80 @@ export type ArchiveSyncResult = {
 };
 
 /**
+ * 「回填几个季度（含当季）」的默认档位。
+ *
+ * ⚠ 只留**这一个**来源：以前 `server.ts` 写 3、`sync.ts` 写 4，同一个参数在两处默认值不同，
+ *   用户从界面和从 CLI 触发会得到不同的范围。
+ */
+export const DEFAULT_BACKFILL = 3;
+
+/**
+ * 算出这次要**按顺序尝试**哪些季度（纯函数：不碰数据库、不发请求）。
+ *
+ * 两条路径（`seasons` 优先，与 `backfill` 同时给时以 `seasons` 为准 —— 见 runFullUpdate 的 scope）：
+ *   1. `seasons`：用户自己挑的季度列表，**按给定顺序**用，跳过 `shiftSeason` 推导。
+ *      「更新范围可控」这条需求就是冲它来的：可以只挑 2026-10 与 2024-10，
+ *      并且允许挑**库里根本没有**的季度（老季度）——这一层不做任何"库里有没有"的判断。
+ *   2. `from/to/backfill`：从 `to` 往回数 `backfill` 个季度（含 `to`），再一路推到 `to`。
+ *
+ * ⚠ `backfill` 必须夹到 >= 1：它是"含当季在内往回数几季"，0 会算出 fromSeason = to 的**下一季**，
+ *   原来的循环于是会一路往后推"未来季度"（靠 64 次守卫上限才没炸）。
+ * ⚠ `from` 写反了（早于/晚于 `to`）自动换过来 —— 这是原来注释里就想做的事，实际没做到。
+ */
+export function resolveArchiveSeasons(
+  options: {
+    seasons?: readonly string[];
+    fromSeason?: string;
+    toSeason?: string;
+    backfill?: number;
+  } = {},
+): string[] {
+  // 1) 显式列表：按给定顺序（去重保序，丢掉空白项）。
+  //    ⚠ **显式给了就用它**，哪怕是空数组也返回空 —— 不能因为"空了"就掉回 backfill 推导：
+  //      那会在"主季已经单独抓过、回填阶段没有别的季度"时，突然去抓一串没被要求的季度。
+  if (options.seasons !== undefined) {
+    const explicit: string[] = [];
+    for (const raw of options.seasons) {
+      const id = String(raw ?? '').trim();
+      if (id && !explicit.includes(id)) explicit.push(id);
+    }
+    return explicit;
+  }
+
+  // 2) 区间 / 档位
+  const toSeason = options.toSeason ?? seasonOf(new Date()).id;
+  const rawBackfill = Math.trunc(Number(options.backfill ?? DEFAULT_BACKFILL));
+  const backfill = Number.isFinite(rawBackfill) ? Math.max(1, rawBackfill) : DEFAULT_BACKFILL;
+  let start = options.fromSeason ?? shiftSeason(toSeason, -(backfill - 1));
+  let end = toSeason;
+  if (start > end) [start, end] = [end, start]; // 季度 id 是 'YYYY-NN'，字典序 == 时间序
+
+  const seasons: string[] = [];
+  let cursor = start;
+  for (let guard = 0; guard < 64; guard += 1) {
+    seasons.push(cursor);
+    if (cursor === end) break;
+    cursor = shiftSeason(cursor, 1);
+  }
+  return seasons.length > 0 ? seasons : [end];
+}
+
+/**
+ * 这个季度这次要不要真的抓（纯函数，判定规则单独拎出来就是为了能在离线测试里断言）。
+ *
+ * 增量语义：库里已经有数据就跳过，除非 `force` —— 「一键更新」每次都把几个季度重抓一遍
+ * 既慢又容易触发源站限速。
+ */
+export function archiveSkipDecision(
+  existing: number,
+  options: { force?: boolean; minSubjects?: number } = {},
+): { skip: boolean; note?: string } {
+  const { force = false, minSubjects = 1 } = options;
+  if (force || existing < minSubjects) return { skip: false };
+  return { skip: true, note: `库里已有 ${existing} 部，跳过（需要重抓请加 force）` };
+}
+
+/**
  * 按季度回填历史数据。
  *
  * 三个刻意的设计（对应 docs/决策记录.md D9）：
@@ -198,15 +272,20 @@ export type ArchiveSyncResult = {
  *   2. **容忍失败**：老季度的 yuc.wiki 页面多半 404、AniList 也可能查不到，
  *      单个季度失败不能中断整体（每个季度单独 try/catch）。
  *   3. **季度间留间隔**：连续打源站很容易被限速，`intervalMs` 默认 1 秒。
+ *
+ * 要抓哪些季度由 `resolveArchiveSeasons()` 决定：既支持 `from/to/backfill`，
+ * 也支持 `seasons`（用户显式挑的季度列表，可以跳过中间季度、可以是库里没有的季度）。
  */
 export async function syncArchive(
   db: DatabaseSync,
   options: {
+    /** 用户显式挑的季度列表（按给定顺序），与 from/to/backfill 二选一，优先它 */
+    seasons?: readonly string[];
     /** 从哪一季开始（含），默认「当季往前 backfill 个季度」 */
     fromSeason?: string;
     /** 到哪一季结束（含），默认当季 */
     toSeason?: string;
-    /** 只回填最近 N 个季度（与 from/to 二选一，from 更明确） */
+    /** 只回填最近 N 个季度（含当季，N>=1；与 from/to 二选一，from 更明确） */
     backfill?: number;
     force?: boolean;
     /** 判定「这个季度已经有数据」的最小条目数 */
@@ -217,30 +296,20 @@ export async function syncArchive(
 ): Promise<ArchiveSyncResult> {
   const { force = false, minSubjects = 1, intervalMs = 1_000, onProgress } = options;
 
-  const toSeason = options.toSeason ?? seasonOf(new Date()).id;
-  const backfill = Math.max(1, options.backfill ?? 4);
-  const fromSeason = options.fromSeason ?? shiftSeason(toSeason, -(backfill - 1));
-
-  // 从前到后收集季度，避免用户把 from/to 写反
-  const seasons: string[] = [];
-  let cursor = fromSeason;
-  for (let guard = 0; guard < 64; guard += 1) {
-    seasons.push(cursor);
-    if (cursor === toSeason) break;
-    cursor = shiftSeason(cursor, 1);
-  }
+  const seasons = resolveArchiveSeasons(options);
 
   const result: ArchiveSyncResult = { seasons: [], totalWritten: 0, totalEpisodes: 0 };
 
   for (const [index, seasonId] of seasons.entries()) {
     const existing = seasonSubjectCount(db, seasonId);
-    if (!force && existing >= minSubjects) {
+    const decision = archiveSkipDecision(existing, { force, minSubjects });
+    if (decision.skip) {
       result.seasons.push({
         season: seasonId,
         status: 'skipped',
         written: 0,
         episodeCount: 0,
-        note: `库里已有 ${existing} 部，跳过（需要重抓请加 force）`,
+        note: decision.note,
         reports: [],
       });
       continue;
@@ -314,7 +383,8 @@ export type TranslateResult = {
 export async function translateMissingTitles(
   db: DatabaseSync,
   options: {
-    season?: string | null;
+    /** 单个季度 / 多个季度 / null（全库）。多季时**只翻这几季**，见 listTranslationCandidates */
+    season?: string | readonly string[] | null;
     limit?: number;
     minIntervalMs?: number;
     onProgress?: (done: number, total: number, title: string) => void;
@@ -470,6 +540,8 @@ export type FullUpdateResult = {
   };
   /** 阶段二：历史季度回填 */
   archive: ArchiveSyncResult;
+  /** 这次实际用了什么范围（用户要能看出"到底抓了哪几季、backfill 有没有被忽略"） */
+  scope: UpdateScope;
   /** 阶段三：全库纠正季度归属 */
   seasonsRepaired: number;
   /** 阶段四：官方名替换掉临时机翻名 */
@@ -495,6 +567,26 @@ export type FullUpdateResult = {
 };
 
 /**
+ * 这次「更新数据」用了什么范围。
+ *
+ * 为什么要显式回报：`seasons` 与 `backfill` 同时给的时候以 `seasons` 为准，
+ * 但**不能静默忽略** —— 界面与 CLI 都要能说出"我按你挑的季度来，backfill 没生效"。
+ */
+export type UpdateScope = {
+  /** 'seasons' = 用户显式挑了季度；'backfill' = 当季 + 往回 N 季 */
+  mode: 'seasons' | 'backfill';
+  /** 这次按顺序尝试的季度（含被增量跳过的那些） */
+  seasons: string[];
+  /** mode='backfill' 时生效的档位（含当季，>=1） */
+  backfill: number;
+  /** 同时给了 seasons 与 backfill：backfill 被忽略 */
+  backfillIgnored: boolean;
+  force: boolean;
+  /** 机翻覆盖的季度（= mode='seasons' 时用户挑的那几季） */
+  translateSeasons: string[];
+};
+
+/**
  * 真正意义上的「一键更新数据」。
  *
  * 语义是**全流程**（用户诉求：「这个项目怎么更新数据，要不要加一键更新数据」）：
@@ -507,13 +599,21 @@ export type FullUpdateResult = {
  *
  * 每一步都单独 try/catch：翻译接口挂掉不该让「更新数据」整体失败 ——
  * 前两步（真正重要的抓取）必须已经落库。
+ *
+ * 「更新范围可控」（`.scratch/update-scope`）：给了 `seasons` 时按用户挑的季度抓
+ * （可以跳过中间季度、可以是库里没有的老季度），机翻也只覆盖这几季。
  */
 export async function runFullUpdate(
   db: DatabaseSync,
   options: {
     season?: SeasonInfo;
-    /** 回填几个季度（含当季），默认 3 */
+    /** 回填几个季度（含当季），默认 DEFAULT_BACKFILL */
     backfill?: number;
+    /**
+     * 用户显式挑的季度列表（按给定顺序）。给了它就以它为准、`backfill` 被忽略，
+     * 并且**第一个季度就是主季**（与"多选季度看总览时主季 = 第一个选中的"同一套约定）。
+     */
+    seasons?: readonly string[];
     /** 连已有数据的季度也重抓 */
     force?: boolean;
     /** 是否做机翻（跑批量翻译很慢，允许关掉） */
@@ -529,7 +629,7 @@ export async function runFullUpdate(
 ): Promise<FullUpdateResult> {
   const {
     season = seasonOf(new Date()),
-    backfill = 3,
+    backfill = DEFAULT_BACKFILL,
     force = false,
     translate = true,
     translateLimit = 0,
@@ -537,28 +637,66 @@ export async function runFullUpdate(
     onProgress,
   } = options;
 
+  // 范围：用户挑了季度就以它为准（顺序也照他给的），否则"当季 + 往回 backfill 季"。
+  const explicitSeasons = (options.seasons ?? []).map((id) => String(id ?? '').trim()).filter(Boolean);
+  const planSeasons = resolveArchiveSeasons(
+    explicitSeasons.length > 0 ? { seasons: explicitSeasons } : { toSeason: season.id, backfill },
+  );
+  const backfillIgnored = explicitSeasons.length > 0 && options.backfill !== undefined;
+  // 主季：显式列表的第一个（与"多选季度看总览时主季 = 第一个选中的"同一套约定）；
+  // 否则就是调用方给的当季。
+  const mainSeason = explicitSeasons.length > 0 ? seasonFromId(planSeasons[0] as string) : season;
+  // ⚠ 不能用 `x || DEFAULT`：backfill=0 是"只抓当季"（=最小档 1），`0 || 3` 会把它变成 3
+  const requestedBackfill = Math.trunc(Number(backfill));
+  const effectiveBackfill = Number.isFinite(requestedBackfill)
+    ? Math.max(1, requestedBackfill)
+    : DEFAULT_BACKFILL;
+  const scope: UpdateScope = {
+    mode: explicitSeasons.length > 0 ? 'seasons' : 'backfill',
+    seasons: planSeasons,
+    backfill: effectiveBackfill,
+    backfillIgnored,
+    force,
+    translateSeasons: planSeasons,
+  };
+  if (backfillIgnored) {
+    onProgress?.(`已按你挑的 ${planSeasons.length} 个季度更新，backfill 参数被忽略`);
+  }
+
   // 用户数据不可重建 —— 动手之前先备份
   const backup = backupDatabase(db, { label: 'pre-update' });
   pruneBackups();
 
-  onProgress?.(`正在抓取 ${season.label}…`);
-  const current = await syncSeason(db, season);
+  onProgress?.(`正在抓取 ${mainSeason.label}…`);
+  const current = await syncSeason(db, mainSeason);
 
-  onProgress?.('正在回填历史季度…');
+  onProgress?.(
+    scope.mode === 'seasons'
+      ? `正在抓取你挑的 ${planSeasons.length} 个季度…`
+      : '正在回填历史季度…',
+  );
+  // 主季上面已经单独抓过一次了，回填阶段把它排除掉：
+  //   - 不排除的话报告里同一季会出现两次（「主季写入 59 部」+「2024-07 跳过」），看着自相矛盾；
+  //   - `force` 时更糟：同一季会被抓两遍，白打一次源站。
+  const archiveSeasons = planSeasons.filter((id) => id !== mainSeason.id);
   let archive: ArchiveSyncResult = { seasons: [], totalWritten: 0, totalEpisodes: 0 };
   try {
-    archive = await syncArchive(db, {
-      toSeason: season.id,
-      backfill,
-      force,
-      intervalMs: 1_000,
-      onProgress,
-    });
+    if (archiveSeasons.length > 0) {
+      archive = await syncArchive(db, {
+        // mode='seasons' 时按用户给的列表（跳过推导）；否则沿用"到当季、往回 backfill 季"。
+        ...(scope.mode === 'seasons'
+          ? { seasons: archiveSeasons }
+          : { toSeason: season.id, backfill: effectiveBackfill }),
+        force,
+        intervalMs: 1_000,
+        onProgress,
+      });
+    }
   } catch (error) {
     archive = {
       seasons: [
         {
-          season: season.id,
+          season: mainSeason.id,
           status: 'failed',
           written: 0,
           episodeCount: 0,
@@ -591,10 +729,16 @@ export async function runFullUpdate(
 
   let translated: TranslateResult = { translated: [], skipped: 0, failed: [], candidates: 0 };
   if (translate) {
-    onProgress?.('正在为缺中文名的番做临时机翻…');
+    onProgress?.(
+      scope.mode === 'seasons'
+        ? `正在为挑中的 ${scope.translateSeasons.length} 个季度里缺中文名的番做临时机翻…`
+        : '正在为缺中文名的番做临时机翻…',
+    );
     try {
       translated = await translateMissingTitles(db, {
-        season: season.id,
+        // ⚠ 多季时传**数组**（只翻用户挑的那几季）。不要图省事传 null 全库翻：
+        //   那会翻掉用户没选的季度，慢且耗免费接口的额度。
+        season: scope.mode === 'seasons' ? scope.translateSeasons : mainSeason.id,
         limit: translateLimit,
         minIntervalMs: 700,
         onProgress: (done, total) => onProgress?.(`机翻中 ${done}/${total}`),
@@ -614,7 +758,7 @@ export async function runFullUpdate(
   const movedToFinished = current.archive.toFinished.length;
 
   return {
-    season: season.id,
+    season: mainSeason.id,
     current: {
       written: current.written,
       episodeCount: current.episodeCount,
@@ -623,6 +767,7 @@ export async function runFullUpdate(
       archive: current.archive,
     },
     archive,
+    scope,
     seasonsRepaired: seasonRepaired,
     healed,
     translated,

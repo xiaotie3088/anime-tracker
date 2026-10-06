@@ -666,6 +666,68 @@ main { padding: 20px 22px 72px; max-width: 2200px; margin: 0 auto; }
 }
 .toolbar .hint { font-size: var(--fs-xs); color: var(--text-faint); font-variant-numeric: tabular-nums; }
 
+/* ---------- 「更新数据」的季度范围选择器（对话框里） ---------- */
+
+/* 预设按钮：只勾当季 / 老规矩 / 库里的全部 / 全不勾 */
+.scope-presets { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: var(--gap); }
+
+/* 季度勾选列表：两列，自己一块滚动区（往前 16 季 + 库里已有的，铺开会很长）。
+   ⚠ 列数写**字面量整数**：`repeat(min(...))` 之类会被浏览器整条丢掉（见文件末尾的静态守卫）。 */
+.scope-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 2px 10px;
+  max-height: 280px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+.scope-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 7px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: var(--fs-sm);
+  color: var(--text-dim);
+}
+.scope-item:hover { background: var(--surface-2); color: var(--text); }
+.scope-item input[type="checkbox"] { accent-color: var(--accent); flex: none; margin: 0; }
+.scope-id { font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--text); }
+.scope-note { margin-left: auto; font-size: var(--fs-xs); color: var(--text-faint); font-variant-numeric: tabular-nums; }
+
+.scope-add { display: flex; align-items: flex-end; gap: var(--gap); margin-top: var(--gap); }
+.scope-add .field { min-width: 220px; }
+.scope-add input[type="text"] {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+}
+.scope-add input[type="text"]:focus { border-color: var(--accent); outline: none; box-shadow: var(--ring); }
+
+/* 「重抓已选季度」开关：一句话讲清不勾会怎样，别让用户猜 */
+.scope-force {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: var(--gap);
+  font-size: var(--fs-sm);
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.scope-force input[type="checkbox"] { accent-color: var(--accent); flex: none; margin-top: 3px; }
+
+/* 摘要是动态刷新的，单独留出高度免得勾选框一动对话框就跳 */
+#scope-summary { min-height: 3.4em; }
+.scope-skip { color: var(--warn); }
+
+/* 窄屏：一列，别把季度名挤断 */
+@media (max-width: 560px) {
+  .scope-grid { grid-template-columns: 1fr; }
+  .scope-add { flex-direction: column; align-items: stretch; }
+}
+
 /* ---------- 筛选面板（五层：搜索 / 状态 / 四个维度 / 显示方式） ---------- */
 
 .filter-panel {
