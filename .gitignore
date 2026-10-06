@@ -13,6 +13,9 @@ data/probe-*/
 data/*.html
 # 离线 UI 预览页（scripts/preview-ui.ts 生成，含内嵌海报，几 MB，不入库）
 data/_preview/
+# data/ 下的 markdown 是排查/清理的一次性报告（含你库里的真实番名与 key），
+# 与 .scratch/ 同理：是实现过程产物，不是源码。
+data/*.md
 *.log
 .DS_Store
 .venv/
