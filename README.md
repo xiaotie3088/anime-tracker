@@ -111,6 +111,44 @@ node src/server/server.ts
 
 ---
 
+## 同一部番不会变成两条记录
+
+这是实测踩得最深的一个坑，值得单独说 —— 因为它**不会报错**，只会让同一部番在界面上出现两次，
+而且两次的首播时间还对不上。
+
+**为什么会发生**：跨源聚类（`src/core/merge.ts`）只在**单次抓取的内存里**做，写完就忘。
+而写库的主键（`subject.key`）是**按"这次哪个源成功了"算出来的**：
+三源齐全时是 `bgm:<id>`，某次只有 yuc 成功（另一个源超时、或缓存里没这部番）时就退化成
+`title:<归一化名>`。于是同一次番剧先以 `title:` 形态落库，下一次又以 `bgm:` 形态落一条新的，
+**旧的永远不会被删**。
+
+**现在的做法**（`src/server/db.ts` 的 `resolveSubjectIdentity()`）：
+落库**之前**必须走一次统一的"找已有番"判定，顺序不可颠倒：
+
+1. **外部 ID**（`bgm_id` / `anilist_id` / `mal_id`）命中 → 复用那一行
+2. 未命中 → **退到归一化标题**匹配（大小写/全半角/标点/季数后缀都归一化后再比）
+3. 仍未命中 → 才新建
+
+第 2 步是必须的：实测库里**有三成条目一个外部 ID 都没有**，只按 ID 查必然漏。
+而且**按 ID 命中之后仍然要按标题扫一遍** —— 否则同一部番的 `title:` 旧行永远碰不到它。
+
+**顺带的两条纪律**：
+
+- 认定是同一条之后，带外部 ID 的那一行活下来（稳定身份），无 ID 的脏行被**吸收**：
+  `my_anime` / `schedule_override` / `change_log` 的引用在**同一个事务**里改指新行，再删旧行。
+  闸门不通过（比如两条都挂着你的追番）就**不删也不动引用**，只报告。
+- 一次"只有 yuc 成功"的同步**不会**把这条番的分集判成"消失了"：
+  删除分支要求**库里那条时刻的数据源这次仍然在场**。修之前这里有 2772 条假报警（实测 100% 是假的）。
+
+**每次同步都会留账**（`sync_run` 表）：哪次运行、抓了哪些季度、每个源的成败条数、
+身份判定吸收了几条。命令行看：
+
+```bash
+node src/server/cli.ts runs --limit=10
+```
+
+---
+
 ## 深夜番：这个项目最容易做错的一件事
 
 日本电视台把深夜番写成 **「日曜 24:30」** —— 放送日历上是**周日**，真实钟点却是**周一 00:30**。
@@ -162,11 +200,14 @@ $ node src/server/cli.ts week --rule=broadcast-calendar
 node src/server/cli.ts                    # 不带参数会打印全部命令
 node src/server/cli.ts update              # 一键更新：抓当季 + 回填历史 + 机翻 + 报告
 node src/server/cli.ts update --no-translate
+node src/server/cli.ts update --seasons=2026-10,2024-10   # 自己挑季度（可含库里没有的）
 node src/server/cli.ts sync --backfill=4   # 增量回填最近 4 季
 node src/server/cli.ts season              # 只看当季清单（不落库）
 node src/server/cli.ts search "药屋"        # 本地优先，中文名与别名都能命中
+node src/server/cli.ts add "番名" --backlog # 加一部老番进补番库（界面里没有加番入口）
 node src/server/cli.ts list                # 我的追番 / 补番库
 node src/server/cli.ts changes             # 延期 / 改档
+node src/server/cli.ts runs                # 最近几次同步的运行记录（各源成败、身份判定吸收几条）
 node src/server/cli.ts backups             # 看备份与库里的季度
 node src/server/cli.ts stats
 ```
@@ -175,7 +216,7 @@ node src/server/cli.ts stats
 
 ```bash
 pnpm exec tsc --noEmit        # 类型检查，0 错误
-node scripts/verify.ts         # 102 项离线自检（不需要装包、不需要联网）
+node scripts/verify.ts         # 127 项离线自检（不需要装包、不需要联网）
 node scripts/verify-api.ts     # 28 项接口自检（需要服务已启动）
 pnpm ui:smoke                   # 前端交互冒烟：筛选/排序按钮到底有没有反应
 ```
@@ -195,8 +236,16 @@ GET  /api/my              POST /api/my             PATCH|DELETE /api/my/:key
 GET  /api/subject/:key    POST /api/override       GET  /api/search
 POST /api/search/import   POST /api/sync           POST /api/update
 POST /api/translate       GET  /api/changes        POST /api/changes/ack
-GET  /api/ics             GET  /api/export
+GET  /api/ics             GET  /api/export         GET  /api/runs
 ```
+
+`/api/update` 支持自选季度（与 CLI 的 `--seasons=` 同一套语义）：
+
+```
+/api/update?seasons=2026-10,2024-10&translate=0
+```
+
+`/api/runs` 返回最近几次同步的运行记录（哪次运行、抓了哪几季、每个源成了几条、身份判定吸收了几条）。
 
 `/api/overview` 支持多季合并与排序，例如：
 
@@ -219,6 +268,10 @@ GET  /api/ics             GET  /api/export
 - **导出**：界面「导出我的数据」→ `GET /api/export`，下载 JSON
   （含追番列表与进度、手动修正、变更历史；抓来的番剧数据可重抓，故不在此列）
 - **历史季度从不删除**：同步只 upsert 当季，季度下拉框随时能切回上一季
+- **你的数据只会被"搬家"，不会被删**：同一部番的两条记录合并时，
+  追番分类、进度、手动修正都会**在同一个事务里改指到保留的那条**，合并前后条数不变。
+  只有一种情况会停下不动：**两条都挂着你的追番**（该保留哪条、进度怎么并是人的判断，
+  代码不猜，只报告）。注意这里合并的是**抓来的番剧数据**，你的列表、进度、手动修正永不删。
 
 ---
 
@@ -233,11 +286,12 @@ anime-tracker/
 │  ├─ providers/     数据源接入
 │  │                 http(代理/限速/超时) · snapshot(原始响应落盘) · validate(zod)
 │  │                 bangumi-data · yuc · anilist · mt(Bing机翻) · provider(统一接口)
-│  └─ server/        db(node:sqlite) · schema.sql · sync(抓取+落库+回填+一键更新)
-│                    changes(延期检测) · server.ts(HTTP) · ics · cli.ts
+│  └─ server/        db(node:sqlite，含写库前的身份判定) · schema.sql
+│                    sync(抓取+落库+回填+一键更新) · changes(延期检测)
+│                    server.ts(HTTP) · ics · cli.ts
 ├─ web/              界面：index.html · styles.css · app.js（原生 ES 模块，零构建）
 ├─ desktop/          Windows 启动器与快捷方式（脚本必须纯 ASCII）
-├─ scripts/          verify(102) · verify-api(28) · ui-smoke · preview-ui
+├─ scripts/          verify(127) · verify-api(28) · ui-smoke · preview-ui
 │                    probe-sources(数据源探测) · diagnose-network
 ├─ data/             anime.db + backups/ + cache/（已 gitignore，不入库）
 └─ docs/             数据源实测 · 决策记录(ADR) · 设计方案 · 交接文档
@@ -264,14 +318,20 @@ anime-tracker/
 ## 已知限制 / 路线图
 
 - ✅ 已实现：当季抓取、周视图、全季总览（筛选/排序/多季）、追番与补番库、变更检测、
-  历史季度保留与回填、临时机翻、`.ics` 导出、数据备份与导出、Windows 桌面启动器
+  历史季度保留与回填、**自选季度更新范围**、临时机翻、`.ics` 导出、数据备份与导出、
+  Windows 桌面启动器、**同一部番的身份判定（不再产生重复记录）+ 每次同步的运行记录**
 - 🚧 **Bilibili PGC** —— 把「国内几点能看」落到每一集（接口已验证可用，未接入）
 - 🚧 **桌面通知** —— 更新前提醒（`.ics` 已覆盖手机端）
 - 🚧 **补番计划的界面入口** —— 数据层已支持「每周几看 / 每天几集」
-- 🚧 **假重复合并** —— 同一部番偶尔会落成两条记录（标题归一化后不相等、且没有跨源 ID 锚点）。
-  不能草率用「标题包含关系」合：`薬屋のひとりごと 亡妃の秘宝`（剧场版）与
-  `薬屋のひとりごと`（TV）是**两部不同作品**
 - ⬜ 明确不做：在线播放 / 弹幕 / 社交 / 云同步账号 / 独立手机 App
+
+### 关于"同一部作品被两个源各记一份"
+
+身份判定已经能处理**绝大多数**情况（判据是跨源 ID + 归一化标题 + 季度）。
+但库里**故意保留**了一小批"两张卡各自带着不同的外部 ID、且分集数/季度对不上"的记录 ——
+它们多半是**同一部作品的不同季**（第 1 季 vs 第 2 季、本季 vs 下一季），
+草率合并会把两部不同的番并成一条。这类只能靠人工判断，所以代码里的策略是：
+**没有把握就不动，只报告**。
 
 ---
 

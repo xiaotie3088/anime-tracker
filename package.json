@@ -19,7 +19,9 @@
     "sync": "node src/server/cli.ts sync",
     "update": "node src/server/cli.ts update",
     "translate": "node src/server/cli.ts translate",
-    "backups": "node src/server/cli.ts backups"
+    "backups": "node src/server/cli.ts backups",
+    "runs": "node src/server/cli.ts runs",
+    "push": "git push origin main"
   },
   "dependencies": {
     "undici": "^7.0.0",
