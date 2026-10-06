@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>原型 · 筛选面板（五层 + 三态）</title>
+    <!--
+      一次性原型：直接引用线上那份 web/styles.css（所以看到的是真实设计令牌 + 双主题），
+      只额外加一个 proto.css 放"原型专用"的东西（说明条、底部工具条、三态里不含的样式）。
+      双击本文件即可打开；数据在 data.js（build-data.mjs 生成的真实快照）。
+    -->
+    <link rel="stylesheet" href="../../web/styles.css" />
+    <link rel="stylesheet" href="proto.css" />
+  </head>
+  <body>
+    <div class="proto-note">
+      <p class="proto-q">
+        <span class="proto-tag">原型</span>这是在回答一个问题：<b
+          >这个「五层 + 三态（不选 / 含 / 不含）」的筛选面板，点起来顺不顺手、看不看得懂？</b
+        >
+      </p>
+      <p>
+        一次性的可交互原型，<b>不是产品代码</b>：没有改 <code>web/app.js</code>，也不调接口、不碰数据库。
+        样式直接用 <code>web/styles.css</code> 的<b>真实令牌</b>，所以深浅两套主题都跟着系统走。
+        数据是 <b id="proto-season">—</b> 这季的<b>真实快照</b>（<span id="proto-shape">—</span>），
+        部数、候选顺序、列表长度都是真的 —— 手感才可信。
+      </p>
+      <p>
+        顶栏的「季度 / 更新数据 / 更多」与卡片布局是静态替身；<b>筛选面板里的每个按钮都真的会动</b>
+        （三态、置顶、折叠、实时部数、排序、每行几部、搜索都在跑）。快照时间
+        <span id="proto-saved">—</span>。
+      </p>
+      <p>
+        <b>顺手试这 4 件事：</b>① 随便挑个标签，点一下 / 两下 / 三下，看三态的差别和列表变化；
+        ② 看选项右边的数字 —— 尤其<b>已经"含"的那个自己写着多少</b>（票的口径在这里会露馅，
+        底部可以切成另外两种口径当场比）；③ 在搜索框里打几个字再点筛选，看光标有没有丢；
+        ④ 点开「类型标签」，注意选中后它会不会被收起、选中项有没有跳到最前面。
+      </p>
+      <p>
+        屏幕底部居中的黑条是<b>原型专用</b>（不属于被测设计）：← → 换 3 个<b>结构</b>变体
+        （键盘 ← → 也行），右边三个开关是票里没定死的三个点，可以当场对比 ——
+        其中「状态 chip」默认沿用<b>线上行为 = 交集</b>，这样不会把旧行为混进"新手感"里一起评价。
+      </p>
+    </div>
+    <div class="proto-variant-note" id="proto-variant-note"></div>
+
+    <header class="top">
+      <div class="brand">
+        <span class="logo">◈</span>
+        <h1>新番追番日历</h1>
+        <span class="season-badge" id="season-badge">—</span>
+      </div>
+
+      <div class="controls">
+        <label class="field">
+          <span>季度</span>
+          <select id="season-select" title="原型里只有这一季的快照">
+            <option>2026-10</option>
+          </select>
+        </label>
+
+        <label class="field">
+          <span>日历归属</span>
+          <select id="rule-select" title="原型里的静态替身">
+            <option>按真实钟点</option>
+            <option>按日本放送日历</option>
+          </select>
+        </label>
+
+        <button id="update-btn" class="btn btn-primary" title="静态替身：原型不去抓源站">更新数据</button>
+
+        <details class="menu" id="more-menu">
+          <summary class="btn" title="同步与导出">更多 <span class="caret">▾</span></summary>
+          <div class="menu-panel">
+            <button class="btn" title="静态替身">只同步本季</button>
+            <button class="btn" title="静态替身">补全中文名（机翻）</button>
+            <a class="btn" href="#">导出日历 (.ics)</a>
+            <a class="btn" href="#">导出我的数据</a>
+          </div>
+        </details>
+      </div>
+    </header>
+
+    <nav class="tabs">
+      <button class="tab" title="原型只有全季总览这一页">周视图</button>
+      <button class="tab is-active" data-view="season">全季总览</button>
+      <button class="tab" title="原型只有全季总览这一页">
+        我的追番 <span class="pill" id="tab-my-count">0</span>
+      </button>
+      <button class="tab" title="原型只有全季总览这一页">变更 <span class="pill">0</span></button>
+      <span class="spacer"></span>
+      <span class="status">原型 · 不是产品页面</span>
+    </nav>
+
+    <main>
+      <!--
+        面板拆成两个槽：
+          #panel-head 第 1 层（搜索框 + 部数）—— **常驻节点，永不重绘**，否则打字时光标会丢；
+          #panel-body 第 2~5 层 —— 每次点选整体重绘（折叠展开状态从 state.open 恢复）。
+      -->
+      <div class="filter-panel" id="filter-panel">
+        <div id="panel-head"></div>
+        <div id="panel-body"></div>
+      </div>
+
+      <div id="active-filters"></div>
+      <div id="subject-list" class="subject-list per-row-4"></div>
+    </main>
+
+    <div class="proto-bar">
+      <button class="proto-arrow" id="proto-prev" title="上一个变体（键盘 ←）">←</button>
+      <span class="proto-variant" id="proto-variant">A</span>
+      <button class="proto-arrow" id="proto-next" title="下一个变体（键盘 →）">→</button>
+      <span class="is-sep"></span>
+      <label title="票要求选中项置顶；关掉可以对比&quot;列表会不会跳&quot;">
+        <input type="checkbox" id="proto-pin" checked />选中项置顶
+      </label>
+      <button class="proto-btn" id="proto-count-mode" title="部数口径三档">
+        部数口径：点它剩多少
+      </button>
+      <button class="proto-btn" id="proto-status-mode" title="第 2 层六个状态 chip 之间的关系。默认沿用线上 = 交集（同时满足）；可切成并集对比">
+        状态 chip：同时满足（且）
+      </button>
+      <span class="is-sep"></span>
+      <button class="proto-btn" id="proto-theme" title="三态的非颜色差异（✓ / ⊘ / 删除线）在深浅两套主题下都该看得出来">
+        主题：跟随系统
+      </button>
+      <button class="proto-btn" id="proto-reset" title="条件与搜索都清掉，回到刚打开的样子">全部重置</button>
+    </div>
+
+    <script src="data.js"></script>
+    <script src="proto.js"></script>
+  </body>
+</html>

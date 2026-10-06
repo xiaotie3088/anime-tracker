@@ -1,0 +1,172 @@
+/* ==========================================================================
+   原型专用样式 —— 只有 prototype/filter-panel/ 用，不属于产品代码。
+   ⚠ 只用 web/styles.css 里的设计令牌，不写死色值：这样深浅两套主题自动跟随，
+     三态的非颜色差异（✓ / ⊘ / 删除线）也是在真实主题下检查的。
+   ========================================================================== */
+
+/* 浮动工具条压在视口底部。main 自己已经有 72px 下内边距（见 styles.css），
+   这里再补一点点，滚到最底时最后一排卡片不会被药丸挡住。 */
+body { padding-bottom: 28px; }
+
+/* ---------- 顶部：这是在回答什么问题 ---------- */
+
+.proto-note {
+  margin: 0;
+  padding: 13px 22px 15px;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: var(--fs-sm);
+  line-height: 1.85;
+}
+.proto-note p { margin: 0 0 6px; }
+.proto-note p:last-child { margin-bottom: 0; }
+.proto-note b { color: var(--text); }
+.proto-note code {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  background: var(--surface-3);
+  border-radius: var(--radius-sm);
+  padding: 1px 5px;
+}
+.proto-q { color: var(--text); font-size: var(--fs-md); }
+.proto-q .proto-tag {
+  display: inline-block;
+  margin-right: 7px;
+  padding: 1px 8px;
+  border: 1px dashed var(--accent-border);
+  border-radius: 999px;
+  color: var(--accent);
+  font-size: var(--fs-xs);
+  font-weight: 650;
+}
+.proto-watch { color: var(--text-dim); }
+
+/* 当前变体的一句话说明（跟着底部工具条变） */
+.proto-variant-note {
+  margin: 0;
+  padding: 8px 22px;
+  border-bottom: 1px solid var(--border);
+  background: var(--accent-soft);
+  color: var(--text);
+  font-size: var(--fs-sm);
+}
+.proto-variant-note b { color: var(--accent); }
+
+/* ---------- 面板：五层之间的分隔 ---------- */
+
+/* 层与层之间只用一条淡分隔线，不再各套一个卡片 —— "一路从上往下收窄"要看得出一条竖线。
+   注意面板拆成了 #panel-head（第 1 层，常驻）和 #panel-body（第 2~5 层，重绘）两个槽，
+   所以第 1 层与第 2 层之间那条线要单独写：它们的 .filter-layer 不是兄弟节点。 */
+.filter-layer + .filter-layer,
+#panel-body > .filter-layer:first-child { border-top: 1px solid var(--border); }
+.filter-layer { padding: 11px 0; }
+.filter-layer:first-child { padding-top: 0; }
+.filter-layer:last-child { padding-bottom: 0; }
+.filter-layer > .toolbar { margin-bottom: 0; }
+.filter-layer .filter-group + .filter-group { margin-top: 11px; }
+
+/* 「显示方式」折叠栏（变体 B）里的正文：里面是两个 .filter-group，不是 .filter-opts，
+   所以拿不到样式表里 `.filter-facet > .filter-opts` 那份内边距，这里补一份。 */
+.facet-body { padding: 2px 12px 12px; }
+
+.facet-picked { color: var(--accent); }
+.facet-picked .is-excluded {
+  color: var(--danger);
+  text-decoration: line-through;
+  text-decoration-thickness: 1.5px;
+}
+
+/* ---------- 三态：含 / 不含 / 不选 ----------
+   ⚠ 含与不含必须**不依赖颜色**也能分辨（色觉障碍 + 单色打印），
+     所以：含 = ✓ + 实心强调色；不含 = ⊘ + 删除线 + 危险色。
+   其中 ✓ / ⊘ 由 JS 写进标签文本，删除线/颜色在这里。 */
+
+.filter-opt.is-excluded {
+  border-color: var(--danger);
+  background: transparent;
+  color: var(--danger);
+  text-decoration: line-through;
+  text-decoration-thickness: 1.5px;
+}
+.filter-opt.is-excluded:hover {
+  border-color: var(--danger);
+  background: var(--surface-3);
+  color: var(--danger);
+}
+.filter-opt.is-excluded .c { color: var(--danger); opacity: 0.75; }
+
+.chip.is-excluded {
+  border-color: var(--danger);
+  background: transparent;
+  color: var(--danger);
+  text-decoration: line-through;
+  text-decoration-thickness: 1.5px;
+}
+
+/* 键盘焦点在三态上也要看得出来（第六轮做过这一轮，别退回去） */
+.filter-opt:focus-visible,
+.chip:focus-visible { outline: none; box-shadow: var(--ring); }
+
+/* ---------- 变体 C：宽屏两栏 + 标签网格 ---------- */
+
+.filter-cols { display: grid; grid-template-columns: 1fr; gap: var(--gap); }
+@media (min-width: 1080px) {
+  .filter-cols { grid-template-columns: 1fr 1.2fr; }
+}
+.filter-opts.is-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(146px, 1fr));
+}
+.filter-opts.is-grid .filter-opt { justify-content: space-between; border-radius: var(--radius-sm); }
+/* 101 个标签：给它自己一块可滚的区域，别把整页顶长 */
+.filter-opts.is-tall { max-height: 320px; overflow-y: auto; padding-right: 6px; }
+
+/* ---------- 底部：原型专用工具条（明显不属于被测设计） ---------- */
+
+.proto-bar {
+  position: fixed;
+  left: 50%;
+  bottom: 16px;
+  transform: translateX(-50%);
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  flex-wrap: wrap;
+  max-width: min(1120px, calc(100vw - 24px));
+  padding: 8px 14px;
+  border-radius: 999px;
+  /* 反色药丸：两套主题下都一眼看出"这不是页面的一部分" */
+  background: var(--text);
+  color: var(--bg);
+  box-shadow: var(--shadow-lg);
+  font-size: var(--fs-xs);
+}
+.proto-bar .is-sep { width: 1px; height: 16px; background: var(--bg); opacity: 0.32; }
+.proto-bar .proto-arrow {
+  background: transparent;
+  border: 1px solid var(--bg);
+  border-radius: 999px;
+  color: var(--bg);
+  cursor: pointer;
+  padding: 2px 11px;
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+}
+.proto-bar .proto-arrow:hover { background: var(--bg); color: var(--text); }
+.proto-bar .proto-key { font-family: var(--font-mono); opacity: 0.7; }
+.proto-bar .proto-variant { font-weight: 650; min-width: 132px; text-align: center; }
+.proto-bar label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; white-space: nowrap; }
+.proto-bar input[type="checkbox"] { accent-color: var(--accent); margin: 0; }
+.proto-bar button.proto-btn {
+  background: transparent;
+  border: 1px solid var(--bg);
+  border-radius: 999px;
+  color: var(--bg);
+  cursor: pointer;
+  padding: 3px 11px;
+}
+.proto-bar button.proto-btn:hover { background: var(--bg); color: var(--text); }
+.proto-bar button.proto-btn.is-on { background: var(--bg); color: var(--text); font-weight: 650; }

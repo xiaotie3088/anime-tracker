@@ -317,12 +317,23 @@ for (const [type, fns] of Object.entries(documentListeners)) {
   docRoot.listeners[type] = fns;
 }
 
+// `#app` 必须**先建出来**再做下面那个 await：bootstrap() 的尾巴会 renderWeek()，
+// 而它要写 `$('#app').innerHTML` —— 元素不存在就抛，还会连带让 bootstrap 的 catch 也抛。
+const appEl = getById('app');
+
+// ⚠ 先让 `bootstrap()` 的异步尾巴跑完：它最后会 `switchView('week')`。
+//   不等它落地，它会在后面任意一个 `await` 的间歇里把 `#app` 换成周视图 ——
+//   于是断言会莫名其妙地"查不到筛选面板 / 行数变 0"。
+//   实测踩过：B 段第一个用例正好在 `await setTimeout(30)` 里撞上它，行数 172→0，
+//   而那条断言写的是"行数有变化"，于是**一直是假通过**。
+await new Promise((resolve) => setTimeout(resolve, 80));
+
 state.season = '2026-10';
 state.selectedSeasons = ['2026-10'];
 state.overview = overview;
 state.view = 'season';
-(state.filters as Record<string, unknown>).weekdays = [];
-(state.filters as Record<string, unknown>).side = [];
+state.searchQuery = '';
+state.statusAnd = true;
 
 let failures = 0;
 const ok = (label: string, cond: boolean, detail = '') => {
@@ -333,7 +344,6 @@ const ok = (label: string, cond: boolean, detail = '') => {
   }
 };
 
-const appEl = getById('app');
 app.renderSeason();
 const firstChild = appEl.children[0];
 console.log(`\n#app 第 1 个子节点=<${firstChild?.tag} class="${firstChild?.className}"> parent=${firstChild?.parent ? `${firstChild.parent.tag}#${firstChild.parent.id}` : 'null'}`);
@@ -359,53 +369,58 @@ function collectText(el: El | null): string {
 const total = rowCount();
 console.log(`初始列表行数=${total}`);
 
-console.log('\n【A】「筛选 / 排序」按钮');
-const toggle = appEl.querySelector('#filter-toggle');
-ok('按钮渲染出来了', Boolean(toggle), `textContent=${toggle?.textContent.trim()}`);
-console.log(`    toggle.parent=${toggle?.parent?.tag}#${toggle?.parent?.id}  根监听器数=${docRoot.listeners.click?.length ?? 0}`);
-console.log(`    toggle.closest('#filter-panel')=${toggle?.closest('#filter-panel')?.tag ?? 'null'}`);
-const panelBefore = appEl.querySelector('#filter-panel');
-ok('初始面板是展开的（filtersOpen=true）', Boolean(panelBefore));
-if (toggle) {
-  const metaBefore = appEl.querySelector('#subject-count')?.textContent ?? '';
-  ok('展开时箭头是 ▲', (toggle.textContent ?? '').includes('▲'), `文本=${toggle.textContent?.trim()}`);
-
-  toggle.click();
-  ok('filtersOpen 翻成 false', state.filtersOpen === false);
-  const panelAfter = appEl.querySelector('#filter-panel');
-  ok('点一次后收起（面板消失）', !panelAfter);
-  // ⚠ 重绘后原 toggle 节点已脱离文档：箭头要从**新查到的**节点上读
-  const toggleAfter = appEl.querySelector('#filter-toggle');
-  ok(
-    '收起后箭头变 ▼',
-    (toggleAfter?.textContent ?? '').includes('▼'),
-    `现在的文本=${toggleAfter?.textContent?.trim() ?? '(拿不到节点)'}`,
-  );
-  ok('统计文本没被弄坏', (appEl.querySelector('#subject-count')?.textContent ?? '') === metaBefore);
-}
-
-console.log('\n【B】逐个点各类筛选块，看哪一类没反应');
-// 先确保面板是展开的（上一步 A 把它收起了；toggle 节点在重绘后已被替换，要重新查）
-const toggleFresh = appEl.querySelector('#filter-toggle');
-if (!appEl.querySelector('#filter-panel')) toggleFresh?.click();
-ok('面板已展开，可以开始点各类筛选块', Boolean(appEl.querySelector('#filter-panel')));
+// ---- 筛选相关的公共小工具（必须在第一个用到它们的断言之前声明：这里是 const 箭头函数，有 TDZ）----
 
 const rowCountNow = () => appEl.querySelectorAll('.subject-row').length;
-// 每个用例前把筛选清空，避免上一个用例把列表筛空导致下一个"看起来没反应"
-const resetFilters = () => {
-  (state.filters as Record<string, unknown>).weekdays = [];
-  (state.filters as Record<string, unknown>).mediaTypes = [];
-  (state.filters as Record<string, unknown>).genres = [];
-  (state.filters as Record<string, unknown>).platforms = [];
-  (state.filters as Record<string, unknown>).side = [];
-  app.renderSeason();
-};
-// 中文属性值用属性匹配即可，但为稳妥起见按属性遍历取节点
+/** 按"属性名 + 精确值"取按钮（见文件里既有的口径：不用 dataset 驼峰键）。 */
 const findChip = (attr: string, value: string) =>
   appEl.querySelectorAll('button').find((b) => b.attrs[attr] === value);
 
+/**
+ * 把筛选条件清空并重绘。
+ *
+ * ⚠ 这里**直接换掉整个 state.filters 对象**（而不是逐个清数组）：三态改版后每个维度是
+ *   `{ include, exclude }` 两份，漏清一份就会让下一个用例"看起来没反应"。
+ */
+const resetFilters = () => {
+  state.filters = {
+    weekdays: { include: [], exclude: [] },
+    mediaTypes: { include: [], exclude: [] },
+    genres: { include: [], exclude: [] },
+    platforms: { include: [], exclude: [] },
+    side: [],
+  };
+  state.searchQuery = '';
+  app.renderSeason();
+};
+
+console.log('\n【A】面板常显：搜索框是第 1 层，不再有「筛选 / 排序」总开关');
+resetFilters();
+const panelBefore = appEl.querySelector('#filter-panel');
+ok('面板渲染出来了（常显，不需要先点开关）', Boolean(panelBefore));
+ok('不再有「筛选 / 排序」按钮（已按票删掉）', !appEl.querySelector('#filter-toggle'));
+const headSlot = appEl.querySelector('#filter-panel-head');
+const bodySlot = appEl.querySelector('#filter-panel-body');
+ok('面板拆成 第 1 层 / 第 2~5 层 两个槽', Boolean(headSlot) && Boolean(bodySlot));
+const searchEl = appEl.querySelector('#season-search');
+ok('搜索框在面板第 1 层里', Boolean(searchEl) && searchEl?.closest('#filter-panel-head') !== null);
+ok('搜索框绑上了 input 监听', (searchEl?.listeners.input?.length ?? 0) > 0);
+ok('部数提示在搜索框那一层（显示 N / M 部）', (appEl.querySelector('#subject-count')?.textContent ?? '').includes('部'));
+
+// 票的硬性验收：搜索框焦点不因点筛选而丢失。
+// 这个手写壳量不出"焦点"，但焦点丢失的根因是"节点被换掉了" —— 断言节点身份就够了。
+console.log('\n【A2】点筛选不重绘面板第 1 层（搜索框焦点不丢的根因）');
+const searchNodeBefore = appEl.querySelector('#season-search');
+const headHtmlBefore = appEl.querySelector('#filter-panel-head')?.innerHTML ?? '';
+const bodyHtmlBefore = appEl.querySelector('#filter-panel-body')?.innerHTML ?? '';
+findChip('data-toggle-value', 'TV')?.click();
+ok('点完之后第 1 层还是同一个搜索框节点（没被换掉 = 光标不会丢）', appEl.querySelector('#season-search') === searchNodeBefore);
+ok('第 1 层的 HTML 没被重写', (appEl.querySelector('#filter-panel-head')?.innerHTML ?? '') === headHtmlBefore);
+ok('第 2~5 层确实重绘了（高亮/部数要跟着变）', (appEl.querySelector('#filter-panel-body')?.innerHTML ?? '') !== bodyHtmlBefore);
+
+console.log('\n【B】逐个点各类筛选块，看哪一类没反应');
 const cases: { label: string; attr: string; value: string; expectChange: boolean }[] = [
-  { label: '快速筛选「放送中」', attr: 'data-quick-filter', value: 'airing', expectChange: true },
+  { label: '状态「放送中」', attr: 'data-quick-filter', value: 'airing', expectChange: true },
   { label: '放送星期「周五」', attr: 'data-toggle-value', value: '5', expectChange: true },
   { label: '媒体类型「TV」', attr: 'data-toggle-value', value: 'TV', expectChange: true },
   { label: '类型标签「Action」', attr: 'data-toggle-value', value: 'Action', expectChange: true },
@@ -439,8 +454,140 @@ for (const c of cases) {
 }
 resetFilters();
 
-console.log('\n【D】卡片按钮：详情改成点整张卡片，「追番 / 补番 / 移除」保留');
+// ---------------------------------------------------------------------------
+// 三态（含 / 不含 / 不选）：这是本票的核心，断言必须走真实的点击路径
+// ---------------------------------------------------------------------------
+
+const rawSubjects = (
+  overview as { subjects: { key: string; genres: string[]; mediaType: string; status: string }[] }
+).subjects;
+const infoOf = new Map(rawSubjects.map((item) => [item.key, item]));
+const rowKeys = () => appEl.querySelectorAll('.subject-row').map((r) => r.attrs['data-key'] ?? '');
+const sameSet = (keys: string[], want: Set<string>) =>
+  keys.length === want.size && keys.every((key) => want.has(key));
+const keysWhere = (predicate: (item: (typeof rawSubjects)[number]) => boolean) =>
+  new Set(rawSubjects.filter(predicate).map((item) => item.key));
+const allKeys = rowKeys();
+const fantasyKeys = keysWhere((item) => item.genres.includes('Fantasy'));
+
+console.log('\n【B2】三态循环：点一下 = 含 → 不含 → 不选（票的核心验收）');
 resetFilters();
+ok('「奇幻」有候选（否则这一节测不出东西）', fantasyKeys.size > 0, `size=${fantasyKeys.size}`);
+findChip('data-toggle-value', 'Fantasy')?.click();
+ok('第 1 下 = 含：列表只剩含奇幻的', sameSet(rowKeys(), fantasyKeys), `${rowKeys().length} vs ${fantasyKeys.size}`);
+const includeState = findChip('data-toggle-value', 'Fantasy');
+ok(
+  '含的那项带 is-active 与 ✓',
+  (includeState?.classList.contains('is-active') ?? false) && (includeState?.textContent ?? '').includes('✓'),
+);
+findChip('data-toggle-value', 'Fantasy')?.click();
+const afterExclude = rowKeys();
+ok(
+  '第 2 下 = 不含：列表里再没有含奇幻的（用户点名的用例）',
+  afterExclude.every((key) => !fantasyKeys.has(key)),
+  `剩 ${afterExclude.length} 行`,
+);
+ok(
+  '不含时行数 = 总行数 − 含奇幻的',
+  afterExclude.length === allKeys.length - fantasyKeys.size,
+  `${afterExclude.length} vs ${allKeys.length - fantasyKeys.size}`,
+);
+const excludeState = findChip('data-toggle-value', 'Fantasy');
+ok('不含的那项带 is-excluded（红字 + 删除线）', excludeState?.classList.contains('is-excluded') ?? false);
+ok('不含的那项带 ⊘ 标记（不依赖颜色也能分辨）', (excludeState?.textContent ?? '').includes('⊘'));
+ok('同一项不会同时又含又不含', !(excludeState?.classList.contains('is-active') ?? false));
+findChip('data-toggle-value', 'Fantasy')?.click();
+ok('第 3 下 = 恢复不选：又是全部', rowKeys().length === allKeys.length, `${rowKeys().length} vs ${allKeys.length}`);
+
+console.log('\n【B3】组内并集 / 组间交集 / 排除一票否决');
+resetFilters();
+findChip('data-toggle-value', 'Fantasy')?.click();
+findChip('data-toggle-value', 'Sci-Fi')?.click();
+const unionKeys = keysWhere((item) => item.genres.includes('Fantasy') || item.genres.includes('Sci-Fi'));
+ok('组内并集：同一维度选两个「含」', sameSet(rowKeys(), unionKeys), `${rowKeys().length} vs ${unionKeys.size}`);
+findChip('data-toggle-value', 'TV')?.click();
+const crossKeys = rowKeys();
+ok('组间交集：每一行都是 TV', crossKeys.length > 0 && crossKeys.every((key) => infoOf.get(key)?.mediaType === 'TV'));
+ok(
+  '组间交集的数量 = TV ∩ (奇幻 ∪ 科幻)',
+  crossKeys.length ===
+    rawSubjects.filter(
+      (item) => item.mediaType === 'TV' && (item.genres.includes('Fantasy') || item.genres.includes('Sci-Fi')),
+    ).length,
+  `${crossKeys.length}`,
+);
+// 把「奇幻」改成"不含"：排除要能穿过"组内并集"，一票否决
+findChip('data-toggle-value', 'Fantasy')?.click();
+const vetoKeys = rowKeys();
+ok('排除一票否决：含奇幻的整条丢掉', vetoKeys.length > 0 && vetoKeys.every((key) => !fantasyKeys.has(key)));
+ok(
+  '排除不吃掉同组另一个「含」（科幻还在）',
+  vetoKeys.every((key) => infoOf.get(key)?.genres.includes('Sci-Fi') ?? false),
+);
+ok('排除是跨维度的（TV 那条约束也还在）', vetoKeys.every((key) => infoOf.get(key)?.mediaType === 'TV'));
+
+console.log('\n【B4】条件条：含与不含分开显示，都能单独取消');
+resetFilters();
+const filtersOf = () => state.filters as Record<string, { include: string[]; exclude: string[] }>;
+/** 条件条里的按钮（壳的 matches() 不解析后代选择器，所以按 closest 过滤）。 */
+const barChips = () => appEl.querySelectorAll('button').filter((b) => Boolean(b.closest('#active-filters')));
+findChip('data-toggle-value', 'Fantasy')?.click();
+findChip('data-toggle-value', 'Hentai')?.click();
+findChip('data-toggle-value', 'Hentai')?.click(); // → 不含
+const includeBarChip = barChips().find((b) => b.attrs['data-clear-value'] === 'Fantasy');
+const excludeBarChip = barChips().find((b) => b.attrs['data-clear-value'] === 'Hentai');
+ok('「含」的那项在条件条里，文字写明「含」', (includeBarChip?.textContent ?? '').includes('含'));
+ok(
+  '「不含」的那项在条件条里，文字是「⊘ 不含 …」',
+  (excludeBarChip?.textContent ?? '').includes('⊘') && (excludeBarChip?.textContent ?? '').includes('不含'),
+);
+ok('「不含」的 chip 也带 is-excluded（删除线）', excludeBarChip?.classList.contains('is-excluded') ?? false);
+includeBarChip?.click();
+ok(
+  '点「含」的 ✕ 只清掉含，不含还在',
+  filtersOf().genres.include.length === 0 && filtersOf().genres.exclude.length === 1,
+  JSON.stringify(filtersOf().genres),
+);
+barChips().find((b) => b.attrs['data-clear-value'] === 'Hentai')?.click();
+ok('点「不含」的 ✕ 只清掉不含', filtersOf().genres.exclude.length === 0);
+findChip('data-toggle-value', 'Fantasy')?.click();
+findChip('data-quick-filter', 'airing')?.click();
+const clearAllBtn = appEl.querySelectorAll('button').find((b) => 'data-clear-filters' in b.attrs);
+ok('渲染出「全部清空」', Boolean(clearAllBtn));
+clearAllBtn?.click();
+ok(
+  '「全部清空」把含、不含、状态一起清掉',
+  filtersOf().genres.include.length === 0 &&
+    filtersOf().genres.exclude.length === 0 &&
+    ((state.filters as { side?: string[] }).side ?? []).length === 0 &&
+    rowCountNow() === allKeys.length,
+  `行数=${rowCountNow()}`,
+);
+
+console.log('\n【B5】第 2 层那个"多个之间：且 / 或"的小切换键');
+resetFilters();
+state.statusAnd = true;
+app.renderSeason();
+const airingKeys = keysWhere((item) => item.status === 'airing');
+const upcomingKeys = keysWhere((item) => item.status === 'upcoming');
+const modeBtn = () => findChip('data-status-mode', '1');
+findChip('data-quick-filter', 'airing')?.click();
+findChip('data-quick-filter', 'upcoming')?.click();
+ok('默认「且」：放送中 ∧ 未开播 = 0 部（沿用线上老行为）', rowCountNow() === 0, `行数=${rowCountNow()}`);
+ok('切换键上写着当前是「且」', (modeBtn()?.textContent ?? '').includes('且'));
+modeBtn()?.click();
+ok('点一下变成「或」', (modeBtn()?.textContent ?? '').includes('或'));
+ok(
+  '「或」：放送中 ∪ 未开播',
+  rowCountNow() === airingKeys.size + upcomingKeys.size,
+  `${rowCountNow()} vs ${airingKeys.size + upcomingKeys.size}`,
+);
+ok('切换被记进 localStorage（不只是这一屏有效）', store.get('anime-tracker.statusAnd') === '0');
+modeBtn()?.click();
+ok('再切回「且」，行数回到 0', rowCountNow() === 0 && store.get('anime-tracker.statusAnd') === '1');
+resetFilters();
+
+console.log('\n【D】卡片按钮：详情改成点整张卡片，「追番 / 补番 / 移除」保留');
 const rows = appEl.querySelectorAll('.subject-row');
 const notMine = rows.filter((r) => !r.querySelector('[data-remove]'));
 const sample = notMine[0];
@@ -490,17 +637,46 @@ console.log(
       .join(' '),
 );
 const facets = facetNodes.filter((f) => Boolean(f.closest('#filter-panel')));
-console.log(`    分面栏数=${facets.length}，展开的=${facets.filter((f) => f.open).length}`);
-ok('四栏分面都在', facets.length === 4, `实际 ${facets.length}`);
-ok('默认全部收起（各栏只留标题，不铺满）', facets.every((f) => !f.open));
-const head = facets[0]?.querySelector('.facet-head');
+// 三态改版后折叠栏有 5 个：四个维度 + 一个「显示方式」（排序与每行几部收在里面）
+const dimensionFacets = facets.filter((f) => f.attrs['data-facet'] !== 'display');
+const displayFacet = facets.find((f) => f.attrs['data-facet'] === 'display');
+console.log(`    折叠栏数=${facets.length}（维度 ${dimensionFacets.length} + 显示方式 ${displayFacet ? 1 : 0}），展开的=${facets.filter((f) => f.open).length}`);
+ok('四个维度栏都在', dimensionFacets.length === 4, `实际 ${dimensionFacets.length}`);
+ok('多了一个「显示方式」折叠栏（排序 + 每行几部收在里面）', Boolean(displayFacet));
+ok(
+  '「显示方式」里确实放着排序与每行几部的按钮',
+  Boolean(displayFacet) &&
+    displayFacet !== undefined &&
+    displayFacet.querySelectorAll('button').length > 0,
+);
+ok('五个折叠栏默认全部收起（各栏只留标题，不铺满）', facets.every((f) => !f.open));
+const head = dimensionFacets[0]?.querySelector('.facet-head');
 // 摘要文字在子节点上（我的壳把文本累积到各子节点，父节点的 textContent 不会聚合子节点）
 const headText = (head?.querySelector('.facet-count')?.textContent ?? '') + (head?.querySelector('.facet-title')?.textContent ?? '');
 ok('标题上有"一栏多少项 / 已选几个"的提示', headText.includes('项') || headText.includes('已选'), `文本=${headText}`);
-if (facets[0]) {
+
+// 标题右侧要把「含」与「不含」分开报：已选 1 · 排除 1
+resetFilters();
+findChip('data-toggle-value', 'Action')?.click();
+findChip('data-toggle-value', 'Mecha')?.click();
+findChip('data-toggle-value', 'Mecha')?.click(); // → 不含
+const genresFacet = () => appEl.querySelectorAll('.filter-facet').find((f) => f.attrs['data-facet'] === 'genres');
+const genresCount = () => genresFacet()?.querySelector('.facet-count')?.textContent ?? '';
+ok(
+  '标题上分开报「已选 1 · 排除 1」',
+  genresCount().includes('已选 1') && genresCount().includes('排除 1'),
+  `文本=${genresCount()}`,
+);
+ok(
+  '摘要里"不含"的那一项带删除线类',
+  Boolean(genresFacet()?.querySelector('.facet-picked')?.querySelectorAll('.is-excluded').length),
+);
+resetFilters();
+
+if (dimensionFacets[0]) {
   // 走真实路径：浏览器里点 <summary> 会翻 details.open 并派发 toggle 事件，
   // 这里照做（直接改 open 不会触发 toggle，测不出"状态有没有被记住"）
-  const facet = facets[0];
+  const facet = dimensionFacets[0];
   facet.open = true;
   facet.dispatch('toggle');
   ok(
@@ -508,7 +684,7 @@ if (facets[0]) {
     (state.facetsOpen as Record<string, boolean> | undefined)?.weekdays === true,
     `facetsOpen=${JSON.stringify(state.facetsOpen)}`,
   );
-  // 再点一个筛选块，面板会重绘 —— 展开状态必须还在
+  // 再点一个筛选块，面板正文会重绘 —— 展开状态必须还在
   const anyChip = appEl.querySelectorAll('button').find((b) => b.attrs['data-toggle-value'] === 'TV');
   anyChip?.click();
   const facetsAfter = appEl.querySelectorAll('.filter-facet').filter((f) => f.closest('#filter-panel'));
@@ -521,20 +697,24 @@ if (facets[0]) {
   ok('重绘后「放送星期」仍然是展开的（状态没被重置）', weekdayStillOpen === true, `实际=${weekdayStillOpen}`);
 }
 
-console.log('\n【C】下拉框（走 change，不经过点击委托）');
-const mediaSelect = appEl.querySelector('#filter-media');
-const baseRows = rowCountNow();
-ok('媒体类型下拉存在', Boolean(mediaSelect));
+console.log('\n【C】旧的两套筛选 UI 已经删掉（面板里只剩一套操作方式）');
+resetFilters();
 ok(
-  '下拉绑上了 change 监听',
-  (mediaSelect?.listeners.change?.length ?? 0) > 0,
-  `listeners=${mediaSelect?.listeners.change?.length ?? 0}`,
+  '四个下拉框全都没了（#filter-weekday / #filter-media / #filter-genre / #filter-platform）',
+  ['filter-weekday', 'filter-media', 'filter-genre', 'filter-platform'].every(
+    (id) => !appEl.querySelector(`#${id}`),
+  ),
 );
-if (mediaSelect) {
-  mediaSelect.value = 'MOVIE';
-  mediaSelect.dispatch('change');
-  ok('选 MOVIE 后列表变化', rowCountNow() !== baseRows, `(${baseRows} → ${rowCountNow()})`);
-}
+ok(
+  '筛选面板里一个 <select> 都没有了',
+  appEl.querySelectorAll('select').every((s) => !s.closest('#filter-panel')),
+);
+const toggleButtons = appEl.querySelectorAll('button').filter((b) => 'data-toggle-value' in b.attrs);
+ok(
+  '三态选项只出现在第 3 层的四个维度栏里（没有第二套联动同一份条件）',
+  toggleButtons.length > 0 && toggleButtons.every((b) => Boolean(b.closest('.filter-facets'))),
+  `三态按钮数=${toggleButtons.length}`,
+);
 
 console.log('\n【F】每行几部：列数要真的被这个选择决定');
 // 断言到"列表容器拿到了 .per-row-N"这一步。
@@ -585,8 +765,8 @@ ok(
 // 所以顺带断言文本确实收集到了（探针用一个**必然存在**的文字）。
 ok('文本收集本身是有效的（防假守卫自检）', appText.includes('库里已有的季度'), `appText 长度=${appText.length}`);
 ok(
-  '面板外壳没有被误删（toolbar 与筛选面板还在）',
-  Boolean(appEl.querySelector('#season-search')) && Boolean(appEl.querySelector('#filter-toggle')),
+  '面板外壳没有被误删（搜索框与筛选面板还在）',
+  Boolean(appEl.querySelector('#season-search')) && Boolean(appEl.querySelector('#filter-panel')),
 );
 
 // 季度全选：按钮要排在季度标签**最前面**，点一次选中库里所有季度。

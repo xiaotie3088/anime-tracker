@@ -70,13 +70,37 @@ const PER_ROW_DEFAULT = 4;
 const PER_ROW_MIN = 3;
 const PER_ROW_MAX = 7;
 
-/** 总览里"可多选的分面"四栏，顺序就是界面上的顺序。 */
-const FACET_DIMENSIONS = ['weekdays', 'mediaTypes', 'genres', 'platforms'];
+/**
+ * 总览里可筛选的四个维度，**顺序就是面板第 3 层的顺序**
+ * （放送星期 / 媒体类型 / 国内平台 / 类型标签）。
+ */
+const FACET_DIMENSIONS = ['weekdays', 'mediaTypes', 'platforms', 'genres'];
+
+/** 四个维度的中文标题（折叠栏标题要用）。 */
+const FACET_TITLES = {
+  weekdays: '放送星期',
+  mediaTypes: '媒体类型',
+  platforms: '国内平台',
+  genres: '类型标签',
+};
+
+/**
+ * 第 2 层的状态预设：**不是标签**，是"我这边"的条件（我追的 / 补番库 /…），
+ * 所以刻意和三态分开、只有"选 / 不选"两态。顺序就是界面上的顺序。
+ */
+const STATUS_CHIPS = [
+  ['mine', '我追的'],
+  ['backlog', '补番库'],
+  ['airing', '放送中'],
+  ['upcoming', '未开播'],
+  ['bilibili', 'B站有版权'],
+  ['nozh', '缺中文名'],
+];
 
 /** localStorage 的键：布局偏好要跨刷新记住，否则每次打开都得重设一遍。 */
 const LS_PER_ROW = 'anime-tracker.perRow';
 const LS_SORT = 'anime-tracker.sort';
-const LS_FILTERS_OPEN = 'anime-tracker.filtersOpen';
+const LS_STATUS_AND = 'anime-tracker.statusAnd';
 
 function readStoredNumber(key, options, fallback) {
   const raw = Number(localStorage.getItem(key));
@@ -96,6 +120,20 @@ function store(key, value) {
   }
 }
 
+/**
+ * 空的筛选条件。
+ *
+ * 四个维度都是 `{ include, exclude }` 两份 —— 三态（不选 / 含 / 不含）循环出来的结果。
+ * ⚠ 排除**必须**有自己的一份数组：混进 include 之后，"同一维度里选多个 = 满足任意一个"
+ *   立刻变成"满足任意一个（含或不含）"，排除项会被并集吃掉，用户点"不含成人"根本不起作用。
+ * `side` 是第 2 层的状态预设，只有选与不选两态，所以仍是普通数组。
+ */
+function emptyFilters() {
+  const filters = { side: [] };
+  for (const dimension of FACET_DIMENSIONS) filters[dimension] = { include: [], exclude: [] };
+  return filters;
+}
+
 const state = {
   view: 'week',
   season: null,
@@ -105,10 +143,13 @@ const state = {
   offset: 0,
   myCategory: 'tracking',
   overview: null,
-  /** 总览的筛选条件：同一维度内多选取并集，跨维度取交集；side 是「我追的/补番库」这类 */
-  filters: { weekdays: [], mediaTypes: [], genres: [], platforms: [], side: [] },
-  filtersOpen: true,
-  /** 四栏分面各自展开着没有（点选后要重绘面板，得把展开状态记住，否则会被重置） */
+  /**
+   * 总览的筛选条件（四个维度三态 + 第 2 层的状态预设），见 emptyFilters 的注释。
+   */
+  filters: emptyFilters(),
+  /** 第 2 层多个状态 chip 之间：true = 且（同时满足，线上老行为），false = 或（满足任意一个） */
+  statusAnd: true,
+  /** 四个折叠栏 + 「显示方式」各自展开着没有（点选后会重绘面板正文，得把展开状态记住） */
   facetsOpen: {},
   sort: 'firstAir',
   perRow: PER_ROW_DEFAULT,
@@ -479,27 +520,43 @@ function machineTag(source) {
 }
 
 /**
- * 总览的两个"独立"筛选：我追的 / 补番库。
- * 从原来的 monthFilter 里拆出来的 —— 它和下面那组可点选的分布筛选混在一个字段里，
- * 加多选时会互相覆盖。
+ * 总览里的"状态"预设：我追的 / 补番库 / 放送中 / 未开播 / B站有版权 / 缺中文名。
+ *
+ * 它们在面板里是**第 2 层**，刻意和第 3 层的四个标签维度分开：语义不同（"我追的"是预设条件，
+ * 不是标签），混在一起就是原来那套面板难用的原因之一。
  */
 function overviewSideFilter() {
   return state.filters.side ?? [];
 }
 
-/** 只应用"搜索框 + 我追的/补番库 + 状态"这些不在分布面板里的条件。 */
+/** 一个番剧满足某个状态预设吗。 */
+function sideMatch(item, value) {
+  if (value === 'mine') return Boolean(item.myCategory);
+  if (value === 'backlog') return item.myCategory === 'backlog';
+  if (value === 'airing') return item.status === 'airing';
+  if (value === 'upcoming') return item.status === 'upcoming';
+  if (value === 'nozh') return !item.titleCn;
+  if (value === 'bilibili') return item.platforms.some((platform) => platform.name.includes('哔哩哔哩'));
+  return false;
+}
+
+/**
+ * 只应用"搜索框 + 第 2 层状态"这些不在第 3 层里的条件。
+ *
+ * 第 2 层多个状态之间用"且"还是"或"，由面板上那个小切换键决定（`state.statusAnd`）：
+ *   - 且（默认，线上老行为）：同时点「放送中」+「未开播」= 一部都不剩，但"我追的 + 放送中"这种收窄很好用；
+ *   - 或：两个状态取并集，适合"我追的 或 补番库"这种看法。
+ * 两边都说得通，所以交给用户切，而不是替他定一个。
+ */
 function baseFilteredSubjects() {
   const overview = state.overview;
   if (!overview) return [];
   const query = state.searchQuery.trim().toLowerCase();
   const side = overviewSideFilter();
+  const sideOk = (item) =>
+    state.statusAnd ? side.every((value) => sideMatch(item, value)) : side.some((value) => sideMatch(item, value));
   return overview.subjects.filter((item) => {
-    if (side.includes('mine') && !item.myCategory) return false;
-    if (side.includes('backlog') && item.myCategory !== 'backlog') return false;
-    if (side.includes('airing') && item.status !== 'airing') return false;
-    if (side.includes('upcoming') && item.status !== 'upcoming') return false;
-    if (side.includes('nozh') && item.titleCn) return false;
-    if (side.includes('bilibili') && !item.platforms.some((p) => p.name.includes('哔哩哔哩'))) return false;
+    if (side.length && !sideOk(item)) return false;
     if (!query) return true;
     return [item.titleCn, item.titleOriginal, item.titleEn]
       .filter(Boolean)
@@ -544,41 +601,129 @@ function dimensionEntries(dimension, items) {
     .map(([value, count]) => ({ value, label: value, count }));
 }
 
-/** 某维度当前选中的值（统一成字符串，避免 dataset 的 number/string 混用）。 */
-function selectedValues(dimension) {
-  return (state.filters[dimension] ?? []).map(String);
+/** 某一维度里"含"的值（统一成字符串，避免 dataset 的 number/string 混用）。 */
+function includedValues(dimension) {
+  return (state.filters[dimension]?.include ?? []).map(String);
+}
+
+/** 某一维度里"不含"的值。 */
+function excludedValues(dimension) {
+  return (state.filters[dimension]?.exclude ?? []).map(String);
+}
+
+/** 某一维度里被选中的值（含 + 不含）—— 摘要、置顶判断、取消都要用。 */
+function pickedValues(dimension) {
+  return [...includedValues(dimension), ...excludedValues(dimension)];
 }
 
 /**
- * 分布面板里的部数：为了数字稳定好读，一律以「搜索框 + 我追的/补番库」的结果为基数，
- * 不再叠加同面板里的其他维度选择（否则点一个筛选，旁边的数字会跟着变，越看越糊）。
+ * 一个番剧在某个维度上有哪些值（一律字符串）。
+ * 放送星期可能没数据（`null`），这时返回空数组 —— 不能写成 `String(null)` 得到一个 'null'。
  */
-function facetEntries(dimension, base) {
-  return dimensionEntries(dimension, base);
+function dimensionValues(dimension, item) {
+  if (dimension === 'weekdays') {
+    return item.broadcastWeekdayJst === null ? [] : [String(item.broadcastWeekdayJst)];
+  }
+  if (dimension === 'mediaTypes') return [item.mediaType];
+  if (dimension === 'platforms') return [...new Set(item.platforms.map((p) => p.name))];
+  return [...new Set(item.genres)];
 }
 
+/**
+ * 把第 3 层的四个维度套到一批番剧上。三条规则（票里 §三 的前三条）：
+ *
+ *   1. **组内并集**：同一维度里选多个"含" = 满足其中任意一个就行。
+ *   2. **组间交集**：不同维度之间 = 每个维度都要满足。
+ *   3. **排除一票否决**：只要命中任一维度的任一"不含"，整条直接丢掉，不再看其他条件。
+ *
+ * 第 4 条（同一项不可能同时被"含"与"不含"）由三态循环天然保证 —— 一个值只会待在
+ * include 或 exclude 之一里，所以下面两段判断不会打架（这也是选三态、而不是
+ * "另加一个排除按钮"的主要原因）。
+ */
 function applyFilters(items) {
-  const filters = state.filters;
-  const weekdays = selectedValues('weekdays');
-  const mediaTypes = selectedValues('mediaTypes');
-  const genres = selectedValues('genres');
-  const platforms = selectedValues('platforms');
-
   return items.filter((item) => {
-    // 同一维度内多选取并集，跨维度取交集
-    if (weekdays.length && !weekdays.includes(String(item.broadcastWeekdayJst))) return false;
-    if (mediaTypes.length && !mediaTypes.includes(item.mediaType)) return false;
-    if (genres.length && !item.genres.some((genre) => genres.includes(genre))) return false;
-    if (platforms.length) {
-      const names = item.platforms.map((p) => p.name);
-      if (!platforms.some((name) => names.includes(name))) return false;
+    for (const dimension of FACET_DIMENSIONS) {
+      const values = dimensionValues(dimension, item);
+      const excluded = excludedValues(dimension);
+      if (excluded.length && values.some((value) => excluded.includes(value))) return false;
+      const included = includedValues(dimension);
+      if (included.length && !values.some((value) => included.includes(value))) return false;
     }
     return true;
   });
 }
 
+/**
+ * 三态循环：不选 → 含 → 不含 → 不选。
+ *
+ * 为什么不给"排除"单独做一个按钮：那样同一项就可能同时被"含"与"不含"选中，
+ * 得再写一套互斥规则；循环只有一条状态线，天然互斥。
+ */
+function cycleFilterValue(dimension, value) {
+  const filter = state.filters[dimension];
+  if (!filter) return;
+  if (filter.exclude.includes(value)) {
+    // 不含 → 不选
+    filter.exclude = filter.exclude.filter((item) => item !== value);
+    return;
+  }
+  if (filter.include.includes(value)) {
+    // 含 → 不含
+    filter.include = filter.include.filter((item) => item !== value);
+    filter.exclude = [...filter.exclude, value];
+    return;
+  }
+  // 不选 → 含
+  filter.include = [...filter.include, value];
+}
+
+/** 把某一项从"含"和"不含"两侧一起清掉（条件条上点 ✕ 走这里，不是三态循环）。 */
+function clearFilterValue(dimension, value) {
+  const filter = state.filters[dimension];
+  if (!filter) return;
+  filter.include = filter.include.filter((item) => item !== value);
+  filter.exclude = filter.exclude.filter((item) => item !== value);
+}
+
+/**
+ * 分布面板里的部数口径：**固定基数**（用户看过原型后定的）。
+ *
+ * 基数是「搜索框 + 第 2 层状态」的结果，**不叠加第 3 层自己的选择**。
+ * 为什么不用"点它之后会剩多少"：那个口径下，已经"含"着的项要显示"改成不含之后"的部数，
+ * 于是同一排数字里混着两种含义 —— 实测含「奇幻」时列表 31 部，而它自己写着 141
+ * （172 − 31），旁边的「科幻」写着 15（含它剩 15），141 和 15 并排会被读成"奇幻有 141 部"。
+ * 固定基数的代价是"点下去会剩多少"要自己反推，换来的是数字稳定、含义唯一。
+ */
+function facetEntries(dimension, base) {
+  return dimensionEntries(dimension, base);
+}
+
 function filteredSubjects() {
   return applyFilters(baseFilteredSubjects());
+}
+
+/** 维度 + 取值 → 给人看的标签（折叠标题的摘要、条件条都要用）。 */
+function dimensionLabel(dimension, value) {
+  if (dimension === 'weekdays') return WEEKDAYS[Number(value)] ?? `星期 ${value}`;
+  if (dimension === 'mediaTypes') return mediaTypeLabel(value);
+  if (dimension === 'genres') return genreLabel(value);
+  return value;
+}
+
+/**
+ * 已选条件条里的一枚 chip。
+ *
+ * "含"与"不含"必须是两种东西：含 = 实心强调色 + `✓`，不含 = 危险色 + **删除线** + `⊘`。
+ * 删除线是刻意加的 —— 只靠红色的话，色觉障碍用户（以及单色屏）分不出这两种。
+ */
+function filterChipHtml(dimension, value, side) {
+  const label = esc(dimensionLabel(dimension, value));
+  const excluded = side === 'exclude';
+  return `<button class="chip ${excluded ? 'is-excluded' : 'is-active'}"
+      data-clear-filter="${esc(dimension)}" data-clear-value="${esc(value)}"
+      title="${excluded ? '不含它：列表里看不到含它的番。点一下取消' : '含它：只看有它的。点一下取消'}">${
+        excluded ? '⊘ 不含 ' : '含 '
+      }${label} ✕</button>`;
 }
 
 /**
@@ -587,31 +732,14 @@ function filteredSubjects() {
  */
 function activeFilterChips() {
   const chips = [];
-  for (const [dimension, labeler] of [
-    ['weekdays', (value) => WEEKDAYS[Number(value)] ?? `星期 ${value}`],
-    ['mediaTypes', mediaTypeLabel],
-    ['genres', genreLabel],
-    ['platforms', (value) => value],
-  ]) {
-    for (const value of selectedValues(dimension)) {
-      chips.push(
-        `<button class="chip is-active" data-toggle-filter="${esc(dimension)}" data-toggle-value="${esc(
-          value,
-        )}" title="点击取消这个筛选">${esc(labeler(value))} ✕</button>`,
-      );
-    }
+  for (const dimension of FACET_DIMENSIONS) {
+    for (const value of includedValues(dimension)) chips.push(filterChipHtml(dimension, value, 'include'));
+    for (const value of excludedValues(dimension)) chips.push(filterChipHtml(dimension, value, 'exclude'));
   }
-  for (const [value, label] of [
-    ['mine', '我追的'],
-    ['backlog', '补番库'],
-    ['airing', '放送中'],
-    ['upcoming', '未开播'],
-    ['bilibili', 'B站有版权'],
-    ['nozh', '缺中文名'],
-  ]) {
+  for (const [value, label] of STATUS_CHIPS) {
     if (overviewSideFilter().includes(value)) {
       chips.push(
-        `<button class="chip is-active" data-quick-filter="${value}" title="点击取消这个筛选">${label} ✕</button>`,
+        `<button class="chip is-active" data-quick-filter="${value}" title="点一下取消这个筛选">${label} ✕</button>`,
       );
     }
   }
@@ -619,191 +747,196 @@ function activeFilterChips() {
   return `<div class="active-filters">
       <span class="af-label">已选条件</span>
       ${chips.join('')}
-      <button class="btn btn-sm" data-clear-filters="1">清空筛选</button>
+      <button class="btn btn-sm" data-clear-filters="1" title="含与不含两侧一起清掉（状态也一起）">全部清空</button>
     </div>`;
 }
 
-function filterPanelHtml(base) {
-  const sortLabel = (SORT_OPTIONS.find((option) => option.key === state.sort) ?? SORT_OPTIONS[0]).label;
-  // 四栏里一共选了几项 —— 只有选了才显示「清空筛选」，免得平时多一个没用的按钮
-  const facetActiveCount = FACET_DIMENSIONS.reduce(
-    (sum, dimension) => sum + selectedValues(dimension).length,
-    0,
-  );
+/**
+ * 面板**第 1 层**：搜索框 + "显示 N / M 部"。
+ *
+ * ⚠ 这一层是**常驻节点**（`#filter-panel-head`），点筛选时只重绘 `#filter-panel-body`。
+ *   票的验收里有一条「搜索框焦点不因点筛选而丢失」—— 线上原来把搜索框放在面板外的工具栏里，
+ *   新设计按票的图把它挪进面板第 1 层，能不能保住焦点就全靠这条拆法
+ *   （见 renderFilterPanelBody 与 refreshSubjectList 的老原则）。
+ */
+function filterPanelHeadHtml(base) {
   return `
-    <div class="filter-panel" id="filter-panel">
-      <div class="filter-panel-head">
-        <div class="filter-group">
-          <div class="filter-group-head">快速筛选</div>
-          <div class="filter-opts">
-            ${[
-              ['mine', '我追的'],
-              ['backlog', '补番库'],
-              ['airing', '放送中'],
-              ['upcoming', '未开播'],
-              ['bilibili', 'B站有版权'],
-              ['nozh', '缺中文名'],
-            ]
-              .map(([value, label]) => {
-                const active = overviewSideFilter().includes(value);
-                return `<button class="filter-opt${active ? ' is-active' : ''}" data-quick-filter="${value}">${label}<span class="c">${
-                  value === 'mine'
-                    ? base.filter((item) => item.myCategory).length
-                    : value === 'backlog'
-                      ? base.filter((item) => item.myCategory === 'backlog').length
-                      : value === 'airing'
-                        ? base.filter((item) => item.status === 'airing').length
-                        : value === 'upcoming'
-                          ? base.filter((item) => item.status === 'upcoming').length
-                          : value === 'nozh'
-                            ? base.filter((item) => !item.titleCn).length
-                            : base.filter((item) => item.platforms.some((p) => p.name.includes('哔哩哔哩'))).length
-                }</span></button>`;
-              })
-              .join('')}
-          </div>
-        </div>
-        <div class="filter-group">
-          <div class="filter-group-head">排序方式</div>
-          <div class="filter-opts">
-            ${SORT_OPTIONS.map(
-              (option) =>
-                `<button class="filter-opt${state.sort === option.key ? ' is-active' : ''}" data-sort="${
-                  option.key
-                }">${esc(option.label)}</button>`,
-            ).join('')}
-          </div>
-          <div class="filter-note">当前：${esc(sortLabel)}</div>
-        </div>
-        <div class="filter-group">
-          <div class="filter-group-head">每行几部</div>
-          <div class="filter-opts">
-            ${PER_ROW_OPTIONS.map(
-              (n) =>
-                `<button class="filter-opt${state.perRow === n ? ' is-active' : ''}" data-per-row="${n}">${n} 部</button>`,
-            ).join('')}
-          </div>
-          <div class="filter-note">现在的卡片太挤的话，调小一点</div>
-        </div>
-      </div>
-      <div class="filter-row">
-        <label class="field"
-          ><span>放送星期</span>
-          <select id="filter-weekday">
-            <option value="">全部</option>
-            ${facetEntries('weekdays', base)
-              .map((entry) => `<option value="${entry.value}">${esc(entry.label)}（${entry.count}）</option>`)
-              .join('')}
-          </select>
-        </label>
-        <label class="field"
-          ><span>媒体类型</span>
-          <select id="filter-media">
-            <option value="">全部</option>
-            ${facetEntries('mediaTypes', base)
-              .map((entry) => `<option value="${esc(String(entry.value))}">${esc(entry.label)}（${entry.count}）</option>`)
-              .join('')}
-          </select>
-        </label>
-        <label class="field"
-          ><span>类型标签</span>
-          <select id="filter-genre">
-            <option value="">全部</option>
-            ${facetEntries('genres', base)
-              .map((entry) => `<option value="${esc(String(entry.value))}">${esc(entry.label)}（${entry.count}）</option>`)
-              .join('')}
-          </select>
-        </label>
-        <label class="field"
-          ><span>国内平台</span>
-          <select id="filter-platform">
-            <option value="">全部</option>
-            ${facetEntries('platforms', base)
-              .map((entry) => `<option value="${esc(String(entry.value))}">${esc(entry.label)}（${entry.count}）</option>`)
-              .join('')}
-          </select>
-        </label>
-      </div>
-      <div class="filter-facets">
-        <div class="filter-facets-bar">
-          <span class="filter-note is-flush">点标题展开 / 收起每一栏</span>
-          ${facetActiveCount ? '<button class="btn btn-sm" data-clear-filters="1">清空筛选</button>' : ''}
-        </div>
-        ${filterGroupHtml('weekdays', '放送星期', base)}
-        ${filterGroupHtml('mediaTypes', '媒体类型', base)}
-        ${filterGroupHtml('platforms', '国内平台', base)}
-        ${filterGroupHtml('genres', '类型标签', base, { scroll: true })}
-      </div>
-      <div class="filter-note">
-        同一栏里选多个 = 满足任意一个；不同栏之间 = 同时满足。点已选中的项即可取消。
+    <div class="filter-layer">
+      <div class="toolbar">
+        <input type="search" id="season-search" placeholder="搜索中文名 / 原名（也可以直接搜别名）" value="${esc(
+          state.searchQuery,
+        )}" />
+        <span class="hint" id="subject-count">显示 ${applyFilters(base).length} / ${base.length} 部</span>
       </div>
     </div>`;
 }
 
 /**
- * 筛选面板里"放送星期 / 媒体类型 / 国内平台 / 类型标签"这四栏。
+ * 面板**第 2~5 层**（会被重绘的那一半），从上到下就是"一路收窄"：
  *
- * 用 `<details>` 做成可折叠：**默认全部收起**（只显示标题 + 已选摘要），
- * 否则四栏全铺开会把这个面板顶得很长（类型标签有 30 多项），
- * 反而看不清"我到底筛了什么"。点标题展开。
+ *   第 2 层 状态 —— 我追的 / 补番库 / …（预设条件，不是标签，所以只有选与不选两态）
+ *   第 3 层 四个维度 —— 放送星期 / 媒体类型 / 国内平台 / 类型标签：**唯一做筛选的地方**，
+ *                       默认全部收起（收起 = 全部）；只有这一层有"含 / 不含"三态
+ *   第 4、5 层 显示方式 —— 排序与每行几部：**不是筛选**，收进一个默认收起的折叠栏（用户选的 B 方案）
+ */
+function filterPanelBodyHtml(base) {
+  return `
+    ${filterStatusLayerHtml(base)}
+    ${filterFacetsLayerHtml(base)}
+    ${filterDisplayLayerHtml()}
+    <div class="filter-note">
+      同一维度里选多个「含」= 满足任意一个；不同维度之间 = 同时满足；标了「不含」的只要命中就整条丢掉。
+      选项右边的部数按「搜索框 + 状态」这个固定基数算，不随这里的筛选跳动。
+    </div>`;
+}
+
+/** 第 2 层：状态预设（只有选 / 不选两态），右上角是"多个之间：且 / 或"那个小切换键。 */
+function filterStatusLayerHtml(base) {
+  const options = STATUS_CHIPS.map(([value, label]) => {
+    const active = overviewSideFilter().includes(value);
+    const count = base.filter((item) => sideMatch(item, value)).length;
+    return `<button class="filter-opt${active ? ' is-active' : ''}" data-quick-filter="${value}"
+        aria-pressed="${active ? 'true' : 'false'}"
+        title="点一下选中，再点取消（可多选）">${active ? '✓ ' : ''}${label}<span class="c">${count}</span></button>`;
+  }).join('');
+  const modeTitle = state.statusAnd
+    ? '现在：多选要同时满足（且）。点一下改成"满足任意一个（或）"'
+    : '现在：多选满足任意一个（或）。点一下改成"同时满足（且）"';
+  return `
+    <div class="filter-layer">
+      <div class="filter-group">
+        <div class="filter-group-head is-row">
+          <span>状态</span>
+          <button class="btn btn-sm" data-status-mode="1" aria-pressed="${state.statusAnd ? 'true' : 'false'}"
+            title="${esc(modeTitle)}">多选之间：${state.statusAnd ? '且' : '或'}</button>
+        </div>
+        <div class="filter-opts">${options}</div>
+      </div>
+    </div>`;
+}
+
+/** 第 3 层：四个可折叠的维度（顺序见 FACET_DIMENSIONS）。 */
+function filterFacetsLayerHtml(base) {
+  return `<div class="filter-layer filter-facets">${FACET_DIMENSIONS.map((dimension) =>
+    // 类型标签有 101 项，展开后给它自己一块可滚的区域（其它维度最多十几项，不需要）
+    filterGroupHtml(dimension, base, { scroll: dimension === 'genres' }),
+  ).join('')}</div>`;
+}
+
+/**
+ * 第 4、5 层：排序方式 + 每行几部。
+ *
+ * 这两层**不是筛选**，是"显示方式"，所以按用户选的方案收进一个默认收起的折叠栏：
+ * 面板平时只剩 状态 + 四个维度，短一截。展开状态同样记在 `state.facetsOpen` 里，
+ * 点筛选导致的重绘不会把它收回去（键名用 'display'，与四个维度区分开）。
+ */
+function filterDisplayLayerHtml() {
+  const sortLabel = (SORT_OPTIONS.find((option) => option.key === state.sort) ?? SORT_OPTIONS[0]).label;
+  const open = state.facetsOpen.display === true;
+  const sortOptions = SORT_OPTIONS.map(
+    (option) =>
+      `<button class="filter-opt${state.sort === option.key ? ' is-active' : ''}" data-sort="${esc(
+        option.key,
+      )}">${state.sort === option.key ? '✓ ' : ''}${esc(option.label)}</button>`,
+  ).join('');
+  const perRowOptions = PER_ROW_OPTIONS.map(
+    (n) =>
+      `<button class="filter-opt${state.perRow === n ? ' is-active' : ''}" data-per-row="${n}">${
+        state.perRow === n ? '✓ ' : ''
+      }${n} 部</button>`,
+  ).join('');
+  return `
+    <div class="filter-layer">
+      <details class="filter-facet" data-facet="display"${open ? ' open' : ''}>
+        <summary class="facet-head">
+          <span class="facet-title">显示方式</span>
+          <span class="facet-count">${state.perRow} 部 / 行</span>
+          <span class="facet-picked">${esc(sortLabel)}</span>
+          <span class="facet-caret">▾</span>
+        </summary>
+        <div class="facet-body">
+          <div class="filter-group">
+            <div class="filter-group-head">排序方式</div>
+            <div class="filter-opts">${sortOptions}</div>
+          </div>
+          <div class="filter-group">
+            <div class="filter-group-head">每行几部</div>
+            <div class="filter-opts">${perRowOptions}</div>
+            <div class="filter-note">现在的卡片太挤的话，调小一点</div>
+          </div>
+        </div>
+      </details>
+    </div>`;
+}
+
+/**
+ * 筛选面板第 3 层里的一栏（放送星期 / 媒体类型 / 国内平台 / 类型标签）。
+ *
+ * 用 `<details>` 做成可折叠：**默认全部收起**（只显示标题 + 「已选 2 · 排除 1」+ 选中项名字），
+ * 否则四栏全铺开会把这个面板顶得很长（类型标签有 101 项），反而看不清"我到底筛了什么"。
  *
  * 用 `<details>` 而不是自己写开合：浏览器原生支持键盘（Tab 到标题、Enter 展开），
  * 也不用担心和点击委托互相干扰（summary 不是 button，委托不会命中它）。
+ *
+ * ⚠ 选项的顺序**不动**（按部数降序）：用户看过原型后明确选了"选中项不置顶、保持原位置不动"，
+ *   所以这里刻意不做"把选中的挪到最前面"——列表会跳位置反而让人找不到刚才点的那一项。
  */
-function filterGroupHtml(dimension, title, base, { scroll = false } = {}) {
+function filterGroupHtml(dimension, base, { scroll = false } = {}) {
   const all = facetEntries(dimension, base);
   if (all.length === 0) return '';
-  const selected = selectedValues(dimension);
-  const summary = selected.length
-    ? `<span class="facet-picked">${selected
-        .map((value) => esc(dimensionLabel(dimension, value)))
-        .join('、')}</span>`
-    : '';
+  const include = includedValues(dimension);
+  const exclude = excludedValues(dimension);
+  const picked = [...include, ...exclude];
 
+  // 固定基数下"被排除"不会让部数变成 0，所以它一定还在候选里；但基数本身可能把它筛掉
+  // （例如搜索词只命中别处），这时也要留着 —— 否则它只能绕到下面的条件条去取消。
   const options = all
+    .filter((entry) => entry.count > 0 || picked.includes(String(entry.value)))
     .map((entry) => {
-      const active = selected.includes(String(entry.value));
-      return `<button class="filter-opt${active ? ' is-active' : ''}"
+      const value = String(entry.value);
+      const isInclude = include.includes(value);
+      const isExclude = exclude.includes(value);
+      const marker = isInclude ? '✓ ' : isExclude ? '⊘ ' : '';
+      const next = isInclude
+        ? '现在：含它。再点一下 → 不含'
+        : isExclude
+          ? '现在：不含它。再点一下 → 不管它'
+          : '现在：不管它。点一下 → 只看含它的';
+      return `<button class="filter-opt${isInclude ? ' is-active' : ''}${isExclude ? ' is-excluded' : ''}"
                 data-toggle-filter="${esc(dimension)}"
-                data-toggle-value="${esc(String(entry.value))}"
-                title="${esc(String(entry.value))}">${esc(entry.label)}<span class="c">${entry.count}</span></button>`;
+                data-toggle-value="${esc(value)}"
+                aria-pressed="${isInclude ? 'true' : 'false'}"
+                title="${esc(`${next}（原始值：${value}）`)}">${marker}${esc(entry.label)}<span class="c">${
+                  entry.count
+                }</span></button>`;
     })
     .join('');
 
-  // 有选中项、或用户自己展开过，就保持展开 —— 刷新 / 点选后不会莫名其妙被收起
-  const open = selected.length > 0 || state.facetsOpen[dimension] === true;
+  // 标题右侧的摘要：含与不含分开报，各自看得见（票里画的就是「已选 2 · 排除 1」）
+  const summary = include.length
+    ? exclude.length
+      ? `已选 ${include.length} · 排除 ${exclude.length}`
+      : `已选 ${include.length}`
+    : exclude.length
+      ? `排除 ${exclude.length}`
+      : `${all.length} 项`;
+  const pickedText = [
+    ...include.map((value) => esc(dimensionLabel(dimension, value))),
+    ...exclude.map((value) => `<span class="is-excluded">⊘${esc(dimensionLabel(dimension, value))}</span>`),
+  ].join('、');
+
+  // 有选中/排除、或用户自己展开过，就保持展开 —— 点选导致的重绘不会把它收回去
+  const open = include.length > 0 || exclude.length > 0 || state.facetsOpen[dimension] === true;
   return `
     <details class="filter-facet" data-facet="${esc(dimension)}"${open ? ' open' : ''}>
       <summary class="facet-head">
-        <span class="facet-title">${esc(title)}</span>
-        <span class="facet-count">${selected.length ? `已选 ${selected.length}` : `${all.length} 项`}</span>
-        ${summary}
+        <span class="facet-title">${esc(FACET_TITLES[dimension] ?? dimension)}</span>
+        <span class="facet-count">${summary}</span>
+        <span class="facet-picked">${pickedText}</span>
         <span class="facet-caret">▾</span>
       </summary>
       <div class="filter-opts${scroll ? ' is-scroll' : ''}">${options}</div>
     </details>`;
-}
-
-/** 维度 + 取值 → 给人看的标签（折叠标题里的"已选摘要"要用）。 */
-function dimensionLabel(dimension, value) {
-  if (dimension === 'weekdays') return WEEKDAYS[Number(value)] ?? `星期 ${value}`;
-  if (dimension === 'mediaTypes') return mediaTypeLabel(value);
-  if (dimension === 'genres') return genreLabel(value);
-  return value;
-}
-
-/** 把下拉框的值同步成"选中的第一项"，避免重绘后下拉框显示"全部"但列表已被筛过。 */
-function syncFilterSelects() {
-  const map = [
-    ['#filter-weekday', 'weekdays'],
-    ['#filter-media', 'mediaTypes'],
-    ['#filter-genre', 'genres'],
-    ['#filter-platform', 'platforms'],
-  ];
-  for (const [selector, dimension] of map) {
-    const el = $(selector);
-    if (el) el.value = selectedValues(dimension)[0] ?? '';
-  }
 }
 
 /**
@@ -889,10 +1022,11 @@ function perRowStyle() {
 }
 
 /**
- * 只重绘"会被筛选/排序影响的部分"，不动筛选面板本身。
+ * 只重绘"会被筛选/排序影响的部分" + 筛选面板的正文，**不碰面板第 1 层**。
  *
- * 为什么分开：面板里有搜索框和四个 select，整块重绘会把焦点和下拉展开状态一起弄丢
- * （在搜索框里打字时尤其明显）。
+ * 为什么分开：第 1 层是搜索框，面板整体重绘会把它的焦点弄丢（在里面打字时尤其明显）。
+ * 这条原则从第五轮起就在（原来靠"搜索框放在面板外"实现），现在搜索框进了面板，
+ * 就靠 `#filter-panel-head` / `#filter-panel-body` 的拆分继续成立。
  */
 function refreshSubjectList() {
   const container = $('#subject-list');
@@ -909,36 +1043,30 @@ function refreshSubjectList() {
   }
   const active = $('#active-filters');
   if (active) active.innerHTML = activeFilterChips();
-  syncFilterSelects();
 }
 
+/**
+ * 总览视图。
+ *
+ * 面板拆成两个槽，是这一版最容易改坏的地方：
+ *   `#filter-panel-head` 第 1 层（搜索框 + 部数）—— **常驻**，只有整个视图重绘时才换；
+ *   `#filter-panel-body` 第 2~5 层 —— 每次点筛选/排序/每行几部都重绘（`renderFilterPanelBody`）。
+ * 把搜索框画进 body 里，就等于把"打字时光标不丢"这条一起画没了。
+ */
 function renderSeason() {
   const overview = state.overview;
 
   if (state.selectedSeasons.length === 0) state.selectedSeasons = [state.season];
 
   const base = baseFilteredSubjects();
-  const filterCount =
-    selectedValues('weekdays').length +
-    selectedValues('mediaTypes').length +
-    selectedValues('genres').length +
-    selectedValues('platforms').length +
-    overviewSideFilter().length;
 
   $('#app').innerHTML = `
     ${seasonLibraryNotice(overview)}
 
-    <div class="toolbar">
-      <input type="search" id="season-search" placeholder="搜索中文名 / 原名（也可以直接搜别名）" value="${esc(state.searchQuery)}" />
-      <button class="btn ${state.filtersOpen ? 'btn-primary' : ''}" id="filter-toggle" aria-expanded="${
-        state.filtersOpen ? 'true' : 'false'
-      }" title="按放送星期 / 媒体类型 / 类型标签 / 国内平台筛选，并切换排序与每行部数">
-        筛选 / 排序${filterCount ? ` <span class="pill">${filterCount}</span>` : ''} ${state.filtersOpen ? '▲' : '▼'}
-      </button>
-      <span class="hint" id="subject-count">显示 ${filteredSubjects().length} / ${base.length} 部</span>
+    <div class="filter-panel" id="filter-panel">
+      <div id="filter-panel-head">${filterPanelHeadHtml(base)}</div>
+      <div id="filter-panel-body">${filterPanelBodyHtml(base)}</div>
     </div>
-
-    ${state.filtersOpen ? filterPanelHtml(base) : ''}
 
     <div id="active-filters">${activeFilterChips()}</div>
 
@@ -949,12 +1077,11 @@ function renderSeason() {
     search.addEventListener('input', (event) => {
       state.searchQuery = event.target.value;
       refreshSubjectList();
+      // 搜索词会改变候选与部数，所以面板正文要跟着刷新 —— 但**不能**碰第 1 层自己，
+      // 否则每打一个字就换一次输入框节点，光标直接飞走。
+      renderFilterPanelBody();
     });
   }
-
-  // 筛选面板里的四个下拉要绑 change（点击事件走不了：select 不触发 click 委托）。
-  // 放在这里统一绑，避免"面板重绘后监听丢了"。
-  renderFilterPanelOnly();
 }
 
 // ---------------------------------------------------------------------------
@@ -1555,7 +1682,8 @@ async function bootstrap() {
     SORT_OPTIONS.map((option) => option.key),
     'firstAir',
   );
-  state.filtersOpen = localStorage.getItem(LS_FILTERS_OPEN) !== '0';
+  // 第 2 层多个状态之间默认"且"（线上老行为）；用户切过就按记下来的来。
+  state.statusAnd = localStorage.getItem(LS_STATUS_AND) !== '0';
 
   const health = await api('/api/health');
   const current = await api(`/api/overview?season=&sort=${encodeURIComponent(state.sort)}`);
@@ -1616,19 +1744,11 @@ document.addEventListener('click', (event) => {
   }
   if (target.id && SELF_HANDLED.has(target.id)) return;
 
-  // 「筛选」面板的开关：它只折叠/展开面板，不需要重新拉数据。
-  if (target.id === 'filter-toggle') {
-    state.filtersOpen = !state.filtersOpen;
-    store(LS_FILTERS_OPEN, state.filtersOpen ? '1' : '0');
-    renderSeason();
-    return;
-  }
   // ⚠ 这里**不能**写 `if (target.closest('#filter-panel')) return;`。
   //   那是把筛选块放在面板外面时的写法（点击委托只管面板外的元素）。
   //   第五轮把筛选块折进面板之后，所有 data-toggle-filter / data-quick-filter /
   //   data-per-row / data-sort 按钮**都在面板里** —— 加这句会把它们全部吃掉：
-  //   表现就是"点筛选块毫无反应、也不高亮"，而四个 <select> 照常能用
-  //   （它们走 change 事件，不经过点击委托）。这正是第六轮踩到的真 bug。
+  //   表现就是"点筛选块毫无反应、也不高亮"。这正是第六轮踩到的真 bug。
   //   面板内部的交互本来就是靠点击委托统一处理的，所以这里直接往下走。
 
   const dataset = target.dataset;
@@ -1658,17 +1778,26 @@ document.addEventListener('click', (event) => {
     void renderWeek();
     return;
   }
-  // ---- 全季总览的筛选 / 排序 / 每行几部：只重绘列表，不重绘面板（保住搜索框焦点） ----
+  // ---- 第 3 层：点一下 = 不选 → 含 → 不含 → 不选（三态循环） ----
   if (dataset.toggleFilter) {
-    const dimension = dataset.toggleFilter;
-    const value = String(dataset.toggleValue ?? '');
-    const current = state.filters[dimension] ?? [];
-    const index = current.findIndex((item) => String(item) === value);
-    if (index >= 0) current.splice(index, 1);
-    else current.push(value);
-    state.filters[dimension] = current;
+    cycleFilterValue(dataset.toggleFilter, String(dataset.toggleValue ?? ''));
     refreshSubjectList();
-    renderFilterPanelOnly();
+    renderFilterPanelBody();
+    return;
+  }
+  // 条件条上点某一项的 ✕：把"含"和"不含"两侧一起清掉（不是三态循环 —— 那里点一下是换态）
+  if (dataset.clearFilter) {
+    clearFilterValue(dataset.clearFilter, String(dataset.clearValue ?? ''));
+    refreshSubjectList();
+    renderFilterPanelBody();
+    return;
+  }
+  // 第 2 层多个状态之间：且 ⇄ 或（这是个偏好，记在 localStorage 里）
+  if (dataset.statusMode) {
+    state.statusAnd = !state.statusAnd;
+    store(LS_STATUS_AND, state.statusAnd ? '1' : '0');
+    refreshSubjectList();
+    renderFilterPanelBody();
     return;
   }
   if (dataset.quickFilter) {
@@ -1679,13 +1808,13 @@ document.addEventListener('click', (event) => {
     else current.push(value);
     state.filters.side = current;
     refreshSubjectList();
-    renderFilterPanelOnly();
+    renderFilterPanelBody();
     return;
   }
   if (dataset.clearFilters) {
-    state.filters = { weekdays: [], mediaTypes: [], genres: [], platforms: [], side: [] };
+    state.filters = emptyFilters();
     refreshSubjectList();
-    renderFilterPanelOnly();
+    renderFilterPanelBody();
     return;
   }
   if (dataset.perRow) {
@@ -1695,7 +1824,7 @@ document.addEventListener('click', (event) => {
       store(LS_PER_ROW, perRow);
     }
     refreshSubjectList();
-    renderFilterPanelOnly();
+    renderFilterPanelBody();
     return;
   }
   if (dataset.sort) {
@@ -1923,41 +2052,36 @@ async function changeSort(sortKey) {
 }
 
 /**
- * 只重绘筛选面板（不碰搜索框）。
- * 点了筛选项/排序/每行部数之后调用：列表已经由 refreshSubjectList() 更新，
- * 这里只需要把面板里的高亮、"当前排序"文字和各选项部数刷新一下。
+ * 只重绘筛选面板的**第 2~5 层**（`#filter-panel-body`）。
+ *
+ * 点了筛选项 / 排序 / 每行几部之后调用：列表已经由 refreshSubjectList() 更新，
+ * 这里只需要把面板里的高亮、选中摘要、各选项部数、"显示方式"的当前值刷新一下。
+ *
+ * ⚠ 三条不能破的约定：
+ *   1. **不要碰 `#filter-panel-head`**（搜索框在那里）：重绘它 = 点一次筛选丢一次光标，
+ *      票的验收里专门有一条。原来搜索框在面板外的工具栏里，这个问题不存在；新设计把它
+ *      挪进面板第 1 层，就靠这条拆法保住。
+ *   2. 重绘前先把"哪几栏是展开的"从 DOM 里**同步**记下来：`toggle` 事件是异步派发的，
+ *      只靠它会在"刚展开就点里面的选项"那一瞬间把展开状态丢掉。
+ *   3. 四个 `<select>` 连同它们的 change 监听一并删掉了（票里明确不保留）——
+ *      面板里现在只有一套筛选操作方式。
  */
-function renderFilterPanelOnly() {
-  if (!state.filtersOpen) return;
-  const host = $('#filter-panel');
+function renderFilterPanelBody() {
+  const host = $('#filter-panel-body');
   if (!host) return;
-
-  // 重绘前先把"哪几栏是展开的"记下来：面板整体换节点，展开状态会丢，
-  // 不记的话用户展开「类型标签」后点一下就又被收起了，很难用。
-  for (const detail of $$('#filter-panel .filter-facet')) {
+  for (const detail of $$('#filter-panel-body .filter-facet')) {
     const dimension = detail.dataset.facet;
     if (dimension) state.facetsOpen[dimension] = detail.open;
   }
-
-  const wrapper = document.createElement('div');
-  wrapper.innerHTML = filterPanelHtml(baseFilteredSubjects());
-  host.replaceWith(wrapper.firstElementChild);
-
-  // 换了新节点，change 监听要重新绑
-  for (const el of $$('#filter-weekday, #filter-media, #filter-genre, #filter-platform')) {
-    el.addEventListener('change', onFilterSelectChange);
-  }
-  // 用户手动展开 / 收起也要记下来（否则下次重绘又回到默认）。
-  // 这里用**事件委托**挂在 document 上（见下面 addEventListener('toggle')）：
-  // 面板每次点选都会整个换节点，逐个绑监听很容易在某次重绘后漏绑。
-  syncFilterSelects();
+  host.innerHTML = filterPanelBodyHtml(baseFilteredSubjects());
 }
 
 /**
- * 记住四栏的展开状态。
+ * 记住四栏 + 「显示方式」的展开状态。
  *
  * `toggle` 事件在 `<details>` 上派发且会冒泡，所以挂在 document 上就够了 ——
- * 面板整体重绘后不需要重新绑定，比"每次重绘给每个 details 绑一遍"稳。
+ * 面板正文每次点选都会整体换节点，逐个绑监听很容易在某次重绘后漏绑。
+ * （另外 renderFilterPanelBody 在重绘前还会**同步**从 DOM 抓一次，防止 toggle 还没派发就重绘。）
  */
 document.addEventListener('toggle', (event) => {
   const detail = event.target;
@@ -1965,21 +2089,6 @@ document.addEventListener('toggle', (event) => {
   if (!dimension) return;
   state.facetsOpen[dimension] = Boolean(detail.open);
 }, true);
-
-/** 筛选面板里的四个下拉：单选，再点一次同一项即取消。 */
-function onFilterSelectChange(event) {
-  const value = event.target.value;
-  const dimension = {
-    'filter-weekday': 'weekdays',
-    'filter-media': 'mediaTypes',
-    'filter-genre': 'genres',
-    'filter-platform': 'platforms',
-  }[event.target.id];
-  if (!dimension) return;
-  state.filters[dimension] = value === '' ? [] : [value];
-  refreshSubjectList();
-  renderFilterPanelOnly();
-}
 
 $('#season-select').addEventListener('change', (event) => {
   void selectSeason(event.target.value);

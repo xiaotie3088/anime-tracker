@@ -230,7 +230,10 @@ async function renderWeekHtml(): Promise<string> {
   return inlineCovers(api.getHtml());
 }
 
-function renderSeasonHtml(filters: Record<string, string[]>): string {
+/** 筛选条件：四个维度都是 `{ include, exclude }`（三态），`side` 是第 2 层的状态预设。 */
+type PreviewFilters = Record<string, unknown>;
+
+function renderSeasonHtml(filters: PreviewFilters): string {
   const api = makeRenderers(overview, week);
   Object.assign(api.state, { filters });
   api.renderSeason();
@@ -238,11 +241,14 @@ function renderSeasonHtml(filters: Record<string, string[]>): string {
 }
 
 const weekHtml = await renderWeekHtml();
+// 演示状态刻意凑齐四种视觉，一张图里就能看出三态的差别：
+//   含（✓ + 实心）→ 周五、TV、奇幻；不含（⊘ + 删除线 + 危险色）→ 成人；不选 → 其余全部。
+// 同一栏里"含 + 不含"都有（类型标签），这样折叠标题上的「已选 1 · 排除 1」也看得见。
 const seasonHtml = renderSeasonHtml({
-  weekdays: ['5'],
-  mediaTypes: ['TV'],
-  genres: [],
-  platforms: [],
+  weekdays: { include: ['5'], exclude: [] },
+  mediaTypes: { include: ['TV'], exclude: [] },
+  genres: { include: ['Fantasy'], exclude: ['Hentai'] },
+  platforms: { include: [], exclude: [] },
   side: [],
 });
 

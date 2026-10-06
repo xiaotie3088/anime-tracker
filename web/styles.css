@@ -666,7 +666,7 @@ main { padding: 20px 22px 72px; max-width: 2200px; margin: 0 auto; }
 }
 .toolbar .hint { font-size: var(--fs-xs); color: var(--text-faint); font-variant-numeric: tabular-nums; }
 
-/* ---------- 筛选 / 排序面板 ---------- */
+/* ---------- 筛选面板（五层：搜索 / 状态 / 四个维度 / 显示方式） ---------- */
 
 .filter-panel {
   background: var(--surface);
@@ -678,31 +678,32 @@ main { padding: 20px 22px 72px; max-width: 2200px; margin: 0 auto; }
   animation: pop-in 0.16s var(--ease);
 }
 
-.filter-panel-head {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-  gap: var(--gap-lg);
-  padding-bottom: var(--gap);
-  margin-bottom: var(--gap);
-  border-bottom: 1px solid var(--border);
-}
+/* 面板拆成两个槽（见 app.js 的 renderFilterPanelBody）：
+   #filter-panel-head 是搜索框那一层，**常驻**、点筛选时不重绘 —— 重绘它就丢光标；
+   #filter-panel-body 是下面几层，每次点选整体重绘。 */
+#filter-panel-body { display: block; }
 
-.filter-row { display: flex; gap: var(--gap-lg); flex-wrap: wrap; margin-bottom: var(--gap); }
-.filter-row .field select { max-width: 260px; }
+/* 层与层之间只用一条淡分隔线：这里要的是"一路从上往下收窄"的视觉，不是一个套一个的卡片。
+   第 1 层与第 2 层之间那条要单独写 —— 它们的 .filter-layer 不是兄弟节点。 */
+.filter-layer + .filter-layer,
+#filter-panel-body > .filter-layer:first-child { border-top: 1px solid var(--border); }
+.filter-layer { padding: 11px 0; }
+#filter-panel-head > .filter-layer { padding-top: 0; }
+#filter-panel-body > .filter-layer:last-child { padding-bottom: 0; }
+.filter-layer > .toolbar { margin-bottom: 0; }
+.filter-layer .filter-group + .filter-group { margin-top: 11px; }
+/* 面板正文最后那行说明紧跟在某一层后面：层的下内边距已经给了间距，别再叠一层 */
+.filter-layer + .filter-note { margin-top: 0; }
 
 /* ---------- 四栏可折叠分面 ---------- */
 
-/* 原来四栏全铺开，类型标签 30 多项会把面板顶得很长；改成默认收起，
-   只留标题 + "已选了什么"的摘要，需要时点开。 */
+/* 四栏默认收起，只留标题 + 「已选 2 · 排除 1」+ 选中项名字，需要时点开
+   （类型标签有 101 项，铺开会把面板顶得很长）。 */
 .filter-facets { display: flex; flex-direction: column; gap: 6px; }
 
-.filter-facets-bar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--gap);
-  margin-bottom: 4px;
-}
+/* 「显示方式」（排序 + 每行几部）折叠栏的正文：里面是两个 .filter-group 而不是 .filter-opts，
+   拿不到下面 `.filter-facet > .filter-opts` 那份内边距，所以这里补一份。 */
+.facet-body { padding: 2px 12px 12px; }
 
 .filter-facet {
   border: 1px solid var(--border);
@@ -743,6 +744,12 @@ main { padding: 20px 22px 72px; max-width: 2200px; margin: 0 auto; }
   white-space: nowrap;
   min-width: 0;
 }
+/* 摘要里"不含"的那几个：与选项上的三态同一套视觉（危险色 + 删除线 + ⊘） */
+.facet-picked .is-excluded {
+  color: var(--danger);
+  text-decoration: line-through;
+  text-decoration-thickness: 1.5px;
+}
 .facet-caret {
   margin-left: auto;
   font-size: 10px;
@@ -761,6 +768,14 @@ main { padding: 20px 22px 72px; max-width: 2200px; margin: 0 auto; }
   font-weight: 650;
   letter-spacing: 0.4px;
   margin-bottom: 8px;
+}
+/* 标题行两侧各放一样东西时用（第 2 层「状态」右边那个"多个之间：且 / 或"的小切换键） */
+.filter-group-head.is-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--gap);
+  flex-wrap: wrap;
 }
 
 .filter-opts { display: flex; flex-wrap: wrap; gap: 5px; }
@@ -786,6 +801,24 @@ main { padding: 20px 22px 72px; max-width: 2200px; margin: 0 auto; }
   color: var(--accent-ink);
   font-weight: 600;
 }
+
+/* 三态的第三态："不含"。
+   ⚠ 不能只靠红色 —— 色觉障碍用户（以及单色打印）分不出红/灰，
+     所以同时给**删除线**（形状差异）和 `⊘` 标记（由 app.js 写进标签文本）。
+   含 = ✓ + 实心强调色；不含 = ⊘ + 删除线 + 危险色；不选 = 普通灰字。 */
+.filter-opt.is-excluded {
+  border-color: var(--danger);
+  background: transparent;
+  color: var(--danger);
+  text-decoration: line-through;
+  text-decoration-thickness: 1.5px;
+}
+.filter-opt.is-excluded:hover {
+  border-color: var(--danger);
+  background: var(--surface-3);
+  color: var(--danger);
+}
+.filter-opt.is-excluded .c { color: var(--danger); opacity: 0.75; }
 .filter-opt .c { font-size: 11px; color: var(--text-faint); font-variant-numeric: tabular-nums; }
 .filter-opt.is-active .c { color: var(--accent-ink); opacity: 0.82; }
 
@@ -902,6 +935,14 @@ main { padding: 20px 22px 72px; max-width: 2200px; margin: 0 auto; }
   background: var(--accent-soft);
   color: var(--accent);
   font-weight: 600;
+}
+/* 条件条里的"不含"chip：与面板里的第三态保持一致（危险色 + 删除线 + ⊘） */
+.chip.is-excluded {
+  border-color: var(--danger);
+  background: transparent;
+  color: var(--danger);
+  text-decoration: line-through;
+  text-decoration-thickness: 1.5px;
 }
 /* 「全选」是**操作**而不是某个季度，所以用虚线边框把自己和季度标签区分开
    （颜色也刻意不用强调色，免得看起来像"已经被选中的那一季"）。
