@@ -18,7 +18,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { copyFileSync, existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -1417,6 +1417,94 @@ check('备份函数在库文件不存在时安全返回 null（而不是抛错�
 });
 
 db.close();
+
+// ---------------------------------------------------------------------------
+// 样式的静态守卫（只读 web/styles.css，不需要浏览器）
+// ---------------------------------------------------------------------------
+//
+// 为什么需要这一节：CSS 里**语法无效的声明会被浏览器静默丢弃**，而 ui:smoke 跑的是手写元素壳、
+// 从不读 styles.css —— 于是"JS 全绿、真实界面塌成一列"这种事故没有任何自动检查能发现。
+// 最典型的坑：`repeat()` 的第一个参数按规范**只能是整数**（或 auto-fill/auto-fit），
+// 写成 `repeat(min(var(--n), 5), …)` 会整条被丢掉。这里用静态检查把它挡在提交之前。
+
+const stylesPath = new URL('../web/styles.css', import.meta.url);
+const stylesCss = readFileSync(stylesPath, 'utf8');
+
+/**
+ * 去掉 CSS 注释后再检查。
+ *
+ * 必须先剥注释：解释"为什么不能这么写"的注释里**必然**会出现反面示例
+ * （例如 `repeat(min(...), …)` 是无效 CSS 这句话），不剥掉就会把自己写的反例当成违规。
+ */
+function stripCssComments(text: string): string {
+  let out = '';
+  let i = 0;
+  while (i < text.length) {
+    if (text.startsWith('/*', i)) {
+      const end = text.indexOf('*/', i + 2);
+      i = end === -1 ? text.length : end + 2;
+      continue;
+    }
+    out += text[i];
+    i += 1;
+  }
+  return out;
+}
+
+const stylesCode = stripCssComments(stylesCss);
+
+/** 取出 repeat(...) 的第一个参数（含嵌套括号），例如 '4'、'auto-fill'、'min(var(--x), 5)' */
+function firstRepeatArg(text: string, openParen: number): string {
+  let depth = 1;
+  for (let i = openParen + 1; i < text.length; i += 1) {
+    const ch = text[i];
+    if (ch === '(') depth += 1;
+    else if (ch === ')') {
+      depth -= 1;
+      if (depth === 0) return text.slice(openParen + 1, i).trim();
+    } else if (ch === ',' && depth === 1) {
+      return text.slice(openParen + 1, i).trim();
+    }
+  }
+  return '';
+}
+
+check('styles.css 里 repeat() 的第一个参数只用整数字面量（min()/calc()/var() 都是无效 CSS）', () => {
+  const bad: string[] = [];
+  for (const m of stylesCode.matchAll(/repeat\s*\(/g)) {
+    const arg = firstRepeatArg(stylesCode, m.index + m[0].length - 1);
+    if (arg === '') continue;
+    const isIntegerLiteral = /^\d+$/.test(arg);
+    const isAutoKeyword = arg === 'auto-fill' || arg === 'auto-fit';
+    if (!isIntegerLiteral && !isAutoKeyword) bad.push(arg);
+  }
+  assert.equal(
+    bad.join(' | '),
+    '',
+    `这些 repeat() 首个参数不是整数、会被浏览器整条丢弃：${bad.join(' | ')}`,
+  );
+});
+
+check('样式表里不再有"每行几部"的旧写法（--per-row-w / auto-fill 列数）', () => {
+  assert.equal(stylesCode.includes('--per-row-w'), false);
+  assert.equal(/grid-template-columns\s*:\s*repeat\(\s*auto-fill/.test(stylesCode), false);
+});
+
+check('每个可选列数都有对应的 .per-row-N 规则（与 app.js 的 PER_ROW_OPTIONS 对齐）', () => {
+  const appJs = readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
+  const list = /const PER_ROW_OPTIONS = \[([^\]]+)\]/.exec(appJs)?.[1] ?? '';
+  const options = list
+    .split(',')
+    .map((piece) => piece.trim())
+    .filter(Boolean);
+  assert.ok(options.length >= 5, `没解析到 PER_ROW_OPTIONS，实际拿到 ${options.length} 项`);
+  for (const option of options) {
+    assert.ok(
+      stylesCode.includes(`.per-row-${option}`),
+      `styles.css 缺少 .per-row-${option} 的列数规则`,
+    );
+  }
+});
 
 // ---------------------------------------------------------------------------
 // 汇总

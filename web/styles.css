@@ -7,8 +7,10 @@
    1. 主题**跟随系统**（`prefers-color-scheme`），页面上没有手动切换开关。
       组件里**绝不要**写死颜色，一律用下面的令牌 —— 否则浅色主题下会出现
       「深色卡片浮在白底上」这种一半一半的效果。
-   2. 列表每行几部靠 JS 写在元素上的 `--per-row-w`，媒体查询里用 `!important` 压它，
-      那两句别删（见 styles.css 末尾）。
+   2. 列表每行几部靠 JS 在容器上加的 `.per-row-N` 类决定列数（列数一律写成**整数**，
+      不能写成 `repeat(min(...), …)` —— 那会被浏览器当无效声明整条丢弃）；
+      窗口不够宽时由第 10 节的媒体查询按档位封顶。
+      **不可改回 auto-fill** —— 那会让"每行几部"这个设置失效（见 .scratch/overview-layout-bug）。
 */
 
 /* ==========================================================================
@@ -825,12 +827,29 @@ main { padding: 20px 22px 72px; max-width: 2200px; margin: 0 auto; }
 .active-filters:empty { display: none; }
 .active-filters .af-label { font-size: var(--fs-xs); color: var(--text-faint); }
 
-/* 每行几部：移动端有单独的媒体查询覆盖，所以这里用 min() 让卡片宽度可调 */
+/* 每行几部：由 JS 在列表容器上加一个 `.per-row-N` 类决定列数（见 web/app.js 的 perRowStyle）。
+   **必须用显式列数**，不能用 auto-fill —— 那是"能放几列就放几列"，
+   会让"每行几部"这个设置完全失效（选 4 部却排出 5、6 部）。
+
+   ⚠ 为什么是"每个列数一个类"，而不是 `repeat(var(--per-row-count), …)`：
+   `repeat()` 的第一个参数**按规范只能是整数**（`<integer [1,∞]>`），不能是计算函数。
+   写成 `repeat(min(var(--a), var(--b)), …)` 时，`min()` 的类型是数值/长度而**不是整数**，
+   语法层就匹配不上 → **整条声明被丢弃** → 列表塌成单列并横向溢出（比 bug 本身更糟）。
+   裸 var 之所以能行，是因为它在 computed-value time 被替换成字面量整数；
+   一旦包上 min()/calc() 就不再是字面量了。所以列数一律写成字面量。
+   下面这个基础值同时充当"JS 没跑起来时的兜底"，不要删。 */
 .subject-list {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(min(100%, var(--per-row-w, 335px)), 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: var(--gap);
 }
+/* 可选列数（3~7，与 web/app.js 的 PER_ROW_OPTIONS 保持一致）。
+   权重 (0,1,0)+类 高于基础 .subject-list，所以能盖住上面的兜底值。 */
+.subject-list.per-row-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.subject-list.per-row-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.subject-list.per-row-5 { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+.subject-list.per-row-6 { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+.subject-list.per-row-7 { grid-template-columns: repeat(7, minmax(0, 1fr)); }
 
 .subject-row {
   display: flex;
@@ -1034,15 +1053,25 @@ main { padding: 20px 22px 72px; max-width: 2200px; margin: 0 auto; }
 @media (max-width: 1500px) {
   /* 7 列再挤下去标题会断成两三行，减到 4 列 */
   .week-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  /* 每行几部的降档：**这个宽度下最多这么多列**，与用户选了几部无关
+     （选了 4 部仍是 4 部，因为没到上限；选了 6、7 部则被压到 5 部）。
+     档位固定而不是按像素换算 —— 按像素算会让列数随窗口每一像素抖动，看起来不稳定。
+     这些选择器是 .subject-list.per-row-N（权重 0,2,0），高于基础 .subject-list（0,1,0），
+     JS 加的类也是 0,2,0，靠**源序在后者胜出**生效，所以不需要 !important。 */
+  .subject-list.per-row-6,
+  .subject-list.per-row-7 { grid-template-columns: repeat(5, minmax(0, 1fr)); }
 }
 @media (max-width: 1100px) {
   .week-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  /* 窗口窄了就不再保证"每行 N 部"，允许多降一档 —— 用 !important 压掉元素上的
-     行内 --per-row-w（行内样式的优先级高于媒体查询），这两句别删 */
-  .subject-list { grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr)) !important; }
+  .subject-list.per-row-4,
+  .subject-list.per-row-5,
+  .subject-list.per-row-6,
+  .subject-list.per-row-7 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
 @media (max-width: 760px) {
   .week-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  /* ⚠ 这一条必须带 !important：`.subject-list`（0,1,0）压不过上面的 `.subject-list.per-row-N`（0,2,0），
+     只有 !important 能越过它们，把所有档位统一收敛到 2 列。 */
   .subject-list { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
   .top, .tabs { padding-left: 12px; padding-right: 12px; }
   .tabs { top: 0; }
@@ -1054,6 +1083,14 @@ main { padding: 20px 22px 72px; max-width: 2200px; margin: 0 auto; }
     --cover-row-w: 56px;
     --cover-row-h: 80px;
   }
+}
+
+@media (max-width: 420px) {
+  /* 极窄屏收敛到 1 列：420px 下排 2 列时卡片只有约 190px，
+     海报固定 64px + 操作按钮约 70px 之后，标题只剩几十像素、会被挤散。
+     旧实现用的是 auto-fill，在这么窄时本来就会自己掉到 1 列 —— 这里把那个隐含行为写明确。
+     同样需要 !important 才能越过 .subject-list.per-row-N（见上一条的说明）。 */
+  .subject-list { grid-template-columns: repeat(1, minmax(0, 1fr)) !important; }
 }
 
 @media (prefers-reduced-motion: reduce) {

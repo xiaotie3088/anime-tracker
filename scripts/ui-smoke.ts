@@ -43,9 +43,22 @@ class El {
   disabled = false;
   open = false;
   classList = {
-    add: () => {},
-    remove: () => {},
-    toggle: () => {},
+    // ⚠ 必须是**真会改 className** 的实现：真实 DOM 的 classList.add/remove 会改 className，
+    //   早先这里是空函数，于是"代码里加了个类"在断言里永远看不到，测试会误报失败。
+    add: (...cs: string[]) => {
+      const set = new Set(this.className.split(/\s+/).filter(Boolean));
+      for (const c of cs) set.add(c);
+      this.className = [...set].join(' ');
+    },
+    remove: (...cs: string[]) => {
+      const set = new Set(this.className.split(/\s+/).filter(Boolean));
+      for (const c of cs) set.delete(c);
+      this.className = [...set].join(' ');
+    },
+    toggle: (c: string) => {
+      if (this.classList.contains(c)) this.classList.remove(c);
+      else this.classList.add(c);
+    },
     contains: (c: string) => this.className.split(/\s+/).filter(Boolean).includes(c),
   };
   private _html = '';
@@ -477,6 +490,32 @@ if (mediaSelect) {
   mediaSelect.dispatch('change');
   ok('选 MOVIE 后列表变化', rowCountNow() !== baseRows, `(${baseRows} → ${rowCountNow()})`);
 }
+
+console.log('\n【F】每行几部：列数要真的被这个选择决定');
+// 断言到"列表容器拿到了 .per-row-N"这一步。
+// ⚠ 这个壳没有布局引擎，量不出"实际排了几列"；而 styles.css 里的列数是**字面量整数**
+//   （不能用 repeat(min(...)) —— 那会被浏览器当无效声明丢掉，见 styles.css 的注释），
+//   所以"类名对了"就等于"列数对了"。
+// 真实列数仍建议在浏览器里目视确认一次（见 .scratch/overview-layout-bug 的验收说明）。
+for (const n of [3, 4, 5, 6, 7]) {
+  resetFilters();
+  const chip = findChip('data-per-row', String(n));
+  if (!chip) {
+    ok(`「${n} 部」按钮渲染出来了`, false);
+    continue;
+  }
+  chip.click();
+  const listEl = appEl.querySelector('#subject-list');
+  ok(
+    `选「${n} 部」后列表容器带 .per-row-${n}`,
+    listEl?.classList.contains(`per-row-${n}`) ?? false,
+    `class="${listEl?.className ?? '(拿不到节点)'}"`,
+  );
+  // 只应有一个 per-row-* 类（旧的不清掉会两个类打架，胜负取决于样式表顺序）
+  const howMany = [3, 4, 5, 6, 7].filter((m) => listEl?.classList.contains(`per-row-${m}`)).length;
+  ok(`选「${n} 部」后只剩一个 per-row 类`, howMany === 1, `实际 ${howMany} 个`);
+}
+resetFilters();
 
 console.log(`\n结果：${failures === 0 ? '全部通过' : `${failures} 项失败`}`);
 process.exitCode = failures === 0 ? 0 : 1;

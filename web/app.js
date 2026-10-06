@@ -770,15 +770,25 @@ function subjectListHtml() {
 }
 
 /**
- * 「每行几部」→ 卡片目标宽度。
+ * 「每行几部」→ 加在列表容器上的类名（`.per-row-N`），列数由 `web/styles.css` 给出。
  *
- * 为什么不是"直接写死 N 列 grid"：那样在窗口还不到 N 列宽时会横向溢出（手机上尤其明显）。
- * 用 `auto-fill + minmax(目标宽度, 1fr)`：窗口够宽就正好是 N 部一行，
- * 窗口变窄会自动降列数，永远不溢出。
+ * 为什么是类名而不是"目标宽度"：以前这里写的是
+ * `--per-row-w: calc((100% - (N-1)*10px) / N)`，配合 CSS 里的
+ * `repeat(auto-fill, minmax(..., 1fr))`。`auto-fill` 的语义是"能放几列就放几列"，
+ * 于是**列数由浏览器按窗口宽度自己决定，用户选的值根本没有约束力** ——
+ * 窗口一宽就会自己多排一列（选 4 部排出 5、6 部）。
+ *
+ * 为什么不是"写成 CSS 变量再 repeat(var(--x), …)"：`repeat()` 的第一个参数**只能是整数**，
+ * 一旦包上 min()/calc() 就不再是字面量整数，整条声明会被浏览器丢弃
+ * （列表会塌成单列）。所以列数必须由样式表写成字面量，这里只负责挂类名。
+ * 这条约束有静态守卫：`scripts/verify.ts` 会检查 styles.css 里每个 repeat() 的首参。
+ *
+ * 窄屏降档（1500px→最多 5 列 / 1100px→3 列 / 760px→2 列 / 420px→1 列）
+ * 由 CSS 的媒体查询负责，见 `web/styles.css` 第 10 节。
  */
 function perRowStyle() {
   const perRow = PER_ROW_OPTIONS.includes(state.perRow) ? state.perRow : PER_ROW_DEFAULT;
-  return `--per-row-w: calc((100% - ${(perRow - 1) * 10}px) / ${perRow});`;
+  return `per-row-${perRow}`;
 }
 
 /**
@@ -790,7 +800,10 @@ function perRowStyle() {
 function refreshSubjectList() {
   const container = $('#subject-list');
   if (container) {
-    container.style.cssText = perRowStyle();
+    // 只重设"每行几部"这个类，不能整体重写 style / class：
+    // 那会把列表上别的状态一起抹掉，也让以后新增的类莫名失效。
+    container.classList.remove('per-row-3', 'per-row-4', 'per-row-5', 'per-row-6', 'per-row-7');
+    container.classList.add(perRowStyle());
     container.innerHTML = subjectListHtml();
   }
   const shown = $('#subject-count');
@@ -847,7 +860,7 @@ function renderSeason() {
 
     <div id="active-filters">${activeFilterChips()}</div>
 
-    <div id="subject-list" class="subject-list" style="${perRowStyle()}">${subjectListHtml()}</div>`;
+    <div id="subject-list" class="subject-list ${perRowStyle()}">${subjectListHtml()}</div>`;
 
   const search = $('#season-search');
   if (search) {
