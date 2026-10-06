@@ -680,8 +680,10 @@ main { padding: 20px 22px 72px; max-width: 2200px; margin: 0 auto; }
 
 /* 面板拆成两个槽（见 app.js 的 renderFilterPanelBody）：
    #filter-panel-head 是搜索框那一层，**常驻**、点筛选时不重绘 —— 重绘它就丢光标；
-   #filter-panel-body 是下面几层，每次点选整体重绘。 */
-#filter-panel-body { display: block; }
+   #filter-panel-body 是下面几层，每次点选整体重绘，收起面板时挂 `hidden`。
+   ⚠ 刻意**不给** #filter-panel-body 写 display —— 那样会盖掉浏览器对 `[hidden]` 的
+   `display:none`（id 选择器比 UA 的 `[hidden]` 优先级高），"收起"就会失效。 */
+#filter-panel-body[hidden] { display: none; }
 
 /* 层与层之间只用一条淡分隔线：这里要的是"一路从上往下收窄"的视觉，不是一个套一个的卡片。
    第 1 层与第 2 层之间那条要单独写 —— 它们的 .filter-layer 不是兄弟节点。 */

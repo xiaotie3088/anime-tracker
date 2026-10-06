@@ -101,6 +101,7 @@ const STATUS_CHIPS = [
 const LS_PER_ROW = 'anime-tracker.perRow';
 const LS_SORT = 'anime-tracker.sort';
 const LS_STATUS_AND = 'anime-tracker.statusAnd';
+const LS_FILTERS_COLLAPSED = 'anime-tracker.filtersCollapsed';
 
 function readStoredNumber(key, options, fallback) {
   const raw = Number(localStorage.getItem(key));
@@ -149,6 +150,13 @@ const state = {
   filters: emptyFilters(),
   /** 第 2 层多个状态 chip 之间：true = 且（同时满足，线上老行为），false = 或（满足任意一个） */
   statusAnd: true,
+  /**
+   * 面板整体收起（只留第 1 层的搜索框 + 那个开关）。
+   *
+   * 收起的是**第 2~5 层**，不是整个面板：搜索框与"显示 N / M 部"留在原地，
+   * 已选条件条本来就在面板外面、也一直可见 —— 所以收起来之后不会出现"不知道被什么筛过"。
+   */
+  filtersCollapsed: false,
   /** 四个折叠栏 + 「显示方式」各自展开着没有（点选后会重绘面板正文，得把展开状态记住） */
   facetsOpen: {},
   sort: 'firstAir',
@@ -751,8 +759,17 @@ function activeFilterChips() {
     </div>`;
 }
 
+/** 现在一共筛了几项（含 + 不含 + 状态）—— 面板开关上的徽标用它，收起时也看得见"我筛了几项"。 */
+function filterConditionCount() {
+  let count = overviewSideFilter().length;
+  for (const dimension of FACET_DIMENSIONS) {
+    count += includedValues(dimension).length + excludedValues(dimension).length;
+  }
+  return count;
+}
+
 /**
- * 面板**第 1 层**：搜索框 + "显示 N / M 部"。
+ * 面板**第 1 层**：搜索框 + 「筛选」开关 + "显示 N / M 部"。
  *
  * ⚠ 这一层是**常驻节点**（`#filter-panel-head`），点筛选时只重绘 `#filter-panel-body`。
  *   票的验收里有一条「搜索框焦点不因点筛选而丢失」—— 线上原来把搜索框放在面板外的工具栏里，
@@ -760,12 +777,21 @@ function activeFilterChips() {
  *   （见 renderFilterPanelBody 与 refreshSubjectList 的老原则）。
  */
 function filterPanelHeadHtml(base) {
+  const count = filterConditionCount();
   return `
     <div class="filter-layer">
       <div class="toolbar">
         <input type="search" id="season-search" placeholder="搜索中文名 / 原名（也可以直接搜别名）" value="${esc(
           state.searchQuery,
         )}" />
+        <button class="btn btn-sm" id="filter-toggle" data-filter-collapse="1"
+          aria-expanded="${state.filtersCollapsed ? 'false' : 'true'}"
+          title="${
+            state.filtersCollapsed ? '展开筛选面板' : '收起筛选面板'
+          }（搜索框留在原地，已选条件也一直在下面看得见）"
+          >筛选${count ? ` <span class="pill">${count}</span>` : ''} ${
+            state.filtersCollapsed ? '▼' : '▲'
+          }</button>
         <span class="hint" id="subject-count">显示 ${applyFilters(base).length} / ${base.length} 部</span>
       </div>
     </div>`;
@@ -1043,6 +1069,8 @@ function refreshSubjectList() {
   }
   const active = $('#active-filters');
   if (active) active.innerHTML = activeFilterChips();
+  // 开关上的徽标（筛了几项）要跟着变；收起时它是"我筛了东西"的唯一可见提示之一
+  syncFilterToggle();
 }
 
 /**
@@ -1065,7 +1093,7 @@ function renderSeason() {
 
     <div class="filter-panel" id="filter-panel">
       <div id="filter-panel-head">${filterPanelHeadHtml(base)}</div>
-      <div id="filter-panel-body">${filterPanelBodyHtml(base)}</div>
+      <div id="filter-panel-body"${state.filtersCollapsed ? ' hidden' : ''}>${filterPanelBodyHtml(base)}</div>
     </div>
 
     <div id="active-filters">${activeFilterChips()}</div>
@@ -1684,6 +1712,8 @@ async function bootstrap() {
   );
   // 第 2 层多个状态之间默认"且"（线上老行为）；用户切过就按记下来的来。
   state.statusAnd = localStorage.getItem(LS_STATUS_AND) !== '0';
+  // 面板收没收起来也记住（收起是"我想看列表"的意思，下次打开不该又铺开）
+  state.filtersCollapsed = localStorage.getItem(LS_FILTERS_COLLAPSED) === '1';
 
   const health = await api('/api/health');
   const current = await api(`/api/overview?season=&sort=${encodeURIComponent(state.sort)}`);
@@ -1753,6 +1783,16 @@ document.addEventListener('click', (event) => {
 
   const dataset = target.dataset;
 
+  // 「筛选」开关：整体展开 / 收起面板正文。**不重绘任何东西**，只切 hidden 与箭头 ——
+  // 见 applyFilterPanelCollapsed 的注释（重绘会丢搜索框焦点）。
+  // ⚠ 必须放在 `const dataset = ...` **之后**：放前面会踩 TDZ（Cannot access 'dataset'
+  //   before initialization），表现就是"点这个按钮抛异常、毫无反应"。
+  if (dataset.filterCollapse) {
+    state.filtersCollapsed = !state.filtersCollapsed;
+    store(LS_FILTERS_COLLAPSED, state.filtersCollapsed ? '1' : '0');
+    applyFilterPanelCollapsed();
+    return;
+  }
   if (dataset.dismissUpdate) {
     target.closest('.card')?.remove();
     return;
@@ -2049,6 +2089,36 @@ async function changeSort(sortKey) {
   } catch (error) {
     setStatus(error.message, 'error');
   }
+}
+
+/**
+ * 面板开关上的箭头与计数徽标。
+ *
+ * 为什么单独一个函数：第 1 层是**常驻节点**、点筛选时不重绘，所以徽标（筛了几项）
+ * 得在这里就地更新；否则收起面板筛完（比如从条件条的 ✕ 取消一项）徽标会一直显示旧数字。
+ */
+function syncFilterToggle() {
+  const toggle = $('#filter-toggle');
+  if (!toggle) return;
+  const count = filterConditionCount();
+  toggle.innerHTML = `筛选${count ? ` <span class="pill">${count}</span>` : ''} ${
+    state.filtersCollapsed ? '▼' : '▲'
+  }`;
+  toggle.setAttribute('aria-expanded', state.filtersCollapsed ? 'false' : 'true');
+  toggle.setAttribute('title', `${state.filtersCollapsed ? '展开' : '收起'}筛选面板（搜索框留在原地，已选条件也一直在下面看得见）`);
+}
+
+/**
+ * 展开 / 收起面板正文。
+ *
+ * 刻意**只切 `#filter-panel-body` 的 hidden**，不调用 renderSeason / 不重绘第 1 层 ——
+ * 重绘就会把搜索框的焦点弄丢（这正是第 1 层常驻的理由），而这个动作本身没有任何
+ * 需要重算的东西。
+ */
+function applyFilterPanelCollapsed() {
+  const body = $('#filter-panel-body');
+  if (body) body.hidden = state.filtersCollapsed;
+  syncFilterToggle();
 }
 
 /**

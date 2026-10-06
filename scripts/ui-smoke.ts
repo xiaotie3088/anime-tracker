@@ -194,9 +194,10 @@ function parseHtml(html: string, parent: El | null): El[] {
       if (attr[1] === 'id') el.id = attr[2] ?? '';
       if (attr[1] === 'class') el.className = attr[2] ?? '';
       if (attr[1] === 'href') el.href = attr[2] ?? '';
-      // 布尔属性：只要出现就算 true（`<details open>` 的属性值是空串，
+      // 布尔属性：只要出现就算 true（`<details open>` / `<div hidden>` 的属性值是空串，
       // 不能按"值是否非空"来判断 —— 真实浏览器就是这么认的）
       if (attr[1] === 'open') el.open = true;
+      if (attr[1] === 'hidden') el.hidden = true;
       if (attr[1].startsWith('data-')) {
         const key = attr[1].slice(5).replace(/-([a-z])/g, (_, c: string) => c.toUpperCase());
         el.dataset[key] = attr[2] ?? '';
@@ -376,6 +377,9 @@ const rowCountNow = () => appEl.querySelectorAll('.subject-row').length;
 const findChip = (attr: string, value: string) =>
   appEl.querySelectorAll('button').find((b) => b.attrs[attr] === value);
 
+/** 条件条里的按钮（壳的 matches() 不解析后代选择器，所以按 closest 过滤）。 */
+const barChips = () => appEl.querySelectorAll('button').filter((b) => Boolean(b.closest('#active-filters')));
+
 /**
  * 把筛选条件清空并重绘。
  *
@@ -398,7 +402,8 @@ console.log('\n【A】面板常显：搜索框是第 1 层，不再有「筛选 
 resetFilters();
 const panelBefore = appEl.querySelector('#filter-panel');
 ok('面板渲染出来了（常显，不需要先点开关）', Boolean(panelBefore));
-ok('不再有「筛选 / 排序」按钮（已按票删掉）', !appEl.querySelector('#filter-toggle'));
+// 老实现用 state.filtersOpen 决定"面板存不存在"；现在面板一定在，只有正文可收起（见 A3）
+ok('面板不再受 filtersOpen 控制（state.filtersOpen 已删掉）', !('filtersOpen' in state));
 const headSlot = appEl.querySelector('#filter-panel-head');
 const bodySlot = appEl.querySelector('#filter-panel-body');
 ok('面板拆成 第 1 层 / 第 2~5 层 两个槽', Boolean(headSlot) && Boolean(bodySlot));
@@ -417,6 +422,42 @@ findChip('data-toggle-value', 'TV')?.click();
 ok('点完之后第 1 层还是同一个搜索框节点（没被换掉 = 光标不会丢）', appEl.querySelector('#season-search') === searchNodeBefore);
 ok('第 1 层的 HTML 没被重写', (appEl.querySelector('#filter-panel-head')?.innerHTML ?? '') === headHtmlBefore);
 ok('第 2~5 层确实重绘了（高亮/部数要跟着变）', (appEl.querySelector('#filter-panel-body')?.innerHTML ?? '') !== bodyHtmlBefore);
+
+console.log('\n【A3】「筛选」开关：整体收起 / 展开面板（第 1 层常驻，收起也不丢搜索框）');
+resetFilters();
+state.filtersCollapsed = false;
+app.renderSeason();
+const collapseBtn = () => findChip('data-filter-collapse', '1');
+ok('开关渲染出来了', Boolean(collapseBtn()), `文本=${collapseBtn()?.innerHTML.trim() ?? '(没有)'}`);
+ok('初始是展开：正文没挂 hidden', appEl.querySelector('#filter-panel-body')?.hidden === false);
+ok('初始 aria-expanded=true', collapseBtn()?.attrs['aria-expanded'] === 'true');
+const searchNodeBeforeCollapse = appEl.querySelector('#season-search');
+collapseBtn()?.click();
+ok('点一下：state.filtersCollapsed 变 true', state.filtersCollapsed === true);
+ok('正文被挂上 hidden（真的收起了）', appEl.querySelector('#filter-panel-body')?.hidden === true);
+ok('箭头变成 ▼', (collapseBtn()?.innerHTML ?? '').includes('▼'));
+ok('收起**不重绘**第 1 层（搜索框还是同一个节点）', appEl.querySelector('#season-search') === searchNodeBeforeCollapse);
+ok('收起状态记进 localStorage', store.get('anime-tracker.filtersCollapsed') === '1');
+// 收起之后仍然看得见"被什么筛过"：条件条在面板外面，一直在
+findChip('data-toggle-value', 'Action')?.click();
+ok(
+  '收起时条件条仍然显示已选条件（不会"不知道被什么筛过"）',
+  barChips().some((b) => b.attrs['data-clear-value'] === 'Action'),
+);
+ok('收起时开关上有计数徽标', (collapseBtn()?.querySelector('.pill')?.textContent ?? '') === '1');
+collapseBtn()?.click();
+ok('再点一下恢复展开', state.filtersCollapsed === false && appEl.querySelector('#filter-panel-body')?.hidden === false);
+// 整块重绘（例如切排序）之后，收起来的状态要还在
+collapseBtn()?.click();
+app.renderSeason();
+ok(
+  '整块重绘后仍然保持收起（并渲染出 aria-expanded=false）',
+  appEl.querySelector('#filter-panel-body')?.hidden === true && collapseBtn()?.attrs['aria-expanded'] === 'false',
+);
+collapseBtn()?.click();
+resetFilters();
+state.filtersCollapsed = false;
+app.renderSeason();
 
 console.log('\n【B】逐个点各类筛选块，看哪一类没反应');
 const cases: { label: string; attr: string; value: string; expectChange: boolean }[] = [
@@ -529,8 +570,6 @@ ok('排除是跨维度的（TV 那条约束也还在）', vetoKeys.every((key) =
 console.log('\n【B4】条件条：含与不含分开显示，都能单独取消');
 resetFilters();
 const filtersOf = () => state.filters as Record<string, { include: string[]; exclude: string[] }>;
-/** 条件条里的按钮（壳的 matches() 不解析后代选择器，所以按 closest 过滤）。 */
-const barChips = () => appEl.querySelectorAll('button').filter((b) => Boolean(b.closest('#active-filters')));
 findChip('data-toggle-value', 'Fantasy')?.click();
 findChip('data-toggle-value', 'Hentai')?.click();
 findChip('data-toggle-value', 'Hentai')?.click(); // → 不含
