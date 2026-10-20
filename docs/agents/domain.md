@@ -4,21 +4,21 @@
 
 ## 探索之前先读这些
 
-- 仓库根的 **`GLOSSARY.md`**
+- 仓库根的 **`CONTEXT.md`**
 - **`docs/adr/`**：读与即将改动的区域相关的 ADR
 
 本仓库是 **single-context**（无 `pnpm-workspace.yaml`、无 workspaces、无多包结构），
-所以不存在 `GLOSSARY-MAP.md`，也不需要读各子上下文的 `GLOSSARY.md`。
+所以不存在 `CONTEXT-MAP.md`，也不需要读各子上下文的 `CONTEXT.md`。
 
 上述文件**目前尚不存在**。按技能约定：不存在就**静默跳过**，不要提醒缺失、
-也不要一上来就催着创建。`GLOSSARY.md` 与 `docs/adr/` 由 `/domain-modeling`
-（经 `/grill-with-docs`、`/improve-codebase-architecture` 抵达）在术语或决策真正定下时**惰性创建**。
+也不要一上来就催着创建。`CONTEXT.md` 与 `docs/adr/` 由 `domain-modeling`
+（经 `grill-with-docs`、`improve-codebase-architecture` 抵达）在术语或决策真正定下时**惰性创建**。
 
 ## 文件结构
 
 ```
 /
-├── GLOSSARY.md          ← 术语表（待惰性创建）
+├── CONTEXT.md          ← 术语表（待惰性创建）
 ├── docs/
 │   ├── adr/             ← 架构决策记录（待惰性创建）
 │   │   └── 0001-<slug>.md
@@ -31,7 +31,7 @@
 ## 术语表优先
 
 当输出里要命名一个领域概念（issue 标题、重构提案、假设、测试名）时，
-使用 `GLOSSARY.md` 里定义的词，不要漂移到术语表明确回避的同义词。
+使用 `CONTEXT.md` 里定义的词，不要漂移到术语表明确回避的同义词。
 
 本仓库已经有若干**必须叫准**的词，改代码前先确认你用的是哪一个口径：
 
@@ -42,7 +42,7 @@
 - **源有分歧** / **手动修正**：详情卡上的来源标注
 
 若需要的概念不在术语表里，这本身是个信号：要么你在发明项目不用的说法（重新考虑），
-要么确实存在缺口（记下来交给 `/domain-modeling`）。
+要么确实存在缺口（记下来交给 `domain-modeling`）。
 
 ## ADR 冲突要显式提出
 

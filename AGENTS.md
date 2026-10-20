@@ -1,4 +1,4 @@
-# anime-tracker 项目规则
+# 项目规则
 
 ## 输出语言
 
@@ -8,7 +8,7 @@
 ## 动手之前必读
 
 `docs/交接说明-第四轮.md` 是自包含的最新交接（含全部硬约束、现状、坑与待办）。
-文件名虽写「第四轮」，但内容已经合并了第五、六轮，**只要读这一份就够**。
+文件名虽写「第四轮」，但内容已经合并到第七轮，**只要读这一份就够**。
 需要更深背景时再看 `README.md`、`docs/决策记录.md`（决策记录）、`docs/sources.md`（数据源实测）。
 
 硬约束（违反会静默出问题，详见交接文档）：
@@ -23,14 +23,17 @@
 - 改了 `src/` 必须**重启服务**才生效；`web/` 是静态文件，刷新页面即可。
 - 改样式只能用 `web/styles.css` 里的**设计令牌**，不要在组件里写死色值（主题是跟随系统的双主题）。
 
-改动后的验收标准（四条必须全绿）：
+改动后的验收标准：
 
 ```powershell
 pnpm exec tsc --noEmit        # 0 错误
-pnpm verify                   # 102 项，离线，不需要联网
-pnpm verify:api               # 28 项，需先启动服务；会真实打源站与翻译接口
+pnpm verify                   # 129 项，离线，不需要联网
+pnpm verify:api               # 28 项，需先启动服务；会真实写库（当前 2 项既有失败，见交接文档第八节）
 pnpm ui:smoke                 # 前端交互，需服务已启动
 ```
+
+跑完 `verify:api` 要按交接文档第六节清理测试数据（删两条测试追番 + ack 变更），
+否则用户界面会留下测试番与未读变更。
 
 `data/anime.db` 里是用户真实在用的追番与进度数据，**不要为了测试去动它**。
 
@@ -46,4 +49,4 @@ issue 与 spec 以本地 markdown 存放在 `.scratch/`，一个功能一个目�
 
 ### Domain docs
 
-single-context：仓库根一份 `GLOSSARY.md` 加 `docs/adr/`。详见 `docs/agents/domain.md`。
+single-context：仓库根一份 `CONTEXT.md` 加 `docs/adr/`。详见 `docs/agents/domain.md`。

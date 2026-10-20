@@ -19,5 +19,11 @@ data/*.md
 *.log
 .DS_Store
 .venv/
+# UI 改版的探索产物（候选页 / 对比页 / 截图取证）：只是设计过程留痕，服务只托管 web/，
+# 缺了不影响运行。style-explorer.html 单文件 11MB 且内嵌海报，推上去会永久占 Git 历史。
+# 设计结论已写进 docs/ui-redesign.md，这里只留本地。
+style-explorer.html
+explore/
+shots/
 # 工程技能的本地状态：issue / spec / 分诊记录都在这里，默认不入库（想版本化就删掉这行）
 .scratch/

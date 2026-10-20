@@ -55,6 +55,22 @@ function mediaTypeLabel(mediaType) {
   return MEDIA_TYPE_CN[mediaType] ?? mediaType;
 }
 
+/**
+ * 我的追番的四个分类（顺序就是下拉框里的顺序，也是「从在用 → 归档」的顺序）。
+ *
+ * ⚠ 这四个值与 `src/core/types.ts` 的 `TRACK_CATEGORIES` 必须一致；
+ *   `PATCH /api/my/:key` 只接受这四个（服务端会白名单校验）。
+ */
+const MY_CATEGORY_LABELS = { tracking: '追番中', backlog: '补番库', finished: '已看完', dropped: '已弃番' };
+const MY_CATEGORY_ORDER = ['tracking', 'backlog', 'finished', 'dropped'];
+
+/** 服务端的 status 原值是英文（airing / upcoming / finished），界面上统一说中文。 */
+const STATUS_CN = { airing: '放送中', upcoming: '未开播', finished: '已完结' };
+
+function statusLabel(value) {
+  return STATUS_CN[value] ?? String(value ?? '—');
+}
+
 /** 总览列表的排序口径（与服务端 resolveSeasonSort 的白名单一致）。 */
 const SORT_OPTIONS = [
   { key: 'firstAir', label: '首集放送时间（早→晚）' },
@@ -102,6 +118,10 @@ const LS_PER_ROW = 'anime-tracker.perRow';
 const LS_SORT = 'anime-tracker.sort';
 const LS_STATUS_AND = 'anime-tracker.statusAnd';
 const LS_FILTERS_COLLAPSED = 'anime-tracker.filtersCollapsed';
+const LS_THEME = 'anime-tracker.theme';
+
+const THEME_OPTIONS = ['auto', 'light', 'dark'];
+const THEME_LABELS = { auto: '跟随系统', light: '浅色', dark: '深色' };
 
 function readStoredNumber(key, options, fallback) {
   const raw = Number(localStorage.getItem(key));
@@ -119,6 +139,37 @@ function store(key, value) {
   } catch {
     /* 隐私模式下写不了 localStorage，忽略即可（只是记不住偏好） */
   }
+}
+
+/**
+ * 把主题偏好落到 `<html>` 上：
+ * - auto：两个 class 都不加，交给 `prefers-color-scheme`；
+ * - light / dark：加 `.theme-light` / `.theme-dark`，覆盖系统偏好。
+ *
+ * 测试壳里没有 documentElement，退回 body（样式表里 `.theme-light` / `.theme-dark`
+ * 本来就同时认根元素和任意容器）。
+ */
+function applyTheme(theme = state.theme) {
+  const root = document.documentElement ?? document.body;
+  if (root?.classList) {
+    root.classList.toggle('theme-light', theme === 'light');
+    root.classList.toggle('theme-dark', theme === 'dark');
+  }
+  for (const button of $$('[data-theme]')) {
+    const active = button.dataset.theme === theme;
+    button.classList.toggle('is-active', active);
+    button.setAttribute('aria-pressed', active ? 'true' : 'false');
+  }
+}
+
+/** 选主题：立刻换、记住、关掉「更多」，再给一句确认。 */
+function setTheme(theme) {
+  if (!THEME_OPTIONS.includes(theme)) return;
+  state.theme = theme;
+  store(LS_THEME, theme);
+  applyTheme(theme);
+  closeMoreMenu();
+  toast(`主题：${THEME_LABELS[theme]}${theme === 'auto' ? '' : '（已记住）'}`);
 }
 
 /**
@@ -141,6 +192,8 @@ const state = {
   /** 同时选中的季度（多选，第一个是主季 —— 周视图 / .ics 用它） */
   selectedSeasons: [],
   rule: 'clock',
+  /** 主题：auto = 跟随系统；light / dark = 强制某一套（「更多」菜单里切换） */
+  theme: 'auto',
   offset: 0,
   myCategory: 'tracking',
   overview: null,
@@ -155,8 +208,11 @@ const state = {
    *
    * 收起的是**第 2~5 层**，不是整个面板：搜索框与"显示 N / M 部"留在原地，
    * 已选条件条本来就在面板外面、也一直可见 —— 所以收起来之后不会出现"不知道被什么筛过"。
+   *
+   * 总览的第一眼应该是番剧列表，不是五个筛选栏，所以**默认收起**；
+   * 用户展开过一次就记住（localStorage 里 '0' = 展开）。
    */
-  filtersCollapsed: false,
+  filtersCollapsed: true,
   /** 四个折叠栏 + 「显示方式」各自展开着没有（点选后会重绘面板正文，得把展开状态记住） */
   facetsOpen: {},
   sort: 'firstAir',
@@ -236,6 +292,17 @@ function formatCn(iso) {
   return `${d.toISOString().slice(5, 10)} ${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
 }
 
+/**
+ * 分集时刻：源站只给日期时（落到 00:00），不要把它伪装成精确的午夜档。
+ * 这是详情弹窗里「三个时间」最容易让人误判的地方，所以明确写成「（日期）」。
+ */
+function episodeAirLabel(iso) {
+  const text = formatJst(iso);
+  if (text === '—') return '—';
+  const [, time] = text.split(' ');
+  return time === '00:00' ? `${text.split(' ')[0]}（日期）` : text;
+}
+
 function humanDuration(ms) {
   const abs = Math.abs(ms);
   const minute = 60_000;
@@ -253,7 +320,8 @@ function humanDuration(ms) {
 function countdownText(iso) {
   if (!iso) return '';
   const diff = Date.parse(iso) - Date.now();
-  return diff > 0 ? `${humanDuration(diff)}后` : '已更新';
+  // 「已播出」而不是「已更新」：旁边就是「已看 0 / 12」，写成「已更新」会被读成「已看完」。
+  return diff > 0 ? `${humanDuration(diff)}后` : '已播出';
 }
 
 function isPast(iso) {
@@ -288,6 +356,29 @@ function renderWeekLoading() {
   $('#app').innerHTML = '<div class="loading">正在加载本周安排…</div>';
 }
 
+/** 周卡片上的短倒计时：`2 天后` / `3 小时后` / `已更新`。 */
+function shortCountdownText(iso) {
+  if (!iso) return '';
+  const diff = Date.parse(iso) - Date.now();
+  if (!Number.isFinite(diff) || diff <= 0) return '已播出';
+  const day = 86_400_000;
+  if (diff >= day) return `${Math.floor(diff / day)} 天后`;
+  const hour = 3_600_000;
+  if (diff >= hour) return `${Math.floor(diff / hour)} 小时后`;
+  return `${Math.max(1, Math.floor(diff / 60_000))} 分钟后`;
+}
+
+/** 下一集横条上的大号倒计时：拆成数值与单位，数值给等宽大字。 */
+function countdownParts(iso) {
+  const diff = Date.parse(iso) - Date.now();
+  if (!Number.isFinite(diff) || diff <= 0) return { value: '已', unit: '更新' };
+  const day = 86_400_000;
+  if (diff >= day) return { value: String(Math.floor(diff / day)), unit: '天后' };
+  const hour = 3_600_000;
+  if (diff >= hour) return { value: String(Math.floor(diff / hour)), unit: '小时后' };
+  return { value: String(Math.max(1, Math.floor(diff / 60_000))), unit: '分钟后' };
+}
+
 function weekCard(item) {
   const past = isPast(item.airAtUtc);
   const tags = [];
@@ -299,18 +390,61 @@ function weekCard(item) {
   if (item.conflicting) tags.push('<span class="tag tag-warn">源有分歧</span>');
 
   return `
-    <div class="ep-card${past ? ' is-past' : ''}" data-key="${esc(item.subjectKey)}">
+    <article class="ep-card${past ? ' is-past' : ''}" data-key="${esc(item.subjectKey)}">
       ${coverHtml(item.coverUrl, 'ep-cover')}
       <div class="ep-main">
-        <div class="ep-title">${esc(subjectTitle(item))}</div>
-        <div class="ep-sub">第 ${esc(item.epNumber)} 话${
-          item.totalEps ? ` / 共 ${esc(item.totalEps)}` : ''
-        } · 已看 ${esc(item.watchedEps ?? 0)}</div>
-        <div class="ep-time">放送 ${esc(formatJst(item.airAtUtc))}</div>
-        <div class="ep-count" data-countdown="${esc(item.airAtUtc ?? '')}">${esc(countdownText(item.airAtUtc))}</div>
+        <div class="ep-title">${copyableTitle(item, subjectTitle(item))}</div>
+        <div class="ep-sub">第 ${esc(item.epNumber)} 话 · ${esc(item.watchedEps ?? 0)}/${
+          item.totalEps ? esc(item.totalEps) : '?'
+        }</div>
         ${tags.length ? `<div class="ep-tags">${tags.join('')}</div>` : ''}
       </div>
-    </div>`;
+      <div class="ep-side">
+        <span class="ep-time">${esc(formatJst(item.airAtUtc).replace(/^周. /, ''))}<small>JST</small></span>
+        <span class="ep-count${past ? ' is-past' : ''}" data-countdown="${esc(item.airAtUtc ?? '')}" data-compact="1" title="${esc(
+          countdownText(item.airAtUtc),
+        )}">${esc(shortCountdownText(item.airAtUtc))}</span>
+      </div>
+    </article>`;
+}
+
+/** 下一集横条：每天打开时唯一必看的信息，放在周板上面。 */
+function nextBandHtml(item) {
+  const parts = countdownParts(item.airAtUtc);
+  const watched = Number(item.watchedEps ?? 0);
+  const total = Number(item.totalEps ?? 0);
+  return `
+    <section class="next-band">
+      <div class="next-label"><span class="dot"></span>下一集</div>
+      <div class="next-main">
+        <h2 class="next-title">${copyableTitle(item, subjectTitle(item))}<small>第 ${esc(item.epNumber)} 话</small></h2>
+        <div class="next-meta">${esc(formatJst(item.airAtUtc))} · 共 ${total || '?'} 话 · <span class="nowrap">看到 ${watched} / ${
+          total || '?'
+        }</span></div>
+      </div>
+      <div class="next-count" data-next-count="${esc(item.airAtUtc ?? '')}">
+        <strong>${esc(parts.value)}</strong><span>${esc(parts.unit)}</span>
+        <em>${esc(formatJst(item.airAtUtc))}</em>
+      </div>
+    </section>`;
+}
+
+/** 周板里的一列：有番的按集数分宽度（一集也至少占 1.5 份，别挤成一条），没番的压成竖条。 */
+function weekDayColumn(day) {
+  const count = day.items.length;
+  const weight = count > 0 ? count + 0.5 : 1;
+  return `
+    <section class="day-col${day.isToday ? ' is-today' : ''}${count ? '' : ' is-empty'}" style="--w:${weight}">
+      <header class="day-col-head">
+        <span class="wd">${esc(day.weekdayLabel)}</span>
+        <span class="dt">${esc(String(day.dateJst).slice(5))}</span>
+        <span class="n">${count ? `${count} 集` : '—'}</span>
+        <span class="empty-inline">无更新</span>
+      </header>
+      <div class="day-col-body">
+        ${count ? day.items.map(weekCard).join('') : '<span class="empty-word">无更新</span>'}
+      </div>
+    </section>`;
 }
 
 async function renderWeek() {
@@ -318,58 +452,52 @@ async function renderWeek() {
   const data = await api(`/api/week?season=${encodeURIComponent(state.season)}&rule=${state.rule}&offset=${state.offset}`);
 
   const weekTotal = data.days.reduce((sum, day) => sum + day.items.length, 0);
+  const nextItem = data.upcoming[0] ?? null;
 
   const upcomingHtml = data.upcoming.length
-    ? `<div class="card dist upcoming">
-         <h3 class="section-title">接下来要更新的</h3>
-         ${data.upcoming
-           .map(
-             (item) => `
-           <div class="bar-row upcoming-row">
-             <span class="name is-strong">${esc(subjectTitle(item))} 第${esc(item.epNumber)}话</span>
-             <span class="num">${esc(formatJst(item.airAtUtc))}</span>
-             <span class="num is-accent" data-countdown="${esc(item.airAtUtc ?? '')}">${esc(
-               countdownText(item.airAtUtc),
-             )}</span>
-           </div>`,
-           )
-           .join('')}
-       </div>`
+    ? `<section class="upcoming-panel">
+         <div class="panel-head">
+           <h3>接下来要更新的</h3>
+           <span class="n">${data.upcoming.length} 集</span>
+           <span class="more">按时间先后</span>
+         </div>
+         <div class="upcoming-list">
+           ${data.upcoming
+             .map(
+               (item) => `
+             <div class="upcoming-row">
+               <span class="name">${copyableTitle(item, subjectTitle(item))} 第${esc(item.epNumber)}话</span>
+               <span class="num">${esc(formatJst(item.airAtUtc))}</span>
+               <span class="num is-accent" data-countdown="${esc(item.airAtUtc ?? '')}">${esc(
+                 countdownText(item.airAtUtc),
+               )}</span>
+             </div>`,
+             )
+             .join('')}
+         </div>
+       </section>`
     : '';
 
-  // ⚠ 顺序是刻意的（第五轮需求 1）：用户主要看的是下面这排「周一~周日」的格子，
-  //   所以周格子必须在最上面，「接下来要更新的」倒计时列表挪到它下面。
   $('#app').innerHTML = `
-    <div class="week-nav">
-      <button class="btn btn-sm" data-week-offset="-1">‹ 上一周</button>
-      <button class="btn btn-sm" data-week-offset="0">本周</button>
-      <button class="btn btn-sm" data-week-offset="1">下一周 ›</button>
-      <span class="range">${esc(data.week.startDateJst)} ~ ${esc(data.week.endDateJst)}</span>
-      <span class="hint">共 ${weekTotal} 集 · 归属口径：${
+    ${nextItem ? nextBandHtml(nextItem) : ''}
+    <div class="week-toolbar">
+      <div class="week-nav">
+        <button class="btn btn-sm" data-week-offset="-1" title="上一周">‹ 上一周</button>
+        <button class="btn btn-sm" data-week-offset="0">本周</button>
+        <button class="btn btn-sm" data-week-offset="1" title="下一周">下一周 ›</button>
+      </div>
+      <span class="week-range">${esc(data.week.startDateJst)} — ${esc(data.week.endDateJst)}</span>
+      <span class="week-meta">共 ${weekTotal} 集 · ${
         data.rule === 'clock' ? '真实钟点' : '日本放送日历'
-      }（可切换）</span>
+      } · 双击番名复制</span>
     </div>
-    <div class="week-grid">
-      ${data.days
-        .map(
-          (day) => `
-        <div class="day-col card${day.isToday ? ' is-today' : ''}">
-          <div class="day-head">
-            <span class="wd">${esc(day.weekdayLabel)}</span>
-            <span class="dt">${esc(String(day.dateJst).slice(5))} · ${day.items.length} 集</span>
-          </div>
-          <div class="day-body">
-            ${day.items.length ? day.items.map(weekCard).join('') : '<div class="empty day-empty">—</div>'}
-          </div>
-        </div>`,
-        )
-        .join('')}
+    <div class="week-board">
+      ${data.days.map(weekDayColumn).join('')}
     </div>
     ${
       weekTotal === 0
         ? `<div class="empty">这一周没有你追的番更新。<br />
-             如果是第一次用，先去「全季总览」或「搜索 / 加番」把要追的番加进来；
-             也可以点右上角「更新数据」抓取当季清单并回填历史季度。</div>`
+             点右上角「更新数据」抓取当季清单，再在「全季总览」里点「追番」加入。</div>`
         : ''
     }
     ${upcomingHtml}`;
@@ -394,44 +522,51 @@ function subjectRow(item) {
   const weekday = item.broadcastWeekdayJst === null ? null : WEEKDAYS[item.broadcastWeekdayJst];
   const platforms = [...new Set(item.platforms.map((p) => p.name))];
   const genres = [...new Set(item.genres)];
+  const when = weekday
+    ? `${weekday}${item.broadcastTimeJst ? ` ${item.broadcastTimeJst}` : ''}`
+    : item.firstAirAtUtc
+      ? `首播 ${formatJst(item.firstAirAtUtc)}`
+      : '';
+  // 列表里只给「够用」的信息：类型、集数、放送、一个平台、前两个标签。
+  // 其余标签与制作公司都收进详情弹窗 —— 一屏 126 部时，标签墙比信息更吵。
+  const genreText = genres.slice(0, 2).map(genreLabel).join(' · ');
+  const extraGenres = genres.length - 2;
 
   return `
     <div class="subject-row" data-key="${esc(item.key)}" data-subject-row="1"${cardClickAttrs()}>
-      ${coverHtml(item.coverUrl, 'cover')}
-      <div class="info">
-        <div class="t-cn">${esc(item.titleCn ?? '（无中文名）')} ${machineTag(item.titleCnSource)} ${inList}${copyNameHtml(
-          item,
-        )}</div>
-        <div class="t-orig">${esc(item.titleOriginal ?? '')}</div>
-        <div class="meta">
-          <span class="tag">${esc(mediaTypeLabel(item.mediaType))}</span>
-          ${item.totalEps ? `<span class="tag">${esc(item.totalEps)} 话</span>` : '<span class="tag tag-warn">集数未知</span>'}
-          ${
-            item.firstAirAtUtc
-              ? `<span class="tag" title="首集放送时刻（JST），列表默认就按这个排">首播 ${esc(
-                  formatJst(item.firstAirAtUtc),
-                )}</span>`
-              : ''
-          }
-          ${weekday ? `<span class="tag">${esc(weekday)} ${esc(item.broadcastTimeJst ?? '')}</span>` : ''}
-          ${genres
-            .map(
-              (genre) =>
-                `<span class="tag" title="原始标签：${esc(genre)}">${esc(genreLabel(genre))}</span>`,
-            )
-            .join('')}
-          ${platforms.map((name) => `<span class="tag tag-ok">${esc(name)}</span>`).join('')}
+      <div class="row-body">
+        ${coverHtml(item.coverUrl, 'cover')}
+        <div class="info">
+          <div class="row-top">
+            <div class="t-cn">${item.titleCn ? copySpan(item.titleCn) : '（无中文名）'}</div>
+            ${machineTag(item.titleCnSource)}
+            ${inList}
+          </div>
+          <div class="t-orig">${copySpan(item.titleOriginal)}</div>
+          <div class="meta">
+            <span class="tag">${esc(mediaTypeLabel(item.mediaType))}</span>
+            ${
+              item.totalEps
+                ? `<span class="tag">${esc(item.totalEps)} 话</span>`
+                : '<span class="tag tag-warn">集数未知</span>'
+            }
+            ${when ? `<span class="tag">${esc(when)}</span>` : ''}
+            ${platforms.slice(0, 1).map((name) => `<span class="tag tag-ok">${esc(name)}</span>`).join('')}
+          </div>
         </div>
       </div>
-      <div class="actions">
-        ${
-          item.myCategory
-            ? `<button class="btn btn-sm btn-danger" data-remove="${esc(item.key)}">移除</button>`
-            : // 追番 / 补番两个按钮：总得先看看是什么番、什么时候放，再决定追还是补 ——
-              // 想看详情**点整张卡片**即可（原来这里还有个「详情」按钮，已按需求去掉）
-              `<button class="btn btn-sm btn-primary" data-add="${esc(item.key)}" data-category="tracking">追番</button>
-               <button class="btn btn-sm" data-add="${esc(item.key)}" data-category="backlog">补番</button>`
-        }
+      <div class="row-foot">
+        <span class="genre-line">${esc(genreText)}${extraGenres > 0 ? ` +${extraGenres}` : ''}</span>
+        <div class="actions">
+          ${
+            item.myCategory
+              ? `<button class="btn btn-sm btn-danger" data-remove="${esc(item.key)}">移除</button>`
+              : // 追番 / 补番两个按钮：总得先看看是什么番、什么时候放，再决定追还是补 ——
+                // 想看详情**点整张卡片**即可（原来这里还有个「详情」按钮，已按需求去掉）
+                `<button class="btn btn-sm btn-primary" data-add="${esc(item.key)}" data-category="tracking">追番</button>
+                 <button class="btn btn-sm" data-add="${esc(item.key)}" data-category="backlog">补番</button>`
+          }
+        </div>
       </div>
     </div>`;
 }
@@ -448,29 +583,30 @@ function cardClickAttrs() {
 }
 
 /**
- * 复制用的名字：**优先只给中文名**，没有中文名时才退回日文原名。
+ * 番剧名的「可双击复制」外壳。
  *
- * 为什么不把"中文名 + 原名"拼起来：用户复制是为了**拿去别处搜这部番**
- * （Bing / 番剧站）。搜索引擎会把整串当成一个短语，混了两种语言的查询通常一条也匹配不到，
- * 用户还得手动删掉一半 —— 比只给一个名字更差。贴回本页搜索框虽然能命中
- * （前端是 `includes` 匹配），但那不是这个按钮的主场景。
+ * 为什么不再用一个独立的「复制」按钮：用户要的是**双击名字**就复制（见
+ * `.scratch/my-view-interactions/spec.md`）。好处是周视图、我的追番这些没有按钮栏的地方
+ * 也能有同一条操作，而且复制的内容就是眼睛盯着的那串字。
+ *
+ * 为什么中文名与原名**各自**包一层：双击中文名复制中文名（拿去国内站搜），
+ * 双击日文原名复制原名（拿去日文站 / AniList 搜）—— 比老按钮"永远只给中文名"更灵活。
+ * 不要拼成"中文名 + 原名"：搜索引擎会把整串当一个短语，混语言的查询通常一条也搜不到。
+ *
+ * `data-copy-title` 同时是点击委托的"别往下走"标记：单击标题不能打开详情，
+ * 否则双击的第一下就弹窗，第二下落在遮罩上，复制根本不会发生。
  */
-function copyTextFor(item) {
-  const cn = String(item.titleCn ?? '').trim();
-  if (cn) return cn;
-  return String(item.titleOriginal ?? '').trim();
+function copySpan(text) {
+  const value = String(text ?? '').trim();
+  if (!value) return '';
+  return `<span class="copy-title" data-copy-title="1" title="双击复制：${esc(
+    value,
+  )}">${esc(value)}</span>`;
 }
 
-/**
- * 「复制番剧名」按钮。
- *
- * 为什么要带 `data-copy="${key}"`：卡片改成整块可点之后，按钮必须能独立识别出来，
- * 否则点击会冒泡到卡片、连带弹出详情（这是本改动最容易出的 bug）。
- */
-function copyNameHtml(item) {
-  const text = copyTextFor(item);
-  if (!text) return '';
-  return `<button class="copy-name" data-copy="${esc(item.key)}" title="复制番剧名（去找番看的时候直接粘贴）" aria-label="复制番剧名">复制</button>`;
+/** 卡片标题：有中文名/原名就包成可复制的，什么都没有才退回纯文本占位。 */
+function copyableTitle(item, fallback = '') {
+  return copySpan(item.titleCn) || copySpan(item.titleOriginal) || esc(fallback);
 }
 
 /**
@@ -510,14 +646,15 @@ async function copyTextToClipboard(text) {
   return false;
 }
 
-/** 点卡片上的「复制」：复制番剧名，方便去别处搜这部番。 */
-async function copySubjectTitle(key) {
-  const item = (state.overview?.subjects ?? []).find((entry) => entry.key === key);
-  const text = item ? copyTextFor(item) : '';
-  if (!text) {
-    toast('这部番还没有名字可以复制', true);
-    return;
-  }
+/**
+ * 双击（或键盘 Ctrl+C）时复制某个 `[data-copy-title]` 里的文字。
+ *
+ * 文本直接从元素 `textContent` 取，而不是再查一遍数据：这样周视图 / 我的追番 / 总览
+ * 三处都走同一条路径，也不用让每个视图都往 data 里塞一份名字。
+ */
+async function copyTitleFromElement(el) {
+  const text = String(el?.textContent ?? '').trim();
+  if (!text) return;
   if (await copyTextToClipboard(text)) toast(`已复制：${text}`);
 }
 
@@ -816,8 +953,7 @@ function filterPanelBodyHtml(base) {
     ${filterFacetsLayerHtml(base)}
     ${filterDisplayLayerHtml()}
     <div class="filter-note">
-      同一维度里选多个「含」= 满足任意一个；不同维度之间 = 同时满足；标了「不含」的只要命中就整条丢掉。
-      选项右边的部数按「搜索框 + 状态」这个固定基数算，不随这里的筛选跳动。
+      同栏多选 = 并集，跨栏 = 交集；标「⊘ 不含」的一票否决。部数按「搜索 + 状态」固定基数算。
     </div>`;
 }
 
@@ -1007,18 +1143,18 @@ function seasonLibraryNotice(overview) {
 
   const isMulti = selected.length > 1;
   return `
-    <div class="card dist card-block">
-      <h3 class="section-title">库里已有的季度（可多选，历史数据会一直保留）</h3>
-      <p class="muted">
-        点季度标签可以<b>同时选多个</b>，下面的番剧列表就是这几季的合集（共 <b>${
-          overview.totals.all
-        }</b> 部），分布与筛选也一起算。
-        同步只写入当季，<b>从不删除</b>任何历史季度 —— 过季的番仍然在库里，随时可以切过去回看。
-        想让更早的季度也进库，点右上角「更新数据」，它会增量回填最近几个季度。
-        ${isMulti ? '<br />⚠ 周视图与 .ics 导出按<b>主季</b>（第一个选中的季度）计算。' : ''}
-      </p>
+    <section class="season-bar">
+      <div class="season-bar-head">
+        <h3 class="section-title">库里已有的季度</h3>
+        <span class="season-bar-note">可多选 · 历史不删 · 同步只写当季 · 当前合集 ${overview.totals.all} 部</span>
+      </div>
       <div class="my-tabs">${allButton}${chips}</div>
-    </div>`;
+      ${
+        isMulti
+          ? '<p class="season-warning">⚠ 周视图与 .ics 导出按主季（第一个选中的季度）计算。</p>'
+          : ''
+      }
+    </section>`;
 }
 
 function emptyListHtml() {
@@ -1121,10 +1257,140 @@ function renderSeason() {
 // 视图：我的追番 / 补番库
 // ---------------------------------------------------------------------------
 
+/** 进度文案：知道总集数才写 `x / y`，不知道就只写 `x`。 */
+function progressLabel(watched, total) {
+  return Number(total) > 0 ? `${watched} / ${total}` : String(watched);
+}
+
+/**
+ * 进度拖动条的量程。
+ *
+ * - 已知总集数：就是总集数；
+ * - 不知道：给一段估算量程 `max(watched + 12, 26)`，至少能往后拖 12 集，也照顾到半年番；
+ * - 两种情况都再与 watched 取 max —— 否则 `<input type="range">` 会把 value **静默截到 max**，
+ *   松手时反而把真实进度写小。原生控件不会告诉我们它截断了，所以只能在这里兜住。
+ */
+function progressMax(item) {
+  const total = Number(item.totalEps ?? 0);
+  const watched = Number(item.watchedEps ?? 0);
+  const base = total > 0 ? total : Math.max(watched + 12, 26);
+  return Math.max(base, watched, 1);
+}
+
+/**
+ * 「0 / 12 旁边那条线」：我的追番里它现在**本身就是拖动条**（原来的 +1 / -1 按钮已去掉）。
+ *
+ * 三件事必须同时成立：
+ *   1. `input` 事件只改视觉（渐变填充 + 数字），**不写库** —— 拖动时每像素发一次 PATCH 是灾难；
+ *   2. `change`（松手 / 键盘方向键结束）才写库，见下面 document 上的 change 监听；
+ *   3. 已看完 / 已弃番只展示静态进度条：归档分类里不需要再改进度，也避免误拖。
+ */
+/**
+ * 进度条底层的「集数刻度」。
+ *
+ * 知道总集数时一格一集（超过 24 格就按比例压到 24 格），补番的人一眼能数出还差几格；
+ * 总集数未知时退回一条连续的量尺，不假装知道集数。
+ */
+function progressTrackHtml(watched, total, max) {
+  if (total > 0) {
+    const slots = Math.min(Math.max(total, 1), 24);
+    const filled = Math.min(slots, Math.max(0, Math.round((watched / total) * slots)));
+    return `<span class="progress-track" aria-hidden="true">${Array.from(
+      { length: slots },
+      (_unused, index) => `<i${index < filled ? ' class="f"' : ''}></i>`,
+    ).join('')}</span>`;
+  }
+  const percent = Math.max(0, Math.min(100, Math.round((watched / max) * 100)));
+  return `<span class="progress-track is-unknown" aria-hidden="true"><span class="progress-fill" style="width:${percent}%"></span></span>`;
+}
+
+function progressHtml(item) {
+  const total = Number(item.totalEps ?? 0);
+  const watched = Number(item.watchedEps ?? 0);
+  const max = progressMax(item);
+  const percent = Math.max(0, Math.min(100, Math.round((watched / max) * 100)));
+  const label = progressLabel(watched, total);
+
+  if (state.myCategory === 'finished' || state.myCategory === 'dropped') {
+    return `<div class="progress-wrap is-static">
+        ${progressTrackHtml(watched, total, max)}
+        <span class="progress-text">${esc(label)}</span>
+      </div>`;
+  }
+
+  return `<div class="progress-wrap">
+      ${progressTrackHtml(watched, total, max)}
+      <input class="progress-range" type="range" min="0" max="${max}" step="1" value="${watched}"
+        data-progress="${esc(item.subjectKey)}" data-progress-max="${max}"
+        data-total-eps="${total}" data-watched-eps="${watched}"
+        style="--progress:${percent}%"
+        aria-valuetext="${esc(label)}${total ? '' : '（总集数未知）'}"
+        title="拖动设置看到第几集（当前 ${esc(label)}${total ? '' : '，总集数未知'}）；松手才保存" />
+      <span class="progress-text">${esc(label)}</span>
+    </div>`;
+}
+
+/**
+ * 分类下拉（追番中 / 补番库 / 已看完 / 已弃番）。
+ *
+ * 这是本轮补上的「移动卡片」入口 —— 之前只有「移到追番 / 移入补番库」两个方向，
+ * 已看完 / 已弃番根本没有入口，尽管 `PATCH /api/my/:key` 早就支持四个分类。
+ *
+ * 为什么用 `<select>` 而不是再加两个按钮：动作栏已经有「详情 / 移除」，纵向按钮越多卡片越高；
+ * 下拉把四个方向收成一处，也顺带能移回来。`data-reload` 给详情弹窗用（改完重拉弹窗内容）。
+ */
+function categorySelectHtml(item, { reload = false } = {}) {
+  const current = item.category ?? 'tracking';
+  const options = MY_CATEGORY_ORDER.map(
+    (key) => `<option value="${key}"${key === current ? ' selected' : ''}>${MY_CATEGORY_LABELS[key]}</option>`,
+  ).join('');
+  return `<select class="move-select" data-move-category="${esc(item.subjectKey)}"
+      data-total-eps="${Number(item.totalEps ?? 0)}" data-watched-eps="${Number(item.watchedEps ?? 0)}"${
+        reload ? ' data-reload="1"' : ''
+      } title="把这部番移到别的分类（已看完 / 已弃番 也在这里）"
+      aria-label="把这部番移到别的分类">${options}</select>`;
+}
+
+/**
+ * 把进度条当前的 `value` 画到渐变填充与数字上（拖动过程中每帧调用，**不写库**）。
+ *
+ * 为什么填充不用 `background-size` 直接写内联 style 字符串：`--progress` 是个 CSS 变量，
+ * 用 `setProperty` 更新最稳（不会把元素上其它的内联样式一起覆盖掉）。测试壳里没有真正的
+ * CSSStyleDeclaration，退化成 cssText 即可 —— 断言只看数字与请求，不依赖浏览器排版。
+ */
+function paintProgressSlider(input) {
+  const value = Number(input.value);
+  const max = Number(input.dataset.progressMax) || 1;
+  const total = Number(input.dataset.totalEps) || 0;
+  const percent = Math.max(0, Math.min(100, Math.round((value / max) * 100)));
+  if (typeof input.style?.setProperty === 'function') {
+    input.style.setProperty('--progress', `${percent}%`);
+  } else if (input.style) {
+    input.style.cssText = `--progress:${percent}%`;
+  }
+  // 真实 DOM 用 parentElement，手写测试壳只有 parent —— 两边都兜住。
+  const holder = input.parentElement ?? input.parent;
+  const text = holder?.querySelector?.('.progress-text');
+  if (text) text.textContent = progressLabel(value, total);
+  // 底层的集数刻度也跟着拖动的值点亮/熄灭。真实 DOM 与测试壳都能走 classList.toggle。
+  const track = holder?.querySelector?.('.progress-track');
+  const segments = track?.querySelectorAll?.('i') ?? [];
+  if (segments.length > 0) {
+    const filled = Math.round((value / max) * segments.length);
+    for (let index = 0; index < segments.length; index += 1) {
+      segments[index].classList.toggle('f', index < filled);
+    }
+  } else {
+    const fill = track?.querySelector?.('.progress-fill');
+    if (fill) fill.style.width = `${percent}%`;
+  }
+  const valueText = `${progressLabel(value, total)}${total ? '' : '（总集数未知）'}`;
+  if (typeof input.setAttribute === 'function') input.setAttribute('aria-valuetext', valueText);
+}
+
 async function renderMy() {
   const data = await api('/api/my');
   const groups = data.groups;
-  const labels = { tracking: '追番中', backlog: '补番库', finished: '已看完', dropped: '已弃番' };
 
   const totalMine = Object.values(groups).reduce((sum, list) => sum + list.length, 0);
   $('#tab-my-count').textContent = String(groups.tracking.length + groups.backlog.length);
@@ -1133,67 +1399,62 @@ async function renderMy() {
 
   const rows = items
     .map((item) => {
-      const total = item.totalEps;
-      const watched = item.watchedEps;
-      const percent = total ? Math.min(100, Math.round((watched / total) * 100)) : 0;
       const remainingText =
-        item.remaining === null ? '剩余集数未知' : `还剩 ${item.remaining} 集 · 约 ${humanDuration(item.remaining * (item.durationMin ?? 24) * 60_000)}`;
-
-      const buttons = [];
-      if (state.myCategory === 'tracking' || state.myCategory === 'backlog') {
-        buttons.push(`<button class="btn btn-sm" data-watched="${esc(item.subjectKey)}" data-delta="1">+1 集</button>`);
-        if (watched > 0) buttons.push(`<button class="btn btn-sm" data-watched="${esc(item.subjectKey)}" data-delta="-1">-1</button>`);
-      }
-      if (state.myCategory === 'backlog') {
-        buttons.push(`<button class="btn btn-sm btn-primary" data-category="${esc(item.subjectKey)}" data-to="tracking">移到追番</button>`);
-      } else if (state.myCategory === 'tracking') {
-        buttons.push(`<button class="btn btn-sm" data-category="${esc(item.subjectKey)}" data-to="backlog">移入补番库</button>`);
-      } else {
-        buttons.push(`<button class="btn btn-sm" data-category="${esc(item.subjectKey)}" data-to="tracking">重新追番</button>`);
-      }
-      buttons.push(`<button class="btn btn-sm" data-open="${esc(item.subjectKey)}">详情</button>`);
-      buttons.push(`<button class="btn btn-sm btn-danger" data-remove="${esc(item.subjectKey)}">移除</button>`);
+        item.remaining === null ? '剩余集数未知' : `还剩 ${item.remaining} 集`;
+      const durationText =
+        item.remaining === null
+          ? ''
+          : ` · 约 ${humanDuration(item.remaining * (item.durationMin ?? 24) * 60_000)}`;
 
       return `
-        <div class="subject-row">
+        <div class="subject-row my-row${item.category === 'backlog' ? ' is-backlog' : ''}">
           ${coverHtml(item.coverUrl, 'cover')}
           <div class="info">
-            <div class="t-cn">${esc(item.titleCn ?? '（无中文名）')} ${machineTag(item.titleCnSource)}</div>
-            <div class="t-orig">${esc(item.titleOriginal ?? '')}</div>
-            <div class="progress-wrap">
-              <span class="progress-track"><span class="progress-fill" style="width:${percent}%"></span></span>
-              <span class="progress-text">${esc(watched)}${total ? ` / ${esc(total)}` : ''}</span>
+            <div class="row-top">
+              <div class="t-cn">${item.titleCn ? copySpan(item.titleCn) : '（无中文名）'}</div>
+              ${machineTag(item.titleCnSource)}
             </div>
+            <div class="t-orig">${copySpan(item.titleOriginal)}</div>
+            ${progressHtml(item)}
             <div class="meta">
-              <span class="tag">${esc(item.status)}</span>
+              <span class="tag">${esc(statusLabel(item.status))}</span>
               <span class="tag">${esc(item.season ?? '—')}</span>
-              ${item.category === 'backlog' ? `<span class="tag tag-purple">${esc(remainingText)}</span>` : ''}
+              ${
+                item.category === 'backlog'
+                  ? `<span class="tag tag-purple">${esc(remainingText)}${esc(durationText)}</span>`
+                  : `<span class="tag">${esc(remainingText)}</span>`
+              }
             </div>
           </div>
-          <div class="actions">${buttons.join('')}</div>
+          <div class="my-actions">
+            ${categorySelectHtml(item)}
+            <button class="btn btn-sm" data-open="${esc(item.subjectKey)}">详情</button>
+            <button class="btn btn-sm btn-danger" data-remove="${esc(item.subjectKey)}">移除</button>
+          </div>
         </div>`;
     })
     .join('');
 
   $('#app').innerHTML = `
-    <div class="my-tabs">
-      ${Object.entries(labels)
-        .map(
-          ([key, label]) =>
-            `<button class="chip ${state.myCategory === key ? 'is-active' : ''}" data-my-category="${key}">${label} ${
+    <div class="my-head">
+      <div class="my-tabs">
+        ${MY_CATEGORY_ORDER.map(
+          (key) =>
+            `<button class="chip ${state.myCategory === key ? 'is-active' : ''}" data-my-category="${key}">${MY_CATEGORY_LABELS[key]} ${
               groups[key]?.length ?? 0
             }</button>`,
-        )
-        .join('')}
-      <span class="spacer"></span>
-      <span class="hint search-hint">
-        共 ${totalMine} 部在列表中 ·
-        「更新数据」时会把<b>已播完但没看完</b>的自动移入补番库（并当场告诉你移了哪几部），
-        一集没看的不动
-      </span>
+        ).join('')}
+      </div>
+      <span class="my-summary">共 ${totalMine} 部 · 拖动进度条改进度 · 双击番名复制</span>
     </div>
-    ${state.myCategory === 'backlog' ? '<div class="section-title">补番库：没看完的当季番与想看的老番都在这里。⚠ 界面里没有「加番」入口 —— 想加没在库里的番，用命令行：<code>pnpm add "番剧名"</code></div>' : ''}
-    <div class="subject-list">${rows || '<div class="empty">这个分类还是空的</div>'}</div>`;
+    ${
+      state.myCategory === 'backlog'
+        ? '<p class="my-note">补番库：没看完的当季番与想看的老番都在这里。加库外的番用命令行 <code>pnpm add "番剧名"</code>；「更新数据」时已播完但没看完的会自动移进来。</p>'
+        : ''
+    }
+    <div class="subject-list my-list">${
+      rows || `<div class="empty">「${esc(MY_CATEGORY_LABELS[state.myCategory] ?? state.myCategory)}」还是空的</div>`
+    }</div>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1332,33 +1593,32 @@ async function renderChanges() {
           : ''
       }
     </div>
-    <div class="card dist">
-      <h3 class="section-title">变更记录</h3>
-      <p class="muted">
-        每次「同步当季」时会与库里的历史时刻做对比。同一部番的时间被改动才会记在这里 ——
-        因数据源切换或秒级抖动造成的差异会被自动过滤。
-      </p>
+    <section class="changes-panel">
+      <div class="panel-head">
+        <h3>变更记录</h3>
+        <span class="n">${changes.length} 条</span>
+        <span class="more">同步时与历史时刻对比</span>
+      </div>
+      <p class="panel-note">只记同一部番的时间改动；数据源切换或秒级抖动会自动过滤。</p>
       ${
         changes.length === 0
-          ? '<div class="empty empty-inline">没有变更记录。改档/延期是在同步时通过对比历史发现的，多同步几次就会积累出来。</div>'
+          ? '<div class="empty empty-inline">没有变更记录。点右上角「更新数据」同步一次，改档与延期会在下次对比时出现。</div>'
           : changes
               .map(
                 (change) => `
-        <div class="ep-line" style="align-items:center">
-          <span class="no" style="width:74px">
-            <span class="tag ${kindClass(change.kind)}">${esc(change.kindLabel)}</span>
-          </span>
-          <span class="t">
+        <div class="change-row">
+          <span class="tag ${kindClass(change.kind)}">${esc(change.kindLabel)}</span>
+          <div class="change-main">
             <b>${esc(change.title ?? change.subjectKey)}</b>
             <div class="change-msg">${esc(change.message)}</div>
-          </span>
-          <span class="at change-at">${esc(change.detectedAt.slice(5, 16).replace('T', ' '))}</span>
+          </div>
+          <span class="change-at">${esc(change.detectedAt.slice(5, 16).replace('T', ' '))}</span>
           <button class="btn btn-sm" data-open="${esc(change.subjectKey)}">详情</button>
         </div>`,
               )
               .join('')
       }
-    </div>`;
+    </section>`;
 
   await refreshChangeBadge();
 }
@@ -1380,13 +1640,13 @@ async function openDetail(key) {
     const watched = my?.watchedEps ?? 0;
 
     const fields = [
-      ['放送', subject.broadcastWeekdayJst === null ? '—' : `${WEEKDAYS[subject.broadcastWeekdayJst]} ${subject.broadcastTimeJst ?? ''}（JST）`],
-      ['首播', subject.firstAirAtUtc ? `${formatJst(subject.firstAirAtUtc)}（JST）` : '—'],
+      ['放送档', subject.broadcastWeekdayJst === null ? '—' : `${WEEKDAYS[subject.broadcastWeekdayJst]} ${subject.broadcastTimeJst ?? ''}（JST）`],
+      ['首集', subject.firstAirAtUtc ? `${formatJst(subject.firstAirAtUtc)}（JST）` : '—'],
       ['集数', subject.totalEps ? `${subject.totalEps} 话` : '未知'],
       ['制作', subject.studios.length ? subject.studios.join(' / ') : '—'],
-      ['类型', subject.genres.length ? subject.genres.join(' / ') : '—'],
+      ['类型', subject.genres.length ? subject.genres.map(genreLabel).join(' / ') : '—'],
       ['平台', [...new Set(subject.platforms.map((p) => p.name))].join(' / ') || '—'],
-      ['状态', subject.status],
+      ['状态', statusLabel(subject.status)],
       ['数据源', subject.sources.join(' + ') || '—'],
     ];
 
@@ -1407,9 +1667,9 @@ async function openDetail(key) {
           <h2>${esc(subject.titleCn ?? subject.titleOriginal ?? subject.key)}</h2>
           <div class="orig">${esc(subject.titleOriginal ?? '')}${subject.titleEn ? ` · ${esc(subject.titleEn)}` : ''}</div>
           <div class="meta">
-            <span class="tag">${esc(subject.mediaType)}</span>
+            <span class="tag">${esc(mediaTypeLabel(subject.mediaType))}</span>
             <span class="tag">${esc(subject.season ?? '—')}</span>
-            ${my ? `<span class="tag tag-ok">${esc({ tracking: '追番中', backlog: '补番库', finished: '已看完', dropped: '已弃番' }[my.category] ?? my.category)}</span>` : ''}
+            ${my ? `<span class="tag tag-ok">${esc(MY_CATEGORY_LABELS[my.category] ?? my.category)}</span>` : ''}
           </div>
         </div>
         <button class="close-x" data-close="1">×</button>
@@ -1418,20 +1678,37 @@ async function openDetail(key) {
         <div class="kv">
           ${fields.map(([k, v]) => `<div class="k">${esc(k)}</div><div class="v">${esc(v)}</div>`).join('')}
         </div>
+        <p class="kv-note">
+          放送档是电视台的每周排期（JST）；首集是第 1 集的实际钟点；分集时刻按源站精度显示，
+          源站只给日期时写作「（日期）」。
+        </p>
         ${
           subject.episodes.length
-            ? `<h3 class="section-title">分集（共 ${subject.episodes.length} 集已知）</h3>
+            ? `<div class="ep-head">
+                 <h3 class="section-title">分集</h3>
+                 <span class="hint">共 ${subject.episodes.length} 集已知 · ✓ 为已看</span>
+               </div>
                <div class="ep-list">
                  ${subject.episodes
-                   .map(
-                     (ep) => `
-                   <div class="ep-line${ep.epNumber <= watched ? ' is-watched' : ''}${ep.airAtUtc && ep.airAtUtc >= new Date().toISOString() && ep.epNumber === subject.episodes.find((x) => x.airAtUtc && x.airAtUtc >= new Date().toISOString())?.epNumber ? ' is-next' : ''}">
+                   .map((ep) => {
+                     const isNext =
+                       ep.airAtUtc &&
+                       ep.airAtUtc >= new Date().toISOString() &&
+                       ep.epNumber ===
+                         subject.episodes.find((item) => item.airAtUtc && item.airAtUtc >= new Date().toISOString())
+                           ?.epNumber;
+                     return `
+                   <div class="ep-line${ep.epNumber <= watched ? ' is-watched' : ''}${
+                     isNext ? ' is-next' : ''
+                   }">
                      <span class="no">${ep.epNumber <= watched ? '✓' : ''} ${esc(ep.epNumber)}</span>
-                     <span class="t">${esc(ep.titleCn ?? ep.title ?? '')}</span>
-                     <span class="at">${esc(formatJst(ep.airAtUtc))}</span>
+                     <span class="t">${
+                       isNext ? '<span class="tag tag-accent">下一集</span> ' : ''
+                     }${esc(ep.titleCn ?? ep.title ?? '')}</span>
+                     <span class="at" title="${esc(ep.airSource ?? '')}">${esc(episodeAirLabel(ep.airAtUtc))}</span>
                      <span class="at ep-line-source">${esc(ep.airSource ?? '')}</span>
-                   </div>`,
-                   )
+                   </div>`;
+                   })
                    .join('')}
                </div>`
             : '<div class="empty empty-inline">还没有分集数据 —— 在周视图里加进追番后，同步一次就会有了</div>'
@@ -1441,9 +1718,10 @@ async function openDetail(key) {
         ${
           my
             ? `<button class="btn btn-primary" data-watched="${esc(key)}" data-delta="1" data-reload="1">看了一集 (+1)</button>
-               <button class="btn" data-category="${esc(key)}" data-to="${my.category === 'backlog' ? 'tracking' : 'backlog'}" data-reload="1">${
-                 my.category === 'backlog' ? '移到追番中' : '移入补番库'
-               }</button>
+               ${categorySelectHtml(
+                 { subjectKey: key, category: my.category, totalEps: subject.totalEps, watchedEps: watched },
+                 { reload: true },
+               )}
                <button class="btn btn-danger" data-remove="${esc(key)}" data-reload="1">移除</button>`
             : `<button class="btn btn-primary" data-add="${esc(key)}" data-category="tracking" data-reload="1">加入追番</button>
                <button class="btn" data-add="${esc(key)}" data-category="backlog" data-reload="1">加入补番库</button>`
@@ -1491,6 +1769,27 @@ async function addToList(subjectKey, category, reloadDetail = false) {
 async function patchMy(subjectKey, patch, reloadDetail = false) {
   await api(`/api/my/${encodeURIComponent(subjectKey)}`, { method: 'PATCH', body: JSON.stringify(patch) });
   await refresh(reloadDetail);
+}
+
+/**
+ * 把一部番移到另一个分类（追番中 / 补番库 / 已看完 / 已弃番）。
+ *
+ * **移到「已看完」时把进度补满**：这个分类的语义就是"看完了"，而自动归档也只在
+ * `watched >= total` 时才会把番放进这里。若只改分类不改进度，会出现「已看完 5 / 12」这种
+ * 自相矛盾的记录。总集数未知就只改分类（不能猜），并在 toast 里说清楚做了什么。
+ */
+async function moveSubjectCategory(subjectKey, category, { totalEps = 0, watchedEps = 0, reload = false } = {}) {
+  if (!MY_CATEGORY_ORDER.includes(category)) return;
+  const patch = { category };
+  let completedTo = 0;
+  if (category === 'finished' && totalEps > 0 && watchedEps < totalEps) {
+    patch.watchedEps = totalEps;
+    completedTo = totalEps;
+  }
+  await patchMy(subjectKey, patch, reload);
+  toast(
+    `已移到「${MY_CATEGORY_LABELS[category]}」${completedTo ? `，进度同步为 ${completedTo} / ${completedTo}` : ''}`,
+  );
 }
 
 async function removeFromList(subjectKey, reloadDetail = false) {
@@ -1620,32 +1919,36 @@ function updateScopeDialogHtml() {
     )
     .join('');
   return `
-    <div class="modal-head">
+    <div class="modal-head is-text">
       <div class="h-info">
         <h2>更新数据：这次抓哪些季度</h2>
-        <div class="orig">默认只更新当季；勾多季会依次抓，每季之间留 1 秒间隔</div>
+        <div class="orig">默认只更新当季；勾多季会依次抓，每季之间停 1 秒</div>
       </div>
       <button class="close-x" data-close="1">×</button>
     </div>
-    <div class="modal-body">
-      <div class="scope-presets">
-        <button class="btn btn-sm" data-scope-preset="current">只勾当季</button>
-        <button class="btn btn-sm" data-scope-preset="recent">当季 + 最近 3 季（老规矩）</button>
-        <button class="btn btn-sm" data-scope-preset="library">库里全部季度</button>
-        <button class="btn btn-sm" data-scope-preset="none">全不勾</button>
+    <div class="modal-body scope-body">
+      <div class="scope-main">
+        <div class="scope-presets">
+          <button class="btn btn-sm" data-scope-preset="current">只勾当季</button>
+          <button class="btn btn-sm" data-scope-preset="recent">当季 + 最近 3 季（老规矩）</button>
+          <button class="btn btn-sm" data-scope-preset="library">库里全部季度</button>
+          <button class="btn btn-sm" data-scope-preset="none">全不勾</button>
+        </div>
+        <div class="scope-grid">${rows}</div>
+        <div class="scope-add">
+          <label class="field"><span>其它季度（库里没有的也能填）</span>
+            <input type="text" id="scope-extra" placeholder="YYYY-NN，例如 2020-01" />
+          </label>
+          <button class="btn btn-sm" data-scope-add="1">加进来</button>
+        </div>
       </div>
-      <div class="scope-grid">${rows}</div>
-      <div class="scope-add">
-        <label class="field"><span>其它季度（库里没有的也能填）</span>
-          <input type="text" id="scope-extra" placeholder="YYYY-NN，例如 2020-01" />
+      <aside class="scope-side">
+        <label class="scope-force">
+          <input type="checkbox" id="scope-force"${scope.force ? ' checked' : ''} />
+          <span>重抓已选季度（不勾则跳过库里已有数据的季度，省时间也少打源站）</span>
         </label>
-        <button class="btn btn-sm" data-scope-add="1">加进来</button>
-      </div>
-      <label class="scope-force">
-        <input type="checkbox" id="scope-force"${scope.force ? ' checked' : ''} />
-        <span>重抓已选季度：不勾时，库里已有数据的季度会跳过（增量，省时间也少打源站）</span>
-      </label>
-      <div class="filter-note" id="scope-summary"></div>
+        <div class="filter-note" id="scope-summary"></div>
+      </aside>
     </div>
     <div class="modal-actions">
       <button class="btn btn-primary" data-scope-start="1">开始更新</button>
@@ -1667,14 +1970,11 @@ function updateScopeSummaryText() {
     lines.push(`<b>已选 ${picked.length} 季</b>：${esc(picked.join('、'))}`);
     lines.push(
       `预计 <b>${picked.length * 10}~${picked.length * 30} 秒</b>` +
-        `（每季约 10~30 秒，另有季间 1 秒间隔；机翻每条约 0.7 秒，按缺中文名的条数另算）`,
+        `（每季 10~30 秒 + 季间 1 秒；机翻每条约 0.7 秒，另算）`,
     );
     const fresh = picked.filter((id) => !libraryIds.has(id));
     if (fresh.length) {
       lines.push(`其中 <b>${esc(fresh.join('、'))}</b> 库里还没有，这次会真的去抓（老季度源站可能查不到，会如实报告）`);
-    }
-    if (!scope.force && picked.some((id) => libraryIds.has(id))) {
-      lines.push('库里已有数据的季度会<span class="scope-skip">跳过</span>；要重抓就勾上面的开关');
     }
   }
   host.innerHTML = lines.join('<br />');
@@ -1909,6 +2209,20 @@ async function refresh(reloadDetail = false) {
   }
 }
 
+let viewEnterTimer = null;
+
+/** 视图切换的一次入场：上浮 6px + 淡入；重复切换时从现在的位置重来，不叠加。 */
+function playViewEnter() {
+  const app = $('#app');
+  if (!app?.classList) return;
+  app.classList.remove('is-entering');
+  // 强制一次重排，让同一个 class 能重新触发动画（测试壳里 offsetWidth 是 undefined，无副作用）
+  void app.offsetWidth;
+  app.classList.add('is-entering');
+  if (viewEnterTimer) clearTimeout(viewEnterTimer);
+  viewEnterTimer = setTimeout(() => app.classList.remove('is-entering'), 600);
+}
+
 async function switchView(view) {
   state.view = view;
   $$('.tab').forEach((tab) => tab.classList.toggle('is-active', tab.dataset.view === view));
@@ -1920,6 +2234,8 @@ async function switchView(view) {
   } else if (view === 'my') await renderMy();
   else if (view === 'changes') await renderChanges();
   else renderSearch();
+
+  playViewEnter();
 }
 
 // ---------------------------------------------------------------------------
@@ -1927,6 +2243,10 @@ async function switchView(view) {
 // ---------------------------------------------------------------------------
 
 async function bootstrap() {
+  // 主题：index.html 的 head 里已经先落了一次 class（防首帧闪烁），这里恢复 state 与按钮状态
+  state.theme = readStoredString(LS_THEME, THEME_OPTIONS, 'auto');
+  applyTheme(state.theme);
+
   // 先恢复布局偏好，再拉数据 —— 排序口径要跟着请求一起发给服务端
   state.perRow = readStoredNumber(LS_PER_ROW, PER_ROW_OPTIONS, PER_ROW_DEFAULT);
   state.sort = readStoredString(
@@ -1936,8 +2256,8 @@ async function bootstrap() {
   );
   // 第 2 层多个状态之间默认"且"（线上老行为）；用户切过就按记下来的来。
   state.statusAnd = localStorage.getItem(LS_STATUS_AND) !== '0';
-  // 面板收没收起来也记住（收起是"我想看列表"的意思，下次打开不该又铺开）
-  state.filtersCollapsed = localStorage.getItem(LS_FILTERS_COLLAPSED) === '1';
+  // 面板收没收起来也记住（默认收起；用户展开过就存 '0'）
+  state.filtersCollapsed = localStorage.getItem(LS_FILTERS_COLLAPSED) !== '0';
 
   const health = await api('/api/health');
   const current = await api(`/api/overview?season=&sort=${encodeURIComponent(state.sort)}`);
@@ -1956,7 +2276,11 @@ async function bootstrap() {
       return `<option value="${esc(id)}"${id === state.season ? ' selected' : ''}>${esc(label)}</option>`;
     })
     .join('');
-  $('#tab-my-count').textContent = String(current.totals.tracking + current.totals.backlog);
+  // 「我的追番」徽标用全库口径（追番中 + 补番库），与「我的追番」页里的数字一致；
+  // 不用当前季度的 totals，否则切到周视图时徽标会从 32 掉回 9。
+  $('#tab-my-count').textContent = String(
+    Number(health.stats.tracking ?? 0) + Number(health.stats.backlog ?? 0),
+  );
   syncSeasonUi();
 
   if (health.stats.subjects === 0) {
@@ -1987,6 +2311,12 @@ function closeMoreMenu() {
 document.addEventListener('click', (event) => {
   if (!event.target.closest('#more-menu')) closeMoreMenu();
 
+  // ⚠ 番剧名的单击**必须在这里就 return**：它是"双击复制"的区域，
+  //   单击若继续往下走，可交互卡片会立刻弹详情 —— 于是双击的第一下打开弹窗、
+  //   第二下落在遮罩上，`dblclick` 的目标不再是被双击的标题，复制永远不生效。
+  //   这条判断要放在取 target 之前：标题是 span，不是 button，也不是 [data-interactive]。
+  if (event.target.closest?.('[data-copy-title]')) return;
+
   // 除了按钮/链接，**可交互卡片**（整块可点，例如点番剧卡片弹详情）也要作为事件目标。
   // ⚠ 不要为了图省事改成 `closest('*')`：那样点页面任何空白都会进来，
   //   下面那些 `target.id === '...'` 分支的语义会被搅乱。
@@ -2007,6 +2337,12 @@ document.addEventListener('click', (event) => {
 
   const dataset = target.dataset;
 
+  // 「更多 → 主题」：auto / light / dark，立刻换并记住
+  if (dataset.theme) {
+    setTheme(dataset.theme);
+    return;
+  }
+
   // 「筛选」开关：整体展开 / 收起面板正文。**不重绘任何东西**，只切 hidden 与箭头 ——
   // 见 applyFilterPanelCollapsed 的注释（重绘会丢搜索框焦点）。
   // ⚠ 必须放在 `const dataset = ...` **之后**：放前面会踩 TDZ（Cannot access 'dataset'
@@ -2022,13 +2358,10 @@ document.addEventListener('click', (event) => {
     return;
   }
   // 点卡片上任意处都可以弹详情（原来的「详情」按钮已按需求去掉）。
-  // ⚠ **必须在按钮分支之后**：追番 / 补番 / 移除 / 复制点了就只是那件事，
+  // ⚠ **必须在按钮分支之后**：追番 / 补番 / 移除点了就只是那件事，
   //   不能连带弹详情。点击事件会从按钮冒泡到卡片，所以只靠"按钮自己 stopPropagation"
   //   不够稳（少写一个就是 bug），这里用"先处理按钮分支、卡片分支放最后"的结构兜底。
-  if (dataset.copy) {
-    void copySubjectTitle(dataset.copy);
-    return;
-  }
+  //   （复制已改成标题上的双击，不再有独立的按钮分支；单击标题在上面就 return 了。）
   if (dataset.seasonAll) {
     void selectAllSeasons();
     return;
@@ -2178,21 +2511,33 @@ document.addEventListener('click', (event) => {
     })();
     return;
   }
-  if (dataset.category && dataset.to) {
-    void patchMy(dataset.category, { category: dataset.to }, dataset.reload === '1');
-    return;
-  }
   if (dataset.remove) {
     void removeFromList(dataset.remove, dataset.reload === '1');
     return;
   }
   // ⚠ 卡片整体可点这一条**必须放在最后**：上面任何按钮分支一旦命中就已经 return，
-  //   所以点「追番 / 补番 / 移除 / 复制」都不会走到这里、不会连带弹详情。
+  //   所以点「追番 / 补番 / 移除」都不会走到这里、不会连带弹详情。
   //   以后新增卡片内的按钮时，也要把它的分支加在这条**之前**。
   if (dataset.subjectRow) {
     void openDetail(dataset.key);
     return;
   }
+});
+
+/**
+ * 双击番剧名 → 复制。
+ *
+ * 用 document 级委托而不是给每个标题绑监听：三个视图（周 / 总览 / 我的追番）都会重绘，
+ * 逐个绑必然在某个视图上漏掉。`closest` 从实际被双击的最内层元素往上找，
+ * 所以点到标题里的文字节点也没问题。
+ *
+ * 为什么在这里**不** preventDefault：双击的文本选择发生在 dblclick 之前，
+ * 这时再 prevent 既拦不住选区，又会在没有真实 DOM 的测试壳里炸（那里没有 preventDefault）。
+ */
+document.addEventListener('dblclick', (event) => {
+  const el = event.target?.closest?.('[data-copy-title]');
+  if (!el) return;
+  void copyTitleFromElement(el);
 });
 
 document.addEventListener('keydown', (event) => {
@@ -2205,6 +2550,20 @@ document.addEventListener('keydown', (event) => {
     }
     closeDetail();
     return;
+  }
+  // 双击复制的键盘兜底：卡片聚焦时 Ctrl/Cmd+C 复制这张卡的番剧名。
+  // 标题本身不设 tabindex —— 一页最多 500 多张卡，再加 500 个 Tab 停靠点会把键盘走查毁掉。
+  if ((event.ctrlKey || event.metaKey) && String(event.key).toLowerCase() === 'c') {
+    const holder =
+      event.target?.closest?.('[data-copy-title]') ??
+      event.target?.closest?.('[data-subject-row]') ??
+      event.target?.closest?.('[data-interactive]');
+    const el = holder?.matches?.('[data-copy-title]') ? holder : holder?.querySelector?.('[data-copy-title]');
+    if (el) {
+      event.preventDefault();
+      void copyTitleFromElement(el);
+      return;
+    }
   }
   // 键盘可达：卡片现在是"点一下弹详情"的交互元素，Tab 聚焦后回车/空格也要能打开。
   // （只加鼠标点击会让键盘用户打不开详情 —— 第六轮刚统一过键盘焦点样式，不要退回去。）
@@ -2403,12 +2762,58 @@ $('#season-select').addEventListener('change', (event) => {
 });
 
 /**
+ * 拖动进度条时的即时反馈（`input` 事件）：只改填充与数字，**不发请求**。
+ * 真正写库在下面的 `change` 监听里（松手 / 键盘方向键结束）。
+ */
+document.addEventListener('input', (event) => {
+  const target = event.target;
+  if (target?.dataset?.progress === undefined) return;
+  paintProgressSlider(target);
+});
+
+/**
  * 范围选择器里的勾选框走 `change`（不是点击委托）：在真实浏览器里点 `<label>` 或复选框
  * 都会派发 change，而在测试壳里也能直接 `dispatch('change')` —— 两边同一条路径。
  * 这里**只更新摘要文案，不重绘对话框**，所以"其它季度"那个输入框不会被打断。
  */
 document.addEventListener('change', (event) => {
   const target = event.target;
+
+  // ---- 我的追番：拖动进度条（松手才写库） ----
+  if (target?.dataset?.progress !== undefined) {
+    const key = target.dataset.progress;
+    const value = Number(target.value);
+    const previous = Number(target.dataset.watchedEps ?? 0);
+    const total = Number(target.dataset.totalEps ?? 0);
+    // 没变就不发请求（拖出去又拖回原处时很常见）
+    if (!key || !Number.isFinite(value) || value === previous) return;
+    void (async () => {
+      try {
+        await patchMy(key, { watchedEps: value });
+        toast(`进度已改为 ${progressLabel(value, total)}`);
+      } catch (error) {
+        toast(error.message, true);
+      }
+    })();
+    return;
+  }
+
+  // ---- 我的追番 / 详情弹窗：分类移动（含已看完 / 已弃番） ----
+  if (target?.dataset?.moveCategory) {
+    const key = target.dataset.moveCategory;
+    const totalEps = Number(target.dataset.totalEps ?? 0);
+    const watchedEps = Number(target.dataset.watchedEps ?? 0);
+    const reload = target.dataset.reload === '1';
+    void (async () => {
+      try {
+        await moveSubjectCategory(key, target.value, { totalEps, watchedEps, reload });
+      } catch (error) {
+        toast(error.message, true);
+      }
+    })();
+    return;
+  }
+
   if (target?.dataset?.scopeSeason !== undefined) {
     if (state.updateScope) {
       if (target.checked) state.updateScope.picked.add(target.dataset.scopeSeason);
@@ -2434,7 +2839,16 @@ $$('.tab').forEach((tab) => tab.addEventListener('click', () => void switchView(
 // 倒计时每分钟刷新一次（不重新拉数据，只改文本）
 setInterval(() => {
   for (const el of $$('[data-countdown]')) {
-    el.textContent = countdownText(el.dataset.countdown);
+    // 周卡片空间窄，用短文案；「接下来要更新的」用完整文案
+    el.textContent = el.dataset.compact ? shortCountdownText(el.dataset.countdown) : countdownText(el.dataset.countdown);
+  }
+  // 页首「下一集」的大号倒计时也一起走，不必等下一次重绘
+  for (const el of $$('[data-next-count]')) {
+    const parts = countdownParts(el.dataset.nextCount);
+    const strong = el.querySelector?.('strong');
+    const unit = el.querySelector?.('span');
+    if (strong) strong.textContent = parts.value;
+    if (unit) unit.textContent = parts.unit;
   }
 }, 30_000);
 

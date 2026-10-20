@@ -4,14 +4,27 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>新番追番日历</title>
+    <script>
+      // 主题偏好要在第一帧之前落到 <html> 上，否则会先闪一下系统主题。
+      try {
+        var savedTheme = localStorage.getItem('anime-tracker.theme');
+        if (savedTheme === 'light' || savedTheme === 'dark') {
+          document.documentElement.classList.add('theme-' + savedTheme);
+        }
+      } catch (error) {
+        /* 隐私模式读不了 localStorage，就按系统主题来 */
+      }
+    </script>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
     <header class="top">
       <div class="brand">
-        <span class="logo">◈</span>
-        <h1>新番追番日历</h1>
-        <span class="season-badge" id="season-badge">—</span>
+        <span class="logo" aria-hidden="true">◈</span>
+        <div class="brand-text">
+          <h1>新番追番日历</h1>
+          <span class="brand-sub">放送表 · <span class="season-badge" id="season-badge">—</span></span>
+        </div>
       </div>
 
       <div class="controls">
@@ -21,7 +34,7 @@
         </label>
 
         <label class="field">
-          <span>日历归属</span>
+          <span>归属</span>
           <select id="rule-select">
             <option value="clock">按真实钟点</option>
             <option value="broadcast-calendar">按日本放送日历</option>
@@ -41,7 +54,7 @@
           窄一点的窗口会换行成两三层。功能一个没少，只是不再占主视线。
         -->
         <details class="menu" id="more-menu">
-          <summary class="btn" title="同步与导出">更多 <span class="caret">▾</span></summary>
+          <summary class="btn" title="同步、导出与主题">更多 <span class="caret">▾</span></summary>
           <div class="menu-panel">
             <button id="sync-btn" class="btn" title="只抓取当前选中的这一季（更快）">只同步本季</button>
             <button
@@ -61,6 +74,21 @@
               title="把你的追番列表、进度、手动修正、变更历史导出成 JSON —— 这些数据不可重建，建议定期留一份"
               >导出我的数据</a
             >
+
+            <div class="menu-section">
+              <span class="menu-label">主题</span>
+              <div class="theme-switch" role="group" aria-label="主题">
+                <button class="btn" data-theme="auto" aria-pressed="true" title="跟随系统设置，系统切换时页面也跟着变">
+                  跟随系统
+                </button>
+                <button class="btn" data-theme="light" aria-pressed="false" title="强制浅色，不受系统影响">
+                  浅色
+                </button>
+                <button class="btn" data-theme="dark" aria-pressed="false" title="强制深色，不受系统影响">
+                  深色
+                </button>
+              </div>
+            </div>
           </div>
         </details>
       </div>

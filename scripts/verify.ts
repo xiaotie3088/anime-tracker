@@ -1788,8 +1788,8 @@ check('导航栏不再有「搜索 / 加番」入口，但搜索视图的代码�
 
 check('点击委托里「卡片整体可点」的分支必须排在所有按钮分支之后', () => {
   // 为什么用静态检查兜这件"顺序"：点卡片弹详情是靠"按钮分支都先 return"来实现的，
-  // 一旦有人把 dataset.subjectRow 那条挪到按钮分支前面，点「追番 / 移除 / 复制」
-  // 就会连带弹出详情 —— 而这类 bug 只有在真实浏览器里点一下才看得出来。
+  // 一旦有人把 dataset.subjectRow 那条挪到按钮分支前面，点「追番 / 移除」就会连带弹出详情
+  // —— 而这类 bug 只有在真实浏览器里点一下才看得出来。
   // 把"新人要记得加在前面"这个隐性约定变成 pnpm verify 里的确定性检查。
   const lines = appJs.split('\n');
   const handlerStart = lines.findIndex((line) => line.includes("document.addEventListener('click'"));
@@ -1800,12 +1800,39 @@ check('点击委托里「卡片整体可点」的分支必须排在所有按钮�
     return index < 0 ? Number.POSITIVE_INFINITY : index;
   };
   const cardBranch = lineOf('if (dataset.subjectRow)');
-  for (const buttonBranch of ['if (dataset.add)', 'if (dataset.remove)', 'if (dataset.copy)']) {
+  for (const buttonBranch of ['if (dataset.add)', 'if (dataset.remove)']) {
     assert.ok(
       lineOf(buttonBranch) < cardBranch,
       `${buttonBranch} 必须排在 if (dataset.subjectRow) 之前，否则点按钮会连带弹出详情`,
     );
   }
+  // 番剧名的单击必须**在取 target 之前**就 return：否则双击的第一下会打开详情，
+  // 第二下落在遮罩上，dblclick 的目标不再是标题 → 双击复制永远不生效。
+  const copyGuard = lineOf("if (event.target.closest?.('[data-copy-title]'))");
+  const targetLine = lineOf('const target =');
+  assert.ok(copyGuard < targetLine, '标题的单击拦截必须放在 const target 之前');
+  assert.ok(copyGuard < cardBranch, '标题的单击拦截必须放在 if (dataset.subjectRow) 之前');
+});
+
+check('「复制番剧名」已经改成双击标题（不再有独立按钮）', () => {
+  // 老实现是一个 data-copy="<key>" 的按钮；用户明确要求换成双击番剧名。
+  // 这条守卫同时盯住三件事：按钮没了、标题外壳在、样式在。
+  assert.equal(appJs.includes('data-copy="'), false, '不应再有 data-copy="..." 的独立复制按钮');
+  assert.ok(appJs.includes('data-copy-title'), '番剧名上必须带 data-copy-title 标记');
+  assert.ok(appJs.includes('dblclick'), '必须监听 dblclick');
+  assert.ok(stylesCode.includes('.copy-title'), 'styles.css 缺少 .copy-title 样式');
+});
+
+check('我的追番：进度拖动条与分类下拉都在（+1 / -1 按钮已从列表里去掉）', () => {
+  assert.ok(appJs.includes('data-progress='), '进度条必须带 data-progress（否则 change 不知道改哪一部）');
+  assert.ok(appJs.includes('class="progress-range"'), '进度条必须是 input[type=range]');
+  assert.ok(stylesCode.includes('.progress-range'), 'styles.css 缺少 .progress-range 样式');
+  assert.ok(appJs.includes('data-move-category'), '分类移动下拉必须带 data-move-category');
+  assert.ok(stylesCode.includes('.move-select'), 'styles.css 缺少 .move-select 样式');
+  // 「已看完 / 已弃番」必须在可选项里（用户点名的两个入口）
+  assert.ok(appJs.includes("MY_CATEGORY_ORDER = ['tracking', 'backlog', 'finished', 'dropped']"));
+  // 列表里的 +1 / -1 已删：data-delta="1" 只应剩详情弹窗的「看了一集」那一处。
+  assert.equal((appJs.match(/data-delta="1"/g) ?? []).length, 1, '列表里的 +1 按钮应当只剩详情弹窗那一处');
 });
 
 check('每个可选列数都有对应的 .per-row-N 规则（与 app.js 的 PER_ROW_OPTIONS 对齐）', () => {

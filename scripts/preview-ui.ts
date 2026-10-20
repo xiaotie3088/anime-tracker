@@ -260,14 +260,16 @@ const staticTopbar = (menuOpen: boolean): string => `
   <header class="top">
     <div class="brand">
       <span class="logo">◈</span>
-      <h1>新番追番日历</h1>
-      <span class="season-badge">2026 年 10 月</span>
+      <div class="brand-text">
+        <h1>新番追番日历</h1>
+        <span class="brand-sub">放送表 · <span class="season-badge">2026 秋</span></span>
+      </div>
     </div>
     <div class="controls">
       <label class="field"><span>季度</span>
         <select><option>2026-10 · 112 部</option><option>2026-07 · 151 部</option></select>
       </label>
-      <label class="field"><span>日历归属</span>
+      <label class="field"><span>归属</span>
         <select><option>按真实钟点</option><option>按日本放送日历</option></select>
       </label>
       <button class="btn btn-primary">更新数据</button>
@@ -285,23 +287,24 @@ const staticTopbar = (menuOpen: boolean): string => `
   <nav class="tabs">
     <button class="tab is-active">周视图</button>
     <button class="tab">全季总览</button>
-    <button class="tab">我的追番 <span class="pill">23</span></button>
+    <button class="tab">我的追番 <span class="pill">8</span></button>
     <button class="tab">变更 <span class="pill">0</span></button>
-    <button class="tab">搜索 / 加番</button>
     <span class="spacer"></span>
   </nav>`;
 
 const css = readFileSync(CSS_PATH, 'utf8');
 
-function buildPage(forceDark: boolean): string {
+function buildPage(theme: 'auto' | 'light' | 'dark'): string {
+  const themeClass = theme === 'auto' ? '' : ` class="theme-${theme}"`;
+  const themeLabel = theme === 'auto' ? '跟随系统' : theme === 'light' ? '强制浅色' : '强制深色';
   const section = (label: string, body: string): string =>
     `<section class="shot-label">${label}</section><div>${body}</div>`;
 
   return `<!doctype html>
-<html lang="zh-CN"${forceDark ? ' class="theme-dark"' : ''}>
+<html lang="zh-CN"${themeClass}>
 <head>
 <meta charset="utf-8" />
-<title>新番追番日历 · UI 预览（${forceDark ? '深色' : '跟随系统'}）</title>
+<title>新番追番日历 · UI 预览（${themeLabel}）</title>
 <style>
 ${css}
 /* ↓ 仅预览页使用的样式 */
@@ -328,24 +331,24 @@ main { max-width: none; }
 <body>
 <p class="preview-note">
   离线预览（样式与渲染函数都取自 <code>web/</code> 真实代码，海报已内嵌，不需要联网）。
-  当前：<b>${forceDark ? '强制深色' : '跟随系统主题'}</b>。线上是跟随系统的，
-  同一个页面在浅色 / 深色系统下会自动切换。
+  当前：<b>${themeLabel}</b>。线上是跟随系统的，同一个页面在浅色 / 深色系统下会自动切换。
 </p>
-${staticTopbar(true)}
+${staticTopbar(false)}
 <main>
-  ${section('① 周视图（顶栏「更多」菜单展开 + 海报已放大）', weekHtml)}
-  ${section('② 全季总览（筛选面板展开，已选「周五 + TV」）', seasonHtml)}
+  ${section('① 周视图（顶栏 + 海报已放大）', weekHtml)}
+  ${section('② 全季总览（筛选面板收起，已选「周五 + TV」）', seasonHtml)}
 </main>
 </body>
 </html>`;
 }
 
 mkdirSync(OUT_DIR, { recursive: true });
-for (const [suffix, forceDark] of [
-  ['preview.html', false],
-  ['preview-dark.html', true],
+for (const [suffix, theme] of [
+  ['preview.html', 'auto'],
+  ['preview-light.html', 'light'],
+  ['preview-dark.html', 'dark'],
 ] as const) {
-  const html = buildPage(forceDark);
+  const html = buildPage(theme);
   writeFileSync(path.join(OUT_DIR, suffix), html, 'utf8');
   console.log(`已写出 ${path.join(OUT_DIR, suffix)}（${Math.round(html.length / 1024)} KB）`);
 }

@@ -35,7 +35,12 @@ class El {
   id = '';
   className = '';
   dataset: Record<string, string> = {};
-  style: { cssText: string } = { cssText: '' };
+  style = {
+    cssText: '',
+    setProperty(name: string, value: string) {
+      this.cssText += `${name}:${value};`;
+    },
+  };
   listeners: Record<string, ((e: unknown) => void)[]> = {};
   textContent = '';
   value = '';
@@ -282,9 +287,13 @@ const fetchJson = async (p: string) => {
 const health = await fetchJson('/api/health');
 const overview = await fetchJson('/api/overview?season=2026-10&sort=firstAir');
 const week = await fetchJson('/api/week?season=2026-10&rule=clock&offset=0');
+// 「我的追番」用真实数据（只读）：本轮要测进度拖动与分类移动，接口形状必须与线上一致。
+const myData = await fetchJson('/api/my');
 
 /** 记录壳里真的发出去过哪些请求（断言"更新范围"有没有正确拼进 query）。 */
 const requestedUrls: string[] = [];
+/** 记录每次请求的 method/body：进度拖动与分类移动要断言 PATCH 的内容，不能只看 URL。 */
+const requestedCalls: { url: string; method: string; body: string }[] = [];
 /**
  * `/api/update` 的假响应：让「开始更新」这条链路真的跑完（否则 result.summary 是 undefined，
  * 会掉进 catch，测不出"报告里能看出每一季的结果"）。形状与 server.ts 的 reply 一致。
@@ -325,11 +334,23 @@ const fakeUpdateResult = {
   backup: { path: 'data/backups/anime-2026-10-06.db', bytes: 1024 },
 };
 
-const fetchStub = async (url: string) => {
+const fetchStub = async (
+  url: string,
+  options: { method?: string; body?: string } = {},
+) => {
   const target = String(url);
   requestedUrls.push(target);
+  requestedCalls.push({
+    url: target,
+    method: options.method ?? 'GET',
+    body: options.body ?? '',
+  });
   if (target.includes('/api/update')) {
     return { ok: true, status: 200, text: async () => JSON.stringify(fakeUpdateResult) };
+  }
+  if (target.includes('/api/my')) {
+    // GET 返回真实数据；PATCH 只要回 ok 就行（patchMy 随后会重新 GET）
+    return { ok: true, status: 200, text: async () => JSON.stringify(myData) };
   }
   const body = target.includes('/api/week') ? week : target.includes('/api/health') ? health : overview;
   return { ok: true, status: 200, text: async () => JSON.stringify(body) };
@@ -352,6 +373,9 @@ for (const id of [
   'modal',
   // 顶栏状态位：setStatus() 会写它（index.html 里也有）
   'status',
+  // 标签页上的计数徽标：「我的追番」与「变更」（renderMy / refreshChangeBadge 会写）
+  'tab-my-count',
+  'tab-changes-count',
 ]) {
   getById(id);
 }
@@ -706,7 +730,12 @@ console.log(`    未加入列表的卡片样例按钮=[${sampleButtons.join(', '
 // 这个手写壳的 matches() 不解析后代选择器，写成后代选择器会命中卡片 div 自己。
 ok('卡片上没有「详情」按钮了（改成点整张卡片）', !sampleButtons.includes('详情'));
 ok('未加入列表的卡片仍有「追番」「补番」', sampleButtons.includes('追番') && sampleButtons.includes('补番'));
-ok('卡片上有「复制番剧名」按钮', sampleButtons.includes('复制'));
+ok('卡片上没有独立的「复制」按钮了（改成双击番剧名）', !sampleButtons.includes('复制'));
+ok(
+  '番剧名外面包了可双击复制的标记',
+  Boolean(sample?.querySelector('[data-copy-title]')),
+  '没找到 [data-copy-title]',
+);
 const mine = rows.find((r) => r.querySelector('[data-remove]'));
 if (mine) {
   const mineButtons = mine.querySelectorAll('button').map((b) => b.textContent.trim());
@@ -992,39 +1021,61 @@ if (backdrop && notMineRow) {
 }
 closeModal();
 
-console.log('\n【K】卡片上的「复制番剧名」按钮');
+console.log('\n【K】双击番剧名复制（原来的「复制」按钮已去掉）');
 state.overview = overview;
 await app.switchView('season');
 const rowsNow = appEl.querySelectorAll('.subject-row');
-const copyBtns = cardButtons().filter((b) => 'data-copy' in b.attrs);
-ok('每张卡片都有「复制」按钮', copyBtns.length === rowsNow.length, `实际 ${copyBtns.length} 个 / 卡片 ${rowsNow.length} 张`);
-const firstCopy = copyBtns[0];
-if (backdrop && firstCopy) {
-  // 复制要先确认"点它不会弹详情"，再确认"真的调了剪贴板、且传的是这张番的名字"
+const copyTitles = appEl.querySelectorAll('[data-copy-title]');
+ok(
+  '每张卡片上都有可双击复制的番剧名',
+  rowsNow.every((row) => Boolean(row.querySelector('[data-copy-title]'))),
+  `卡片 ${rowsNow.length} 张 / 标记 ${copyTitles.length} 个`,
+);
+ok(
+  '卡片上不再有独立的 data-copy 按钮',
+  cardButtons().every((b) => !('data-copy' in b.attrs)),
+  `仍有 ${cardButtons().filter((b) => 'data-copy' in b.attrs).length} 个`,
+);
+
+const firstTitle = rowsNow[0]?.querySelector('[data-copy-title]');
+if (backdrop && firstTitle) {
   closeModal();
-  const copyRow = firstCopy.closest('.subject-row');
-  const cnTitle = (copyRow?.querySelector('.t-cn')?.textContent ?? '').trim();
-  const origTitle = (copyRow?.querySelector('.t-orig')?.textContent ?? '').trim();
+  const titleText = firstTitle.textContent.trim();
   const before = copied.length;
-  firstCopy.click();
+
+  // ① 单击标题：不能弹详情。否则双击的第一下就打开弹窗、第二下落到遮罩上，
+  //    dblclick 的目标不再是标题 —— 复制永远不生效（这是本改动最容易出的 bug）。
+  firstTitle.click();
   await new Promise((resolve) => setTimeout(resolve, 30));
-  ok('点「复制」不会连带弹出详情', backdrop.hidden === true);
-  // 真正要锁的是"按钮携带的 key 与它所在卡片一致"（而不是拿它去比卡片节点）
-  const copyKey = firstCopy.attrs['data-copy'];
+  ok('单击番剧名不会弹出详情（双击的第一下不会误触）', backdrop.hidden === true);
+  ok('单击也不会复制（要双击才复制）', copied.length === before);
+
+  // ② 双击标题：真的写剪贴板，且内容就是被双击的那串字
+  firstTitle.dispatch('dblclick');
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  ok('双击番剧名调了剪贴板', copied.length === before + 1, `copied=${JSON.stringify(copied)}`);
   ok(
-    '「复制」按钮携带的 key 与所在卡片一致',
-    Boolean(copyKey) && copyKey === copyRow?.attrs['data-key'],
-    `按钮=${copyKey} 卡片=${copyRow?.attrs['data-key']}`,
+    '复制的内容就是被双击的那个名字',
+    (copied[copied.length - 1] ?? '') === titleText,
+    `copied=${JSON.stringify(copied[copied.length - 1])} title=${JSON.stringify(titleText)}`,
   );
-  ok('「复制」真的调了剪贴板', copied.length === before + 1, `copied=${JSON.stringify(copied)}`);
-  const text = copied[copied.length - 1] ?? '';
-  // 只复制中文名，不加原名：搜索引擎会把"中文名 原名"整串当短语，反而搜不到
+  ok('双击复制也不会弹出详情', backdrop.hidden === true);
+
+  // ③ 键盘兜底：标题没有 tabindex（一页几百张卡，不再加几百个 Tab 停靠点），
+  //    所以卡片聚焦时用 Ctrl+C。
+  const cardRow = firstTitle.closest('.subject-row');
+  const keyCopy = { prevented: false };
+  cardRow?.dispatch('keydown', {
+    key: 'c',
+    ctrlKey: true,
+    preventDefault: () => (keyCopy.prevented = true),
+  });
+  await new Promise((resolve) => setTimeout(resolve, 30));
   ok(
-    '复制的内容就是这张番的中文名',
-    cnTitle.length > 0 && text === cnTitle,
-    `copied=${JSON.stringify(text)} cnTitle=${JSON.stringify(cnTitle)}`,
+    '卡片聚焦时按 Ctrl+C 也能复制',
+    copied.length === before + 2 && keyCopy.prevented === true,
+    `copied=${copied.length - before} prevented=${keyCopy.prevented}`,
   );
-  ok('复制内容里不带日文原名（否则贴到站外搜不到）', origTitle === '' || !text.includes(origTitle), `copied=${JSON.stringify(text)} orig=${JSON.stringify(origTitle)}`);
 }
 
 // 把「详情」按钮去掉之后，卡片上不该再有它 —— 弹详情改成点卡片了
@@ -1207,6 +1258,165 @@ await new Promise((resolve) => setTimeout(resolve, 40));
 const reportText = collectText(appEl);
 ok('报告里能看出每一季的结果（各季结果 + 跳过的说明）', reportText.includes('各季结果') && reportText.includes('2024-10'));
 ok('报告里写明了本次范围', reportText.includes('本次范围') && reportText.includes('你挑的'));
+
+// ---------------------------------------------------------------------------
+// 【N】我的追番：进度拖动条 / 分类移动 / 双击复制（.scratch/my-view-interactions）
+// ---------------------------------------------------------------------------
+//
+// 这一节从**真实 `/api/my` 数据**里挑一个非空分类渲染，但所有写操作都被 fetchStub 拦下，
+// 只断言"发出去的 PATCH 内容对不对"—— 不会改动用户正在用的追番数据。
+
+console.log('\n【N】我的追番：进度拖动条 / 分类移动 / 双击复制');
+type MyItem = {
+  subjectKey: string;
+  titleCn: string | null;
+  titleOriginal: string | null;
+  totalEps: number | null;
+  watchedEps: number;
+};
+const myGroups = (myData as { groups: Record<string, MyItem[]> }).groups;
+const categoryHasItems = (category: string) => (myGroups[category] ?? []).length > 0;
+
+// 进度条只在追番中 / 补番库里出现；优先用有内容的那个。
+const editableCategory = ['tracking', 'backlog'].find(categoryHasItems);
+if (editableCategory) {
+  state.myCategory = editableCategory;
+  state.view = 'my';
+  await app.switchView('my');
+
+  const myRows = () => appEl.querySelectorAll('.subject-row');
+  ok('我的追番按真实数据渲染出来了', myRows().length > 0, `分类=${editableCategory} 行数=${myRows().length}`);
+  ok(
+    '我的追番的番剧名也能双击复制',
+    myRows().every((row) => Boolean(row.querySelector('[data-copy-title]'))),
+    `卡片 ${myRows().length} 张`,
+  );
+  ok(
+    '列表里不再有 +1 集 / -1 按钮（改成拖动条）',
+    !appEl.querySelectorAll('button').some((b) => ['+1 集', '-1'].includes(b.textContent.trim())),
+  );
+
+  const progressInput = appEl.querySelectorAll('input').find((input) => 'data-progress' in input.attrs);
+  ok('进度条是 input[type=range]', progressInput?.attrs.type === 'range', `type=${progressInput?.attrs.type}`);
+  if (progressInput) {
+    const max = Number(progressInput.attrs['data-progress-max'] ?? 1);
+    const total = Number(progressInput.attrs['data-total-eps'] ?? 0);
+    const oldValue = Number(progressInput.attrs['data-watched-eps'] ?? 0);
+    // 量程可能恰好等于当前进度（已知总集数且已看完），这时往回拖一格
+    const nextValue = oldValue < max ? oldValue + 1 : Math.max(0, oldValue - 1);
+    const textOf = () =>
+      (progressInput.parent?.querySelector('.progress-text')?.textContent ?? '').trim();
+
+    progressInput.value = String(nextValue);
+    progressInput.dispatch('input');
+    ok(
+      '拖动过程中数字立刻变化（不等接口）',
+      textOf() === (total > 0 ? `${nextValue} / ${total}` : String(nextValue)),
+      `text=${textOf()}`,
+    );
+    ok(
+      '拖动过程中不发 PATCH（只有松手才写库）',
+      !requestedCalls.some((call) => call.method === 'PATCH' && call.url.includes('/api/my/')),
+    );
+
+    const callsBefore = requestedCalls.length;
+    progressInput.dispatch('change');
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    const patch = requestedCalls
+      .slice(callsBefore)
+      .find((call) => call.method === 'PATCH' && call.url.includes('/api/my/'));
+    const patchBody = patch ? (JSON.parse(patch.body) as { watchedEps?: number }) : null;
+    ok('松手后发出 PATCH', Boolean(patch), `patch=${JSON.stringify(patch)}`);
+    ok(
+      'PATCH 的 watchedEps 就是拖到的那一集',
+      patchBody?.watchedEps === nextValue,
+      `body=${patch?.body ?? '(没有请求)'} 期望=${nextValue}`,
+    );
+  }
+
+  // 分类下拉：四个分类都要在，且能真的发出 finished / dropped
+  const moveSelects = () => appEl.querySelectorAll('select').filter((s) => 'data-move-category' in s.attrs);
+  ok(
+    '每张卡片都有分类下拉',
+    moveSelects().length > 0 && moveSelects().length === myRows().length,
+    `下拉 ${moveSelects().length} 个 / 卡片 ${myRows().length} 张`,
+  );
+  const moveSelect = moveSelects()[0];
+  const optionValues = (moveSelect?.querySelectorAll('option') ?? []).map((o) => o.attrs.value ?? '');
+  ok(
+    '分类下拉里有「已看完」与「已弃番」（用户点名的两个入口）',
+    optionValues.includes('finished') && optionValues.includes('dropped'),
+    `options=${optionValues.join(',')}`,
+  );
+
+  if (moveSelect) {
+    const itemKey = moveSelect.attrs['data-move-category'];
+    const totalEps = Number(moveSelect.attrs['data-total-eps'] ?? 0);
+    const watchedEps = Number(moveSelect.attrs['data-watched-eps'] ?? 0);
+
+    const dropCallsBefore = requestedCalls.length;
+    moveSelect.value = 'dropped';
+    moveSelect.dispatch('change');
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    const dropPatch = requestedCalls
+      .slice(dropCallsBefore)
+      .find((call) => call.method === 'PATCH' && call.url.includes('/api/my/'));
+    const dropBody = dropPatch ? (JSON.parse(dropPatch.body) as { category?: string }) : null;
+    ok(
+      '选「已弃番」发出 PATCH category=dropped',
+      Boolean(dropPatch) && dropBody?.category === 'dropped',
+      `key=${itemKey} body=${dropPatch?.body ?? '(没有请求)'}`,
+    );
+
+    // 重绘后旧节点已脱离文档，必须重新查
+    const freshSelect = moveSelects()[0];
+    if (freshSelect) {
+      const finishCallsBefore = requestedCalls.length;
+      freshSelect.value = 'finished';
+      freshSelect.dispatch('change');
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      const finishPatch = requestedCalls
+        .slice(finishCallsBefore)
+        .find((call) => call.method === 'PATCH' && call.url.includes('/api/my/'));
+      const finishBody = finishPatch
+        ? (JSON.parse(finishPatch.body) as { category?: string; watchedEps?: number })
+        : null;
+      ok(
+        '选「已看完」发出 PATCH category=finished',
+        Boolean(finishPatch) && finishBody?.category === 'finished',
+        `body=${finishPatch?.body ?? '(没有请求)'}`,
+      );
+      // 语义：已看完 = 进度补满。只有已知总集数且原进度没满时才应该带 watchedEps。
+      if (totalEps > 0 && watchedEps < totalEps) {
+        ok(
+          '移到「已看完」时进度补满到总集数',
+          finishBody?.watchedEps === totalEps,
+          `body=${finishPatch?.body ?? '(没有请求)'} 期望 watchedEps=${totalEps}`,
+        );
+      }
+    }
+  }
+} else {
+  ok('我的追番里有可编辑分类（追番中 / 补番库）', false, '两个分类都是空的，无法测进度条');
+}
+
+// ---- 周视图的双击复制 ----
+console.log('\n【N2】周视图：双击番剧名也能复制');
+state.view = 'week';
+await app.switchView('week');
+const weekTitle = appEl.querySelector('[data-copy-title]');
+ok('周视图渲染出了可双击复制的番剧名', Boolean(weekTitle));
+if (weekTitle) {
+  const weekText = weekTitle.textContent.trim();
+  const before = copied.length;
+  weekTitle.dispatch('dblclick');
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  ok(
+    '双击周视图的番剧名调了剪贴板、内容是这个名字',
+    copied.length === before + 1 && (copied[copied.length - 1] ?? '') === weekText,
+    `copied=${JSON.stringify(copied[copied.length - 1])} title=${JSON.stringify(weekText)}`,
+  );
+}
 
 console.log(`\n结果：${failures === 0 ? '全部通过' : `${failures} 项失败`}`);
 process.exitCode = failures === 0 ? 0 : 1;
