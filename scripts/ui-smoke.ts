@@ -364,6 +364,32 @@ const fakeJobDone = {
   result: fakeUpdateResult,
 };
 
+/** 「只补中文名」是另一种任务：结果形状与 update 不同，壳里要分开喂。 */
+const fakeTranslateJobDone = {
+  ...fakeJobRunning,
+  kind: 'translate',
+  running: false,
+  stage: 'done',
+  message: '完成',
+  currentSeason: null,
+  seasons: [],
+  translate: { done: 3, total: 3 },
+  finishedAt: '2026-10-22T00:00:04.000Z',
+  result: {
+    season: 'all',
+    translatedCount: 3,
+    skipped: 1,
+    candidates: 4,
+    translated: [],
+    failed: [],
+    stopped: 0,
+    remaining: 7,
+  },
+};
+
+/** 最近一次长任务：轮询 /api/job 时按它回对应的结果形状。 */
+let lastLongJob: 'update' | 'translate' = 'update';
+
 const fetchStub = async (
   url: string,
   options: { method?: string; body?: string } = {},
@@ -377,10 +403,22 @@ const fetchStub = async (
   });
   if (target.includes('/api/job')) {
     // 轮询：第一次就给"已完成"，这样测试不必等真的几秒
-    return { ok: true, status: 200, text: async () => JSON.stringify({ job: fakeJobDone }) };
+    return {
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ job: lastLongJob === 'translate' ? fakeTranslateJobDone : fakeJobDone }),
+    };
   }
   if (target.includes('/api/update')) {
+    lastLongJob = 'update';
     return { ok: true, status: 202, text: async () => JSON.stringify({ job: fakeJobRunning }) };
+  }
+  if (target.includes('/api/translate')) {
+    lastLongJob = 'translate';
+    return { ok: true, status: 202, text: async () => JSON.stringify({ job: fakeJobRunning }) };
+  }
+  if (target.includes('/api/shutdown') || target.includes('/api/restart')) {
+    return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true }) };
   }
   if (target.includes('/api/my')) {
     // GET 返回真实数据；PATCH 只要回 ok 就行（patchMy 随后会重新 GET）
@@ -398,8 +436,8 @@ const fetchStub = async (
 for (const id of [
   'update-btn',
   'cancel-btn',
-  'sync-btn',
-  'translate-btn',
+  'shutdown-btn',
+  'restart-btn',
   'season-select',
   'rule-select',
   'ics-link',
@@ -1463,6 +1501,52 @@ const reportText = collectText(appEl);
 ok('报告里能看出每一季的结果（各季结果 + 跳过的说明）', reportText.includes('各季结果') && reportText.includes('2024-10'));
 ok('报告里写明了本次范围', reportText.includes('本次范围') && reportText.includes('你挑的'));
 
+console.log('\n【M2】更新对话框里的两个快捷动作（原「更多」里的两项）');
+state.season = '2026-10';
+state.overview = overview;
+app.renderSeason();
+requestedUrls.length = 0;
+updateBtn?.click();
+const quickBtn = (name: string) =>
+  modalBox()?.querySelectorAll('button').find((b) => b.attrs['data-scope-quick'] === name);
+ok(
+  '对话框里有「只同步当季」与「只补中文名（不抓取）」',
+  Boolean(quickBtn('sync-current')) && Boolean(quickBtn('translate-only')),
+);
+quickBtn('sync-current')?.click();
+const quickScope = state.updateScope as { picked: Set<string>; incremental: boolean; translate: boolean };
+ok(
+  '「只同步当季」把范围收成当季一季',
+  quickScope.picked.size === 1 && quickScope.picked.has('2026-10'),
+  `picked=${[...quickScope.picked].join(',')}`,
+);
+ok('「只同步当季」取消增量（确保真的重抓一次）', quickScope.incremental === false);
+ok('「只同步当季」取消机翻', quickScope.translate === false);
+ok(
+  '两个勾选框跟着变：只剩 1 季、增量与机翻都没勾',
+  scopeBoxes().filter((input) => input.checked).length === 1 &&
+    (modalBox()?.querySelector('#scope-incremental')?.checked ?? true) === false &&
+    (modalBox()?.querySelector('#scope-translate')?.checked ?? true) === false,
+);
+ok('快捷动作只是预设表单，不会直接开跑', requestedUrls.length === 0 && backdrop?.hidden === false);
+
+requestedUrls.length = 0;
+quickBtn('translate-only')?.click();
+ok('「只补中文名」关掉对话框', backdrop?.hidden === true);
+ok(
+  '「只补中文名」直接发全库机翻任务（all=1 & async=1）',
+  requestedUrls.some(
+    (url) => url.includes('/api/translate') && url.includes('all=1') && url.includes('async=1'),
+  ),
+  requestedUrls.join(' | '),
+);
+await new Promise((resolve) => setTimeout(resolve, 150));
+ok(
+  '机翻任务的结果会写回状态位',
+  (docRoot.querySelector('#status')?.textContent ?? '').includes('机翻完成'),
+  `status=${docRoot.querySelector('#status')?.textContent ?? '(空)'}`,
+);
+
 // ---------------------------------------------------------------------------
 // 【N】我的追番：进度拖动条 / 分类移动 / 双击复制（.scratch/my-view-interactions）
 // ---------------------------------------------------------------------------
@@ -1621,6 +1705,48 @@ if (weekTitle) {
     `copied=${JSON.stringify(copied[copied.length - 1])} title=${JSON.stringify(weekText)}`,
   );
 }
+
+console.log('\n【O】更多 → 停止服务 / 重启服务');
+state.view = 'season';
+state.overview = overview;
+app.renderSeason();
+requestedUrls.length = 0;
+const shutdownBtn = docRoot.querySelector('#shutdown-btn');
+const restartBtn = docRoot.querySelector('#restart-btn');
+ok('更多里渲染出「停止服务」与「重启服务」', Boolean(shutdownBtn) && Boolean(restartBtn));
+
+shutdownBtn?.click();
+ok('点「停止服务」先弹确认框（不直接停）', backdrop?.hidden === false && requestedUrls.length === 0);
+ok('确认框里写明了下次怎么启动', collectText(modalBox()).includes('双击桌面'));
+modalBox()
+  ?.querySelectorAll('button')
+  .find((b) => b.attrs['data-confirm-cancel'] === '1')
+  ?.click();
+ok('点「取消」什么都不发、弹窗关掉', requestedUrls.length === 0 && backdrop?.hidden === true);
+
+shutdownBtn?.click();
+modalBox()
+  ?.querySelectorAll('button')
+  .find((b) => b.attrs['data-confirm-ok'] === '1')
+  ?.click();
+ok('点「停止服务」发出 POST /api/shutdown', requestedUrls.some((url) => url.includes('/api/shutdown')));
+await new Promise((resolve) => setTimeout(resolve, 120));
+ok('停止后整页显示「服务已停止」', collectText(appEl).includes('服务已停止'));
+ok('停止后给了「重新连接」按钮', Boolean(appEl.querySelector('#reconnect-btn')));
+
+// 重启：先把页面恢复回来（真实场景里是服务起来后自动刷新）
+state.overview = overview;
+app.renderSeason();
+requestedUrls.length = 0;
+docRoot.querySelector('#restart-btn')?.click();
+ok('点「重启服务」也先确认', backdrop?.hidden === false && requestedUrls.length === 0);
+modalBox()
+  ?.querySelectorAll('button')
+  .find((b) => b.attrs['data-confirm-ok'] === '1')
+  ?.click();
+ok('点「重启服务」发出 POST /api/restart', requestedUrls.some((url) => url.includes('/api/restart')));
+await new Promise((resolve) => setTimeout(resolve, 120));
+ok('重启中整页显示「正在重启服务」', collectText(appEl).includes('正在重启'));
 
 console.log(`\n结果：${failures === 0 ? '全部通过' : `${failures} 项失败`}`);
 process.exitCode = failures === 0 ? 0 : 1;

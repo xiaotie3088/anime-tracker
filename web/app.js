@@ -246,6 +246,8 @@ const state = {
   searchDraft: '',
   /** 季度面板展开着没有（收起时季度区只占一行：已选季度 + 选择季度 / 全选） */
   seasonsOpen: false,
+  /** 「确认」对话框里待执行的动作（`data-confirm-ok` 点下去时用它） */
+  confirmAction: null,
   detailKey: null,
   /** 「更新数据」范围选择器的临时状态（picked = 勾中的季度 id，只在对话框开着时有效） */
   updateScope: null,
@@ -2002,6 +2004,139 @@ async function openDetail(key) {
 function closeDetail() {
   $('#modal-backdrop').hidden = true;
   state.detailKey = null;
+  state.confirmAction = null;
+}
+
+/**
+ * 通用确认框（停止 / 重启服务用）。
+ *
+ * `body` 是一段**静态** HTML（提示文案），动态内容在外面先 esc 再传进来。
+ * 确认动作存在 `state.confirmAction` 里，点「确认」时由点击委托统一取出执行 ——
+ * 不给按钮单独绑监听，弹窗换内容时不会留下旧监听。
+ */
+function openConfirm({ title, body, confirmLabel, onConfirm }) {
+  closeMoreMenu();
+  state.confirmAction = onConfirm ?? null;
+  const modal = $('#modal');
+  if (!modal) return;
+  modal.innerHTML = `
+    <div class="modal-head is-text">
+      <div class="h-info">
+        <h2>${esc(title)}</h2>
+        <div class="orig">${body}</div>
+      </div>
+      <button class="close-x" data-close="1">×</button>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-primary" data-confirm-ok="1">${esc(confirmLabel)}</button>
+      <button class="btn" data-confirm-cancel="1">取消</button>
+    </div>`;
+  const backdrop = $('#modal-backdrop');
+  if (backdrop) backdrop.hidden = false;
+}
+
+/**
+ * 服务停止 / 重启后的整页提示。
+ *
+ * 关掉服务以后页面上的按钮全都是死的，所以直接把 `#app` 换成一块说明 ——
+ * 比留着一堆点不动的界面诚实。「重新连接」给两种场景用：
+ *   - 停止后你双击了桌面图标 → 点它就能回到页面；
+ *   - 重启后自动轮询，服务起来就自己刷新。
+ */
+function showServiceOffline({ title, body, poll = false }) {
+  const host = $('#app');
+  if (!host) return;
+  showCancel(false);
+  host.innerHTML = `
+    <section class="offline">
+      <img src="/icon.svg" alt="" aria-hidden="true" />
+      <h2>${esc(title)}</h2>
+      <p>${body}</p>
+      <div class="offline-actions">
+        <button class="btn" id="reconnect-btn">重新连接</button>
+      </div>
+      <p class="hint-line" id="offline-hint">${
+        poll ? '正在等它起来…' : '服务重新启动后再点「重新连接」'
+      }</p>
+    </section>`;
+  $('#reconnect-btn')?.addEventListener('click', () => void reconnectService(true));
+  if (poll) void reconnectService(true);
+}
+
+/** 轮询健康检查，服务一回来就刷新页面。最多等约 12 秒。 */
+async function reconnectService(poll = false) {
+  const hint = $('#offline-hint');
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    try {
+      await api('/api/health');
+      location.reload();
+      return;
+    } catch {
+      /* 还没起来，继续等 */
+    }
+    if (hint) hint.textContent = `正在等它起来…（第 ${attempt + 1} 次）`;
+    if (!poll) break;
+    await new Promise((resolve) => setTimeout(resolve, 600));
+  }
+  if (hint) hint.textContent = '等不到服务：请双击桌面「新番追番日历」图标启动';
+}
+
+/** 「更多 → 停止服务」：确认后关掉本机服务（有任务在跑时服务端会拒绝）。 */
+function confirmShutdown() {
+  openConfirm({
+    title: '停止本机服务？',
+    body:
+      '<p>页面会立刻失去连接。下次双击桌面上的「新番追番日历」图标启动。</p>' +
+      '<p class="hint-line">有任务在跑时不能停 —— 先用顶栏「停止」把它收尾。</p>',
+    confirmLabel: '停止服务',
+    onConfirm: () => void shutdownServer(),
+  });
+}
+
+async function shutdownServer() {
+  closeMoreMenu();
+  setStatus('正在停止服务…');
+  try {
+    await api('/api/shutdown', { method: 'POST', body: JSON.stringify({ confirm: true }) });
+  } catch (error) {
+    setStatus(`停止失败：${error.message}`, 'error');
+    toast(`停止失败：${error.message}`, true);
+    return;
+  }
+  showServiceOffline({
+    title: '服务已停止',
+    body: '可以关闭这个页面了。下次双击桌面上的「新番追番日历」图标启动。',
+  });
+  setStatus('服务已停止', 'ok');
+}
+
+/** 「更多 → 重启服务」：改完 `src/` 不用离开浏览器就能让它生效。 */
+function confirmRestart() {
+  openConfirm({
+    title: '重启本机服务？',
+    body:
+      '<p>会先关掉当前服务、再拉起来，大约 2–5 秒。服务起来后页面自动刷新。</p>' +
+      '<p class="hint-line">改了 src/ 的代码，需要用这一步才会生效。</p>',
+    confirmLabel: '重启服务',
+    onConfirm: () => void restartServer(),
+  });
+}
+
+async function restartServer() {
+  closeMoreMenu();
+  setStatus('正在重启服务…');
+  try {
+    await api('/api/restart', { method: 'POST', body: JSON.stringify({ confirm: true }) });
+  } catch (error) {
+    setStatus(`重启失败：${error.message}`, 'error');
+    toast(`重启失败：${error.message}`, true);
+    return;
+  }
+  showServiceOffline({
+    title: '正在重启服务…',
+    body: '服务起来后页面会自动刷新；十秒还没反应就双击桌面图标手动启动。',
+    poll: true,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -2044,33 +2179,6 @@ async function removeFromList(subjectKey, reloadDetail = false) {
   await api(`/api/my/${encodeURIComponent(subjectKey)}`, { method: 'DELETE' });
   toast('已从列表移除');
   await refresh(reloadDetail);
-}
-
-async function syncSeason() {
-  const button = $('#sync-btn');
-  button.disabled = true;
-  setStatus('正在同步本季数据…');
-  try {
-    const result = await api(`/api/sync?season=${encodeURIComponent(state.season)}`, { method: 'POST' });
-    const failed = result.reports.filter((report) => !report.ok);
-    const changeCount = (result.changes ?? []).length;
-    setStatus(
-      `同步完成：写入 ${result.written} 部 / ${result.episodeCount} 集` +
-        (result.archive.toBacklog.length ? ` · ${result.archive.toBacklog.length} 部移入补番库` : '') +
-        (changeCount ? ` · 检测到 ${changeCount} 条改档` : '') +
-        (failed.length ? ` · ${failed.length} 个源失败` : ''),
-      failed.length ? 'error' : 'ok',
-    );
-    reportArchiveMove(result.moved ?? result.archive.moved ?? []);
-    if (changeCount) toast(`检测到 ${changeCount} 条延期/改档，已记入「变更」`);
-    for (const report of failed) toast(`${report.provider} 失败：${(report.error ?? '').split('\n')[0]}`, true);
-    await refresh();
-    await refreshChangeBadge();
-  } catch (error) {
-    setStatus(`同步失败：${error.message}`, 'error');
-  } finally {
-    button.disabled = false;
-  }
 }
 
 /**
@@ -2204,6 +2312,14 @@ function updateScopeDialogHtml() {
           <button class="btn btn-sm" data-scope-preset="library">库里全部季度</button>
           <button class="btn btn-sm" data-scope-preset="none">全不勾</button>
         </div>
+        <div class="scope-quick">
+          <span class="scope-quick-label">快捷动作</span>
+          <button class="btn btn-sm" data-scope-quick="sync-current"
+            title="只抓当季、不机翻；会取消「增量」，确保真的重抓一次（原来「更多 → 只同步本季」）">只同步当季</button>
+          <button class="btn btn-sm" data-scope-quick="translate-only"
+            title="不抓取，只给全库缺中文名的番补临时机翻（每次最多 200 条；原来「更多 → 补全中文名」）"
+            >只补中文名（不抓取）</button>
+        </div>
         <div class="scope-grid">${rows}</div>
         <div class="scope-add">
           <label class="field"><span>其它季度（库里没有的也能填）</span>
@@ -2219,7 +2335,7 @@ function updateScopeDialogHtml() {
         </label>
         <label class="scope-toggle">
           <input type="checkbox" id="scope-translate"${scope.translate === false ? '' : ' checked'} />
-          <span>顺带补中文名（机翻）。取消勾选＝这次只抓清单，中文名以后点「补全中文名（机翻）」再补。</span>
+          <span>顺带补中文名（机翻）。取消勾选＝这次只抓清单；只想单独补名，点上面的「只补中文名（不抓取）」。</span>
         </label>
         <div class="filter-note" id="scope-summary"></div>
       </aside>
@@ -2272,6 +2388,31 @@ function updateScopeSummaryText() {
     );
   }
   host.innerHTML = lines.join('<br />');
+}
+
+/**
+ * 「更新数据」里的两个快捷动作（原来在「更多」菜单里）。
+ *
+ * `sync-current`：把表单预设成「当季 + 不增量 + 不机翻」，让用户看一眼再点开始 ——
+ * 与原来那个一键同步是同一件事，只是多一次确认，但换来统一的进度条与「停止」。
+ * `translate-only`：跟季节选择无关，直接关掉对话框跑全库机翻任务。
+ */
+function applyScopeQuick(name) {
+  const scope = state.updateScope;
+  if (!scope) return;
+  if (name === 'sync-current') {
+    scope.picked = new Set([state.season].filter(Boolean));
+    scope.incremental = false;
+    scope.translate = false;
+    const modal = $('#modal');
+    if (modal) modal.innerHTML = updateScopeDialogHtml();
+    updateScopeSummaryText();
+    return;
+  }
+  if (name === 'translate-only') {
+    closeUpdateDialog();
+    void translateMissing();
+  }
 }
 
 /** 应用某个预设（只勾当季 / 老规矩 / 库里全部 / 全不勾）。 */
@@ -2485,9 +2626,15 @@ function showUpdateDetail(result) {
  * 补名这件事跟"当前在看哪一季"没关系 —— 你刚补完 2020 年的番，
  * 缺名的就在 2020 年，而不是界面上选中的这一季。
  */
+/**
+ * 只补中文名（机翻）。官方译名一到，更新数据会自动替换。
+ *
+ * 入口在「更新数据」对话框的「只补中文名（不抓取）」——不再占「更多」里一个位置。
+ * 范围是**全库缺中文名的条目**（最多 200 条/次，再点一次继续补）：
+ * 补名这件事跟"当前在看哪一季"没关系 —— 你刚补完 2020 年的番，
+ * 缺名的就在 2020 年，而不是界面上选中的这一季。
+ */
 async function translateMissing() {
-  const button = $('#translate-btn');
-  if (button) button.disabled = true;
   setStatus('正在为缺中文名的番做临时机翻（4 路并发）…');
   try {
     const job = await runJob('/api/translate?all=1&limit=200&async=1', {
@@ -2519,8 +2666,6 @@ async function translateMissing() {
     await refresh();
   } catch (error) {
     setStatus(`机翻失败：${error.message}`, 'error');
-  } finally {
-    if (button) button.disabled = false;
   }
 }
 
@@ -2628,7 +2773,13 @@ async function bootstrap() {
 // 否则点一次会跑两遍（「更新数据」跑两遍 = 两倍的源站请求与机翻额度）。
 // 这是加固时发现的既有缺陷：界面上点了会重复触发，只是以前的两个按钮恰好幂等才没暴露。
 // `search-go` 也是这样：它在 renderSeason 里直接绑 click，委托里不必再处理一次。
-const SELF_HANDLED = new Set(['update-btn', 'sync-btn', 'translate-btn', 'search-go']);
+// `shutdown-btn` / `restart-btn` 在 init 里直接绑（带确认框），同样排除。
+const SELF_HANDLED = new Set([
+  'update-btn',
+  'shutdown-btn',
+  'restart-btn',
+  'search-go',
+]);
 
 /**
  * 收起顶栏的「更多」菜单。
@@ -2814,6 +2965,21 @@ document.addEventListener('click', (event) => {
     applyScopePreset(dataset.scopePreset);
     return;
   }
+  if (dataset.scopeQuick) {
+    applyScopeQuick(dataset.scopeQuick);
+    return;
+  }
+  // ---- 通用确认框（停止 / 重启服务） ----
+  if (dataset.confirmOk) {
+    const action = state.confirmAction;
+    closeDetail();
+    action?.();
+    return;
+  }
+  if (dataset.confirmCancel) {
+    closeDetail();
+    return;
+  }
   if (dataset.scopeAdd) {
     addScopeSeason();
     return;
@@ -2935,8 +3101,8 @@ document.addEventListener('keydown', (event) => {
 
 // 「更新数据」先问范围（默认只更新当季），再走全流程 —— 见 openUpdateDialog
 $('#update-btn').addEventListener('click', () => openUpdateDialog());
-$('#sync-btn').addEventListener('click', () => void syncSeason());
-$('#translate-btn').addEventListener('click', () => void translateMissing());
+$('#shutdown-btn').addEventListener('click', () => confirmShutdown());
+$('#restart-btn').addEventListener('click', () => confirmRestart());
 $('#cancel-btn')?.addEventListener('click', () => {
   const button = $('#cancel-btn');
   if (button) button.disabled = true;

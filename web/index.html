@@ -4,6 +4,8 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>新番追番日历</title>
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <link rel="alternate icon" href="/icon-32.png" sizes="32x32" type="image/png" />
     <script>
       // 主题偏好要在第一帧之前落到 <html> 上，否则会先闪一下系统主题。
       try {
@@ -20,7 +22,7 @@
   <body>
     <header class="top">
       <div class="brand">
-        <span class="logo" aria-hidden="true">◈</span>
+        <img class="logo" src="/icon.svg" alt="" aria-hidden="true" />
         <div class="brand-text">
           <h1>新番追番日历</h1>
           <span class="brand-sub">放送表 · <span class="season-badge" id="season-badge">—</span></span>
@@ -58,18 +60,12 @@
         <!--
           低频操作收进「更多」菜单：顶栏原来是 5 个按钮 + 2 个下拉挤成一排，
           窄一点的窗口会换行成两三层。功能一个没少，只是不再占主视线。
+          「只同步本季」「补全中文名」已经并进「更新数据」对话框的快捷动作里 ——
+          长任务只留一个入口，进度条与「停止」也只有一套。
         -->
         <details class="menu" id="more-menu">
-          <summary class="btn" title="同步、导出与主题">更多 <span class="caret">▾</span></summary>
+          <summary class="btn" title="导出、服务与主题">更多 <span class="caret">▾</span></summary>
           <div class="menu-panel">
-            <button id="sync-btn" class="btn" title="只抓取当前选中的这一季（更快）">只同步本季</button>
-            <button
-              id="translate-btn"
-              class="btn"
-              title="给缺中文名的番加上临时机翻名；官方译名一到，更新数据时会自动替换"
-            >
-              补全中文名（机翻）
-            </button>
             <a id="ics-link" class="btn" href="/api/ics" title="导入手机系统日历，之后不打开本页面也能看"
               >导出日历 (.ics)</a
             >
@@ -80,6 +76,25 @@
               title="把你的追番列表、进度、手动修正、变更历史导出成 JSON —— 这些数据不可重建，建议定期留一份"
               >导出我的数据</a
             >
+
+            <div class="menu-section menu-service">
+              <span class="menu-label">服务</span>
+              <button
+                id="restart-btn"
+                class="btn"
+                title="重启本机服务（改了 src/ 之后用它生效；页面会在服务起来后自动刷新）"
+              >
+                重启服务
+              </button>
+              <button
+                id="shutdown-btn"
+                class="btn"
+                title="停止本机服务；下次双击桌面「新番追番日历」图标启动"
+              >
+                停止服务
+              </button>
+              <p class="menu-note">停止后页面会断开；下次双击桌面图标启动。</p>
+            </div>
 
             <div class="menu-section">
               <span class="menu-label">主题</span>

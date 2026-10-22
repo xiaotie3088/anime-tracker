@@ -10,6 +10,8 @@
  *   - 只监听 127.0.0.1，不对外暴露（这是单人本机工具，不需要鉴权）
  */
 
+import { spawn } from 'node:child_process';
+import { openSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import path from 'node:path';
@@ -652,6 +654,100 @@ async function handleTranslate(url: URL, reply: Reply): Promise<void> {
 }
 
 /**
+ * 「更多 → 停止服务 / 重启服务」的服务端实现。
+ *
+ * 为什么做成接口而不是继续用桌面 .cmd（`taskkill /F` 硬杀）：
+ *   1. 硬杀不会 checkpoint WAL；虽然 SQLite 崩溃安全，但每次都要去桌面找快捷方式太绕；
+ *   2. 网页里停 / 重启才能在「改了 src/ 忘了重启」时一条路走通（这次踩过的坑）。
+ *
+ * 安全：只接受 `POST` + `application/json` + `{"confirm":true}`。
+ * 跨站请求发不了 application/json（要预检），而本服务不回 CORS 头，别的网页关不掉它。
+ */
+async function readServiceAction(
+  req: IncomingMessage,
+): Promise<{ ok: true } | { ok: false; status: number; error: string }> {
+  const type = String(req.headers['content-type'] ?? '');
+  if (!type.includes('application/json')) {
+    return { ok: false, status: 400, error: '需要 application/json 请求体（防止其它网页误触）' };
+  }
+  let body: Record<string, unknown>;
+  try {
+    body = await readJsonBody(req);
+  } catch (error) {
+    return { ok: false, status: 400, error: error instanceof Error ? error.message : String(error) };
+  }
+  if (body.confirm !== true) return { ok: false, status: 400, error: '缺少 confirm: true' };
+  if (activeJob?.snapshot.running) {
+    return { ok: false, status: 409, error: '还有任务在跑：先点顶栏「停止」把它收尾，再停服务' };
+  }
+  return { ok: true };
+}
+
+/**
+ * 优雅退出：先 checkpoint 再关库。
+ *
+ * `server.close()` 会等现有连接结束；万一 keep-alive 迟迟不断，最多等 2 秒强退
+ * （数据已经 checkpoint 过，强退也不会丢）。
+ */
+function closeAndExit(after?: () => void): void {
+  const finish = () => {
+    try {
+      db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    } catch {
+      /* checkpoint 失败不影响退出 */
+    }
+    try {
+      db.close();
+    } catch {
+      /* 已经关过就算了 */
+    }
+    after?.();
+    process.exit(0);
+  };
+  const force = setTimeout(finish, 2000);
+  force.unref?.();
+  server.close(() => {
+    clearTimeout(force);
+    finish();
+  });
+}
+
+/** 先把 200 的响应发出去，再关 —— 否则页面只会看到连接被重置。 */
+function scheduleShutdown(): void {
+  setTimeout(() => closeAndExit(() => console.log('服务已停止（网页触发）。')), 120);
+}
+
+function scheduleRestart(): void {
+  setTimeout(() => {
+    closeAndExit(() => {
+      try {
+        const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+        // 把这些日志写进文件：重启出来的进程没有控制台，起不来时不然没人知道为什么。
+        // 放在库文件旁边（data/restart.log），与 launcher.log 分开，* .log 已被 gitignore。
+        let stdio: 'ignore' | ['ignore', number, number] = 'ignore';
+        try {
+          const fd = openSync(path.join(path.dirname(dbPath), 'restart.log'), 'a');
+          stdio = ['ignore', fd, fd];
+        } catch {
+          /* 日志写不了就静默启动，不因为日志拖垮重启 */
+        }
+        const child = spawn(process.execPath, [path.join(projectRoot, 'src', 'server', 'server.ts')], {
+          cwd: projectRoot,
+          env: process.env,
+          detached: true,
+          stdio,
+          windowsHide: true,
+        });
+        child.unref();
+        console.log('服务已重启（新进程已拉起）。');
+      } catch (error) {
+        console.error('重启失败：', error);
+      }
+    });
+  }, 120);
+}
+
+/**
  * 组装「我的数据」的导出内容（追番列表 + 进度 + 手动修正 + 变更记录）。
  *
  * 用户把追番列表当资产，所以必须能一键拿走 —— 而且导出的东西要能看懂，
@@ -995,6 +1091,28 @@ const server = createServer((req, res) => {
         return;
       }
 
+      // 停止 / 重启本机服务（网页「更多」里的两个动作）
+      if (pathname === '/api/shutdown' && req.method === 'POST') {
+        const verdict = await readServiceAction(req);
+        if (!verdict.ok) {
+          reply(verdict.status, { error: verdict.error });
+          return;
+        }
+        reply(200, { ok: true, message: '服务已停止' });
+        scheduleShutdown();
+        return;
+      }
+      if (pathname === '/api/restart' && req.method === 'POST') {
+        const verdict = await readServiceAction(req);
+        if (!verdict.ok) {
+          reply(verdict.status, { error: verdict.error });
+          return;
+        }
+        reply(200, { ok: true, message: '正在重启服务' });
+        scheduleRestart();
+        return;
+      }
+
       // 长任务进度（一键更新 / 补中文名）：前端轮询它画进度条
       if (pathname === '/api/job' && req.method === 'GET') {
         reply(200, { job: activeJob?.snapshot ?? null });
@@ -1056,18 +1174,37 @@ const server = createServer((req, res) => {
   })();
 });
 
-server.listen(PORT, HOST, () => {
-  console.log(`新番追番日历已启动：http://${HOST}:${PORT}`);
-  console.log(`数据库：${dbPath}`);
-  console.log('按 Ctrl+C 停止。');
+/**
+ * 监听端口。被占用时自动重试一小会儿 —— 「重启服务」的旧进程刚退出时，
+ * 端口可能还没完全释放；直接 EADDRINUSE 会让重启看起来"点了没反应"。
+ * 用户自己双击快捷方式两次也能被这条兜住（不会第二个进程默默崩掉）。
+ */
+let listenAttempts = 0;
+function startListening(): void {
+  server.listen(PORT, HOST, () => {
+    console.log(`新番追番日历已启动：http://${HOST}:${PORT}`);
+    console.log(`数据库：${dbPath}`);
+    console.log('按 Ctrl+C 停止。');
+  });
+}
+
+server.on('error', (error: NodeJS.ErrnoException) => {
+  if (error.code === 'EADDRINUSE' && listenAttempts < 20) {
+    listenAttempts += 1;
+    console.log(`端口 ${PORT} 还被占着，300ms 后重试（${listenAttempts}/20）…`);
+    setTimeout(startListening, 300);
+    return;
+  }
+  console.error('服务启动失败：', error);
+  process.exit(1);
 });
+
+startListening();
 
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
   process.on(signal, () => {
     console.log('\n正在关闭…');
-    server.close(() => {
-      db.close();
-      process.exit(0);
-    });
+    // 与网页「停止服务」走同一条退出路径：checkpoint WAL → 关库 → 退出
+    closeAndExit();
   });
 }

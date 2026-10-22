@@ -607,6 +607,41 @@ await check('POST /api/translate 不会覆盖已有的官方中文名', async ()
 });
 
 // ---------------------------------------------------------------------------
+console.log('\n停止 / 重启服务（网页「更多」）');
+// ---------------------------------------------------------------------------
+//
+// ⚠ 这里只测**拒绝路径**（400 / 404）。成功路径会把自检用的服务关掉，
+//   后面的用例全都会失败；「真的能停 / 真能重启」在副本服务上手动验过。
+
+await check('POST /api/shutdown 不接受没有 JSON 请求体的请求（防其它网页误触）', async () => {
+  const response = await fetch(`${BASE}/api/shutdown`, { method: 'POST' });
+  assert(response.status === 400, `期望 400，实际 HTTP ${response.status}`);
+});
+
+await check('POST /api/shutdown 必须带 confirm: true', async () => {
+  const response = await fetch(`${BASE}/api/shutdown`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: '{}',
+  });
+  assert(response.status === 400, `期望 400，实际 HTTP ${response.status}`);
+});
+
+await check('POST /api/restart 也必须带 confirm: true', async () => {
+  const response = await fetch(`${BASE}/api/restart`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ confirm: 'yes' }),
+  });
+  assert(response.status === 400, `期望 400，实际 HTTP ${response.status}`);
+});
+
+await check('GET /api/shutdown 不存在（只开 POST）', async () => {
+  const response = await fetch(`${BASE}/api/shutdown`);
+  assert(response.status === 404, `期望 404，实际 HTTP ${response.status}`);
+});
+
+// ---------------------------------------------------------------------------
 console.log('\n一键更新数据（用户诉求 2）');
 // ---------------------------------------------------------------------------
 

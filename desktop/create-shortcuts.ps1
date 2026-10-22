@@ -1,8 +1,14 @@
-# Create desktop shortcuts for the anime calendar.
+# Create the desktop shortcut for the anime calendar.
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File desktop\create-shortcuts.ps1
 #
 # You can also just double-click the .cmd file in this folder.
+#
+# Creates ONE shortcut: the silent launcher (start-anime-calendar.vbs) with the
+# project icon (desktop\app-icon.ico). Older versions created three shortcuts
+# (normal / silent / stop); this script deletes those and recreates the plain
+# name pointing at the silent launcher. Stop / restart now live in the web UI
+# ("More" menu) so they can shut down gracefully instead of taskkill /F.
 #
 # IMPORTANT: this file must stay 100% ASCII -- including comments.
 #
@@ -176,31 +182,88 @@ if ($blocked -eq 0) {
 }
 
 Write-Host ''
-Write-Host 'Creating desktop shortcuts ...'
-# The MAIN shortcut points at the visible .cmd launcher on purpose:
-#   - it does not need Windows Script Host (so security software that blocks .vbs
-#     cannot break it),
-#   - it does not need the http URL association (it starts a browser exe directly),
-#   - and when something goes wrong the reason is on screen instead of invisible.
-# The .vbs launcher is still created as a separate, silent option.
-New-Shortcut -Name "$startLabel.lnk" -Target $debugScript -Icon "$env:SystemRoot\System32\shell32.dll,43" -Description $startDescription
-New-Shortcut -Name "$silentLabel.lnk" -Target $startScript -Icon "$env:SystemRoot\System32\shell32.dll,77" -Description $silentDescription
-New-Shortcut -Name "$stopLabel.lnk" -Target $stopScript -Icon "$env:SystemRoot\System32\shell32.dll,27" -Description $stopDescription
+Write-Host 'Creating the desktop shortcut ...'
+# ONE shortcut only (the silent launcher):
+#   - the previous "normal" one opened a visible console; it is the same launcher
+#     with a console attached, so it added nothing but a second icon
+#   - stopping / restarting the server now lives in the web UI ("More" menu),
+#     which also checkpoints the SQLite WAL instead of a hard taskkill
+#   - the .cmd / .vbs files stay in desktop\ for troubleshooting; they just do
+#     not get their own desktop icons any more
+$iconSource = Join-Path $root 'desktop\app-icon.ico'
+if (-not (Test-Path -LiteralPath $iconSource)) {
+  throw "Icon not found: $iconSource"
+}
+
+# The shortcut points at a COPY of the icon under %LOCALAPPDATA%, not at the
+# file inside the project folder, on purpose:
+#   - the project folder can end up with an ACL / integrity label the Explorer
+#     icon extractor is not allowed to read (containers, sandboxes, some
+#     policy-managed folders). Windows then silently draws the generic blank
+#     document icon instead of the real one -- the shortcut itself looks fine,
+#     only the picture is wrong, which is confusing to debug
+#   - %LOCALAPPDATA% always has the normal per-user rights, so the shell can
+#     read it no matter where the project lives
+# The copy is refreshed on every run, so editing app-icon.ico + re-running this
+# script is enough to pick up a new icon.
+$iconDir = Join-Path $env:LOCALAPPDATA 'anime-tracker'
+New-Item -ItemType Directory -Path $iconDir -Force | Out-Null
+$iconPath = Join-Path $iconDir 'app-icon.ico'
+Copy-Item -LiteralPath $iconSource -Destination $iconPath -Force
+Unblock-File -LiteralPath $iconPath -ErrorAction SilentlyContinue
+
+# Create / overwrite the single plain-name shortcut FIRST, then drop the two
+# extra icons from older versions. Doing it in that order means a failure can
+# never leave the desktop with no shortcut at all.
+New-Shortcut -Name "$startLabel.lnk" -Target $startScript -Icon "$iconPath,0" -Description $silentDescription
+
+# Explorer caches icons per file path. A shortcut that was just re-created can
+# keep showing the icon of the PREVIOUS version until the cache is flushed, so
+# ask the shell to drop it now instead of telling the user to log off and on.
+try {
+  Add-Type -Namespace Win32 -Name Shell -MemberDefinition @'
+[DllImport("shell32.dll")]
+public static extern void SHChangeNotify(int eventId, uint flags, IntPtr item1, IntPtr item2);
+'@
+  # SHCNE_ASSOCCHANGED flushes the icon cache; SHCNF_FLUSH waits for it.
+  [Win32.Shell]::SHChangeNotify(0x08000000, 0x1000, [IntPtr]::Zero, [IntPtr]::Zero)
+  Write-Host '  icon cache: refreshed'
+} catch {
+  Write-Host '  icon cache: could not refresh (harmless, Explorer will catch up later)'
+}
+
+foreach ($oldName in @("$silentLabel.lnk", "$stopLabel.lnk")) {
+  $oldPath = Join-Path $desktop $oldName
+  if (-not (Test-Path -LiteralPath $oldPath)) { continue }
+  try {
+    Remove-Item -LiteralPath $oldPath -Force -ErrorAction Stop
+    Write-Host "  removed : $oldName"
+  } catch {
+    Write-Host "  WARN    : could not remove $oldName"
+    Write-Host "            $($_.Exception.Message)"
+  }
+}
 
 Write-Host ''
 if ($script:failures.Count -eq 0) {
   Write-Host 'Done. Double-click the shortcut on your desktop to start.'
   Write-Host ''
-  Write-Host 'Two launchers are created on purpose:'
-  Write-Host '  - the normal one opens a visible console, starts the server and opens the'
-  Write-Host '    browser; if anything goes wrong the reason is printed right there'
-  Write-Host '  - the "(silent)" one does the same without a console window and logs'
-  Write-Host '    every step to <project>\data\launcher.log'
+  Write-Host 'What changed:'
+  Write-Host '  - exactly ONE shortcut is created: silent start (no console window),'
+  Write-Host '    every step logged to <project>\data\launcher.log'
+  Write-Host '  - the old "(silent)" and "stop" extras are removed automatically'
+  Write-Host '    (the plain "New anime calendar" name is reused, no duplicate icons)'
+  Write-Host '  - stop / restart the server from the web page: More -> Stop service /'
+  Write-Host '    Restart service (a graceful shutdown, not taskkill /F)'
+  Write-Host '  - if the browser ever refuses to open, run desktop\start-anime-calendar-debug.cmd'
+  Write-Host '    by hand: same launcher, visible console, real error text'
   Write-Host ''
-  Write-Host 'Neither of them relies on the Windows http:// URL association, so they keep'
-  Write-Host 'working even when the default browser is uninstalled or moved.'
+  Write-Host 'The shortcut starts the browser directly (it does not rely on the Windows'
+  Write-Host 'http:// URL association), so it keeps working when the default browser is'
+  Write-Host 'uninstalled or moved.'
   Write-Host "Server: http://127.0.0.1:8787    Database: $root\data\anime.db"
   Write-Host "Log:    $root\data\launcher.log"
+  Write-Host "Icon:   $iconPath  (a copy, so Explorer can always read it)"
 } else {
   Write-Host 'Some shortcuts could not be written.'
   Write-Host "Desktop path: $desktop"

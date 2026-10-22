@@ -1797,6 +1797,20 @@ check('导航栏不再有「搜索 / 加番」入口，但搜索视图的代码�
   assert.ok(appJs.includes('function renderSearch'), 'renderSearch 不该被删');
 });
 
+check('「更多」菜单只留长任务一个入口，服务开关搬进网页', () => {
+  const indexHtml = readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
+  const serverTs = readFileSync(new URL('../src/server/server.ts', import.meta.url), 'utf8');
+  // 用户要求：桌面只留一个静默启动快捷方式，停止/重启进网页。
+  assert.equal(indexHtml.includes('id="sync-btn"'), false, '「只同步本季」应已并进更新对话框');
+  assert.equal(indexHtml.includes('id="translate-btn"'), false, '「补全中文名」应已并进更新对话框');
+  assert.ok(indexHtml.includes('id="shutdown-btn"'), '「更多」里要有「停止服务」');
+  assert.ok(indexHtml.includes('id="restart-btn"'), '「更多」里要有「重启服务」');
+  assert.ok(indexHtml.includes('/icon.svg'), '页面要有 favicon / 顶栏 logo');
+  assert.ok(appJs.includes('data-scope-quick'), '更新对话框要提供「只同步当季 / 只补中文名」');
+  assert.ok(appJs.includes('/api/shutdown') && appJs.includes('/api/restart'), '前端要调这两个接口');
+  assert.ok(serverTs.includes("'/api/shutdown'") && serverTs.includes("'/api/restart'"), '服务端要有这两个路由');
+});
+
 check('点击委托里「卡片整体可点」的分支必须排在所有按钮分支之后', () => {
   // 为什么用静态检查兜这件"顺序"：点卡片弹详情是靠"按钮分支都先 return"来实现的，
   // 一旦有人把 dataset.subjectRow 那条挪到按钮分支前面，点「追番 / 移除」就会连带弹出详情

@@ -296,14 +296,9 @@ a { color: inherit; }
 }
 
 .logo {
-  display: grid;
-  place-items: center;
+  display: block;
   width: 30px;
   height: 30px;
-  background: var(--accent);
-  color: var(--accent-ink);
-  font-size: 16px;
-  line-height: 1;
   flex: none;
 }
 
@@ -408,6 +403,19 @@ a { color: inherit; }
   font: 500 var(--fs-2xs) / 1 var(--font-mono);
   letter-spacing: .1em;
   color: var(--text-faint);
+}
+
+/* 服务区两个按钮各占一整行（主题那三段按钮不能套这条规则） */
+.menu-service .btn { width: 100%; }
+
+/* 菜单里的说明（「停止服务」下面的下一步提示）：常驻、别用 tooltip 藏起来 */
+.menu-note {
+  margin: 2px 0 0;
+  padding: 0 6px;
+  font: 500 var(--fs-2xs) / 1.6 var(--font-mono);
+  color: var(--text-faint);
+  white-space: normal;
+  max-width: 220px;
 }
 
 .theme-switch {
@@ -1927,6 +1935,24 @@ main {
 
 .scope-presets { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
 
+/* 「更新数据」里的快捷动作：原来「更多」里的「只同步本季 / 补全中文名」收在这里 */
+.scope-quick {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 12px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--border);
+}
+
+.scope-quick-label {
+  margin-right: 2px;
+  font: 500 var(--fs-2xs) / 1 var(--font-mono);
+  letter-spacing: .1em;
+  color: var(--text-faint);
+}
+
 .scope-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -2010,6 +2036,26 @@ main {
 }
 
 .empty-inline { padding: 18px 0; }
+
+/* 服务已停止 / 正在重启：整页只留这一块，别让人对着一堆失效按钮点 */
+.offline {
+  max-width: 520px;
+  margin: 9vh auto 0;
+  padding: 28px 26px 22px;
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  text-align: center;
+}
+
+.offline img { width: 64px; height: 64px; }
+
+.offline h2 { margin: 14px 0 8px; font-size: 20px; }
+
+.offline p { margin: 0 0 6px; color: var(--text-dim); font-size: 13px; line-height: 1.8; }
+
+.offline .hint-line { font: 500 var(--fs-xs) / 1.7 var(--font-mono); color: var(--text-faint); }
+
+.offline-actions { display: flex; justify-content: center; gap: 8px; margin: 16px 0 4px; }
 
 .empty code {
   padding: 1px 4px;

@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="新番追番日历">
+  <rect x="16" y="16" width="224" height="224" rx="54" fill="#f8f5ee" stroke="#14161a" stroke-width="10" />
+  <rect x="32" y="32" width="192" height="46" rx="12" fill="#14161a" />
+  <path d="M128 78v162M16 158h224" stroke="#14161a" stroke-width="10" fill="none" />
+  <rect x="133" y="166" width="95" height="69" fill="#b8331b" />
+</svg>
