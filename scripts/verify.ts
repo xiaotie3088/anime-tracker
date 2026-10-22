@@ -29,6 +29,11 @@ import type { DayRule } from '../src/core/calendar.ts';
 import { decideMachineTranslation, isLatinOnly, isReadableChinese } from '../src/core/mt.ts';
 import { mergeSubjects, normalizeTitle } from '../src/core/merge.ts';
 import { anilistSeasonId } from '../src/providers/anilist.ts';
+import {
+  DEFAULT_TRANSLATE_CONCURRENCY,
+  DEFAULT_TRANSLATE_INTERVAL_MS,
+  translateTitles,
+} from '../src/providers/mt.ts';
 import { detectChanges, detectTotalEpsChange } from '../src/server/changes.ts';
 import {
   countdown,
@@ -39,6 +44,7 @@ import {
   resolveAiringSlot,
   seasonDateRange,
   seasonFromId,
+  seasonIsPast,
   seasonOf,
   shiftSeason,
   toLiteralJstTime,
@@ -69,6 +75,9 @@ import {
   listTranslationCandidates,
   logChange,
   logChanges,
+  recordSeasonFetch,
+  getSeasonFetchState,
+  listSeasonFetchStates,
   migrate,
   openDb,
   pruneBackups,
@@ -82,8 +91,10 @@ import {
   setOverride,
   stats,
   upsertSubject,
+  upsertSubjects,
 } from '../src/server/db.ts';
-import { healMachineTitles, archiveSkipDecision, DEFAULT_BACKFILL, resolveArchiveSeasons, translateMissingTitles } from '../src/server/sync.ts';
+import { healMachineTitles, DEFAULT_BACKFILL, resolveArchiveSeasons, seasonFetchDecision, translateMissingTitles } from '../src/server/sync.ts';
+import type { SeasonFetchState } from '../src/server/db.ts';
 
 // ---------------------------------------------------------------------------
 // 极简测试骨架
@@ -1923,32 +1934,134 @@ check('from/to 写反了自动换过来；跨年也对', () => {
   assert.ok(resolveArchiveSeasons({ fromSeason: '1990-01', toSeason: '2030-01' }).length <= 64);
 });
 
-check('增量判定：库里已有的季度跳过，force / minSubjects 能改变结论', () => {
-  // 1) 库里**没有**的季度绝不能被误判成 skip（老季度 404 也要真去试一次）
-  assert.equal(archiveSkipDecision(0).skip, false);
-  // 2) 已有数据 → 跳过，且理由里要说清怎么重抓
-  const skipped = archiveSkipDecision(31);
-  assert.equal(skipped.skip, true);
-  assert.ok((skipped.note ?? '').includes('force'), `跳过理由要提到 force，实际：${skipped.note}`);
-  // 3) force → 不跳过（重抓）
-  assert.equal(archiveSkipDecision(31, { force: true }).skip, false);
-  // 4) minSubjects 的口径
-  assert.equal(archiveSkipDecision(3, { minSubjects: 5 }).skip, false);
-  assert.equal(archiveSkipDecision(5, { minSubjects: 5 }).skip, true);
+check('过去季度不抓逐集放送时刻：判定只认「季度 id 早于当季」', () => {
+  const now = new Date('2026-10-15T00:00:00.000Z'); // 当季 = 2026-10
+  assert.equal(seasonIsPast('2026-10', now), false, '当季不算过去');
+  assert.equal(seasonIsPast('2027-01', now), false, '未来季度更不算');
+  assert.equal(seasonIsPast('2026-07', now), true, '上一季算过去');
+  assert.equal(seasonIsPast('2015-04', now), true);
+  // 跨年边界：1 月的当季往前是上一年 10 月
+  const jan = new Date('2026-01-05T00:00:00.000Z');
+  assert.equal(seasonIsPast('2025-10', jan), true);
+  assert.equal(seasonIsPast('2026-01', jan), false);
 });
 
-check('archiveSkipDecision 与库里的实际条数对得上（内存库真查一次）', () => {
+check('增量判定看「上次真抓过」而不是「库里有几条」', () => {
+  const fetched: SeasonFetchState = {
+    season: '2024-01',
+    lastFetchedAt: '2026-10-20T13:08:00.000Z',
+    lastStatus: 'fetched',
+    lastWritten: 135,
+    lastEpisodes: 0,
+    lastAdded: 12,
+    lastSchedules: false,
+    lastProviders: [],
+  };
+  // 1) 从没真抓过 -> 一定抓（正是「库里 10 部、但全是邻季漏入」的场景）
+  assert.equal(seasonFetchDecision({ incremental: true }).skip, false);
+  // 2) 非增量 -> 一定抓
+  assert.equal(seasonFetchDecision({ incremental: false, state: fetched }).skip, false);
+  // 3) 真抓过 + 增量 -> 跳过，理由里要说清"上次什么时候抓的"和怎么重抓
+  const skipped = seasonFetchDecision({ incremental: true, state: fetched });
+  assert.equal(skipped.skip, true);
+  assert.match(skipped.note ?? '', /上次真抓/);
+  assert.ok((skipped.note ?? '').includes('force'), `跳过理由要提到怎么重抓，实际：${skipped.note}`);
+  // 4) force -> 抓
+  assert.equal(seasonFetchDecision({ incremental: true, force: true, state: fetched }).skip, false);
+  // 5) 上次所有源都失败 -> 不算"抓过了"，下次重试
+  assert.equal(
+    seasonFetchDecision({ incremental: true, state: { ...fetched, lastStatus: 'failed', lastWritten: 0 } }).skip,
+    false,
+  );
+  // 6) 上次源站没返回数据 -> 跳过，但理由与"抓到了"不同
+  const empty = seasonFetchDecision({ incremental: true, state: { ...fetched, lastStatus: 'empty', lastWritten: 0 } });
+  assert.equal(empty.skip, true);
+  assert.match(empty.note ?? '', /没返回数据/);
+});
+
+check('回归：库里已有条目 ≠ 抓过（没有抓取记录就一定要抓）', () => {
   const scopeDb = openDb(':memory:');
   migrate(scopeDb);
-  // 两个季度：一个有数据、一个库里根本没有（2020-01）
-  upsertSubject(scopeDb, makeSubject('scope:1', { titleCn: '有数据的番' }), '2026-10');
-  assert.equal(seasonSubjectCount(scopeDb, '2026-10'), 1);
-  assert.equal(seasonSubjectCount(scopeDb, '2020-01'), 0);
-  assert.equal(archiveSkipDecision(seasonSubjectCount(scopeDb, '2026-10')).skip, true);
-  assert.equal(archiveSkipDecision(seasonSubjectCount(scopeDb, '2020-01')).skip, false);
-  // 顺带把"这次要抓哪几季"的整条链路合起来看一遍
-  assert.deepEqual(resolveArchiveSeasons({ seasons: ['2026-10', '2020-01'] }), ['2026-10', '2020-01']);
+  // 造出真实库里 2024-01 的样子：有条目（邻季漏入的），但抓取记录一行都没有
+  upsertSubject(scopeDb, makeSubject('scope:1', { titleCn: '邻季漏入的番' }), '2024-01');
+  assert.equal(seasonSubjectCount(scopeDb, '2024-01'), 1);
+  assert.equal(getSeasonFetchState(scopeDb, '2024-01'), undefined, '库里没有抓取记录');
+  // ⚠ 旧实现（archiveSkipDecision(1)）这一步返回 skip:true —— 就是「古早季度怎么更新都不增加」的根因
+  assert.equal(seasonFetchDecision({ incremental: true, state: getSeasonFetchState(scopeDb, '2024-01') }).skip, false);
+
+  // 真抓过之后（记一行状态）才会被增量跳过
+  recordSeasonFetch(scopeDb, {
+    season: '2024-01',
+    status: 'fetched',
+    written: 140,
+    episodes: 0,
+    added: 130,
+    schedules: false,
+    providers: [],
+  });
+  const state = getSeasonFetchState(scopeDb, '2024-01');
+  assert.equal(state?.lastStatus, 'fetched');
+  assert.equal(state?.lastSchedules, false, '过去季度不抓逐集时刻，这一位要如实记下来');
+  assert.equal(seasonFetchDecision({ incremental: true, state }).skip, true);
+  // 显式挑的季度默认不增量（runFullUpdate 传 incremental=false）→ 同样不跳过
+  assert.equal(seasonFetchDecision({ incremental: false, state }).skip, false);
   scopeDb.close();
+});
+
+check('season_state 能写能读，且 seasonSummaries 会把「上次真抓」带出来', () => {
+  const stateDb = openDb(':memory:');
+  migrate(stateDb);
+  recordSeasonFetch(stateDb, {
+    season: '2015-04',
+    status: 'fetched',
+    written: 200,
+    episodes: 0,
+    added: 198,
+    schedules: false,
+    providers: [{ provider: 'anilist', ok: true, items: 128 }],
+  });
+  const state = getSeasonFetchState(stateDb, '2015-04');
+  assert.equal(state?.lastWritten, 200);
+  assert.equal(state?.lastAdded, 198);
+  assert.equal(state?.lastProviders.length, 1);
+  assert.equal(state?.lastProviders[0]?.provider, 'anilist');
+  assert.equal(listSeasonFetchStates(stateDb).size, 1);
+  // 同一条记录写两次只更新、不重复（ON CONFLICT）
+  recordSeasonFetch(stateDb, {
+    season: '2015-04',
+    status: 'fetched',
+    written: 210,
+    episodes: 0,
+    added: 0,
+    schedules: false,
+    providers: [],
+  });
+  assert.equal(listSeasonFetchStates(stateDb).size, 1);
+  assert.equal(getSeasonFetchState(stateDb, '2015-04')?.lastWritten, 210);
+
+  // 界面靠 seasonSummaries 里的 lastFetchedAt 判断「未真抓过」
+  upsertSubject(stateDb, makeSubject('scope:2', { titleCn: '季度体检样本' }), '2015-04');
+  const summary = seasonSummaries(stateDb).find((item) => item.season === '2015-04');
+  assert.equal(summary?.lastStatus, 'fetched');
+  assert.ok(summary?.lastFetchedAt, '要带出上次真抓时间');
+  // 没有抓取记录的季度 -> lastFetchedAt 为 null（界面据此标「未真抓过」）
+  upsertSubject(stateDb, makeSubject('scope:3', { titleCn: '只有邻季漏入' }), '2024-01');
+  assert.equal(seasonSummaries(stateDb).find((item) => item.season === '2024-01')?.lastFetchedAt, null);
+  stateDb.close();
+});
+
+check('upsert 要把「写入」与「新增」分开数（报告里「新增 X 部」的依据）', () => {
+  const countDb = openDb(':memory:');
+  migrate(countDb);
+  const first = upsertSubjects(countDb, [makeSubject('a:1'), makeSubject('a:2')], '2026-10');
+  assert.deepEqual(first, { written: 2, added: 2 });
+  // 第二次：a:1 已存在（更新）、a:3 是新的（新增）
+  const again = upsertSubjects(countDb, [makeSubject('a:1'), makeSubject('a:3')], '2026-10');
+  assert.deepEqual(again, { written: 2, added: 1 });
+  // 整批一个事务：不只是数对了，内容也要真的落库
+  const total = countDb.prepare('SELECT COUNT(*) AS n FROM subject').get() as { n: number };
+  assert.equal(total.n, 3);
+  countDb.close();
 });
 
 // 机翻那几个条目刻意"连原文都没有"（titleCn / titleOriginal 都不给）：
@@ -1999,6 +2112,35 @@ check('translateMissingTitles 把季度数组原样传到候选查询（计数�
   assert.equal(scopedTranslation.translated.length, 0);
   assert.equal(scopedTranslation.failed.length, 0, '没有可用原文的条目应算"跳过"，不是失败');
   mtScopeDb.close();
+});
+
+// ---------------------------------------------------------------------------
+section('十七、性能：机翻并发与「停止」（第八轮）');
+// ---------------------------------------------------------------------------
+
+check('机翻默认值只有一处来源，且与实测口径一致', () => {
+  // 实测（本机 2026-10-22）：并发 4 + 250ms → 24 条 7.7 秒 = 0.32 秒/条、3.1 请求/秒
+  // 对照旧实现：串行 + 每条先睡 700ms → 12 条 23 秒 = 1.92 秒/条
+  assert.equal(DEFAULT_TRANSLATE_CONCURRENCY, 4);
+  assert.equal(DEFAULT_TRANSLATE_INTERVAL_MS, 250);
+  assert.ok(DEFAULT_TRANSLATE_CONCURRENCY > 1, '并发必须 > 1，否则"提速"又退回去了');
+});
+
+check('translateTitles 空列表直接返回（不空转、不发请求）', async () => {
+  const started = Date.now();
+  const results = await translateTitles([]);
+  assert.deepEqual(results, []);
+  assert.ok(Date.now() - started < 200, '空列表不该有任何等待');
+});
+
+check('shouldStop 一上来就该掐断整批（「停止」按钮的语义）', async () => {
+  // 故意用空标题：即使没被掐断也不会真的发请求（translateTitle 对空文本直接返回失败）
+  const results = await translateTitles(['', '', '', ''], { shouldStop: () => true });
+  assert.equal(results.length, 4);
+  assert.ok(
+    results.every((item) => item === undefined),
+    '已停止时不应产生任何结果（调用方按"未翻"处理）',
+  );
 });
 
 // ---------------------------------------------------------------------------

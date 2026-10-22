@@ -10,13 +10,26 @@ import type { SeasonInfo } from '../core/time.ts';
 
 export type ProviderCapability = 'season' | 'episodes' | 'search' | 'platforms';
 
+/**
+ * 抓一季时可选的取舍。
+ *
+ * `schedules`（默认 true）：要不要抓**逐集放送时刻**。
+ * 过去季度（`time.seasonIsPast()`）会被调用方传 false —— 番早就播完了，
+ * 逐集时刻没有使用场景，却要为此多拉几十倍的 JSON、多写几千行 `episode`。
+ * 注意它**不影响**首播时刻（`firstAirAtUtc`）与放送日历归属（`broadcastWeekdayJst`）：
+ * 那两项各只有一条、且是「季度归属」与总览排序的依据，任何时候都要有。
+ */
+export type SeasonFetchOptions = {
+  schedules?: boolean;
+};
+
 export interface Provider {
   id: SourceId;
   label: string;
   /** 该源能为哪些能力负责 */
   capabilities: readonly ProviderCapability[];
   /** 抓取一个季度的全部番剧 */
-  fetchSeason(season: SeasonInfo): Promise<RawSeasonAnime[]>;
+  fetchSeason(season: SeasonInfo, options?: SeasonFetchOptions): Promise<RawSeasonAnime[]>;
   /** 抓取某部番的分集列表（入参为该源的内部 ID） */
   fetchEpisodes?(externalId: string): Promise<RawEpisode[]>;
   /**
@@ -38,6 +51,7 @@ export type ProviderRunReport = {
 export async function runProviders(
   providers: readonly Provider[],
   season: SeasonInfo,
+  options: SeasonFetchOptions = {},
 ): Promise<{ results: Map<SourceId, RawSeasonAnime[]>; reports: ProviderRunReport[] }> {
   const results = new Map<SourceId, RawSeasonAnime[]>();
   const reports: ProviderRunReport[] = [];
@@ -47,7 +61,7 @@ export async function runProviders(
       .filter((p) => p.capabilities.includes('season'))
       .map(async (provider) => {
         const startedAt = Date.now();
-        const items = await provider.fetchSeason(season);
+        const items = await provider.fetchSeason(season, options);
         return { provider, items, elapsedMs: Date.now() - startedAt };
       }),
   );

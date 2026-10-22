@@ -182,3 +182,28 @@ CREATE TABLE IF NOT EXISTS sync_run (
 );
 
 CREATE INDEX IF NOT EXISTS idx_sync_run_time ON sync_run(started_at);
+
+-- ---------------------------------------------------------------------------
+-- 每个季度「上一次真抓」的结果
+-- ---------------------------------------------------------------------------
+--
+-- 为什么需要它（第八轮）：增量回填以前用「库里这个季度有几条」判断「抓过没有」，
+-- 而季度归属是按**条目自己的放送时刻**纠正的 —— 抓 2024-04 会顺带把 3 月开播的番
+-- 判进 2024-01、把 7 月上旬开播的番判进 2024-07。于是 2024-01 永远"有 10 部"，
+-- 回填于是永远跳过它，用户看到的是「一个季度只有几部番，怎么更新都不增加」。
+--
+-- 这张表记的是**抓取行为本身**，不是数据现状：一条记录都没有 = 从没真抓过 = 该抓。
+-- 与 sync_run 的区别：sync_run 是逐次运行的流水账（只追加、可清空），
+-- 本表是每季一行的当前状态，直接参与「这次要不要跳过」的判定。
+CREATE TABLE IF NOT EXISTS season_state (
+  season          TEXT PRIMARY KEY,             -- 形如 "2024-01"
+  last_fetched_at TEXT    NOT NULL,             -- ISO8601 UTC
+  -- 'fetched'（抓到了并写库）| 'empty'（源站没给这个季度的数据）| 'failed'（所有源都失败）
+  last_status     TEXT    NOT NULL,
+  last_written    INTEGER NOT NULL DEFAULT 0,    -- 上次写入了多少部
+  last_episodes   INTEGER NOT NULL DEFAULT 0,    -- 上次写入了多少条分集
+  last_added      INTEGER NOT NULL DEFAULT 0,    -- 上次里有多少是**新增**（库里原本没有）
+  last_schedules  INTEGER NOT NULL DEFAULT 1,    -- 上次有没有抓逐集放送时刻
+  last_providers  TEXT    NOT NULL DEFAULT '[]'  -- 各源成败（JSON，与 sync_run.providers 同构）
+);
+

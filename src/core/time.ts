@@ -295,6 +295,21 @@ export function seasonDateRange(id: string, padDays = 15): { startUtc: string; e
   };
 }
 
+/**
+ * 这个季度是否**已经过去**（含上一季，但不含当季）。
+ *
+ * 用途：过去季度的番早就播完了，逐集放送时刻没有使用场景
+ * （周视图只关心当季 / 追番中，「下一集还有多久」对它们是负数），
+ * 所以抓取时可以整段省掉 —— 见 `fetchSeason()` 的 `schedules` 选项。
+ *
+ * 判据是季度 id 的字典序：`'YYYY-NN'` 的字典序 == 时间序（月份只有 01/04/07/10）。
+ * 刻意不用 `Date` 比较区间边界：季度是日历概念，不该受一天里的时刻影响。
+ */
+export function seasonIsPast(id: string, now: Date = new Date()): boolean {
+  const target = seasonFromId(id).id;
+  return target < seasonOf(now).id;
+}
+
 /** 上一个 / 下一个季度，offset 可为负。 */
 export function shiftSeason(id: string, offset: number): string {
   const info = seasonFromId(id);

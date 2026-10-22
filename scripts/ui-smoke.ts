@@ -334,6 +334,36 @@ const fakeUpdateResult = {
   backup: { path: 'data/backups/anime-2026-10-06.db', bytes: 1024 },
 };
 
+// 「更新数据」现在是后台任务：POST /api/update?async=1 只回一个任务快照，
+// 前端轮询 /api/job 拿进度与最终结果。所以壳里要模拟这两步。
+const fakeJobRunning = {
+  kind: 'update',
+  running: true,
+  stage: 'fetch',
+  message: '正在抓取 2026-10…',
+  currentSeason: '2026-10',
+  seasons: [],
+  translate: { done: 0, total: 0 },
+  startedAt: '2026-10-22T00:00:00.000Z',
+  finishedAt: null,
+  cancelRequested: false,
+};
+
+const fakeJobDone = {
+  ...fakeJobRunning,
+  running: false,
+  stage: 'done',
+  message: '完成',
+  currentSeason: null,
+  seasons: [
+    { season: '2026-10', status: 'fetched', written: 90, added: 2 },
+    { season: '2024-10', status: 'fetched', written: 30, added: 30 },
+  ],
+  translate: { done: 12, total: 12 },
+  finishedAt: '2026-10-22T00:00:09.000Z',
+  result: fakeUpdateResult,
+};
+
 const fetchStub = async (
   url: string,
   options: { method?: string; body?: string } = {},
@@ -345,8 +375,12 @@ const fetchStub = async (
     method: options.method ?? 'GET',
     body: options.body ?? '',
   });
+  if (target.includes('/api/job')) {
+    // 轮询：第一次就给"已完成"，这样测试不必等真的几秒
+    return { ok: true, status: 200, text: async () => JSON.stringify({ job: fakeJobDone }) };
+  }
   if (target.includes('/api/update')) {
-    return { ok: true, status: 200, text: async () => JSON.stringify(fakeUpdateResult) };
+    return { ok: true, status: 202, text: async () => JSON.stringify({ job: fakeJobRunning }) };
   }
   if (target.includes('/api/my')) {
     // GET 返回真实数据；PATCH 只要回 ok 就行（patchMy 随后会重新 GET）
@@ -363,6 +397,7 @@ const fetchStub = async (
 // `modal-backdrop` / `modal` 是 openDetail() 要用的（index.html 里也有），必须一并建出来。
 for (const id of [
   'update-btn',
+  'cancel-btn',
   'sync-btn',
   'translate-btn',
   'season-select',
@@ -424,10 +459,18 @@ const appEl = getById('app');
 await new Promise((resolve) => setTimeout(resolve, 80));
 
 state.season = '2026-10';
-state.selectedSeasons = ['2026-10'];
+/**
+ * 「当季」与主季定序都认 `state.currentSeason`（真实代码在 bootstrap 里从
+ * `/api/overview?season=` 取）。这个壳跳过 bootstrap 直接塞数据，所以这里也要显式给 ——
+ * 否则「当季」预设会落到别的季度上。
+ */
+state.currentSeason = (overview as { season?: { id?: string } }).season?.id ?? '2026-10';
+state.selectedSeasons = [state.season];
 state.overview = overview;
 state.view = 'season';
 state.searchQuery = '';
+state.searchDraft = '';
+state.seasonsOpen = false;
 state.statusAnd = true;
 
 let failures = 0;
@@ -467,6 +510,16 @@ console.log(`初始列表行数=${total}`);
 // ---- 筛选相关的公共小工具（必须在第一个用到它们的断言之前声明：这里是 const 箭头函数，有 TDZ）----
 
 const rowCountNow = () => appEl.querySelectorAll('.subject-row').length;
+/** 轮询等条件成立：重绘 / 请求都是异步的，固定 sleep 在慢机器上会偶发假红。 */
+const waitFor = async (predicate: () => boolean, label: string, timeoutMs = 15_000) => {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (predicate()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  console.log(`    ⚠ 等待超时：${label}`);
+  return false;
+};
 /** 按"属性名 + 精确值"取按钮（见文件里既有的口径：不用 dataset 驼峰键）。 */
 const findChip = (attr: string, value: string) =>
   appEl.querySelectorAll('button').find((b) => b.attrs[attr] === value);
@@ -489,6 +542,7 @@ const resetFilters = () => {
     side: [],
   };
   state.searchQuery = '';
+  state.searchDraft = '';
   app.renderSeason();
 };
 
@@ -503,7 +557,13 @@ const bodySlot = appEl.querySelector('#filter-panel-body');
 ok('面板拆成 第 1 层 / 第 2~5 层 两个槽', Boolean(headSlot) && Boolean(bodySlot));
 const searchEl = appEl.querySelector('#season-search');
 ok('搜索框在面板第 1 层里', Boolean(searchEl) && searchEl?.closest('#filter-panel-head') !== null);
-ok('搜索框绑上了 input 监听', (searchEl?.listeners.input?.length ?? 0) > 0);
+ok('搜索框绑上了 input 监听（现在只更新草稿，不直接筛）', (searchEl?.listeners.input?.length ?? 0) > 0);
+ok('「搜索」按钮渲染出来了，且排在「筛选」左边', (() => {
+  const head = appEl.querySelector('#filter-panel-head');
+  const buttons = head?.querySelectorAll('button') ?? [];
+  const names = buttons.map((b) => (b.id || ''));
+  return names.indexOf('search-go') >= 0 && names.indexOf('search-go') < names.indexOf('filter-toggle');
+})(), `按钮顺序=${(appEl.querySelector('#filter-panel-head')?.querySelectorAll('button') ?? []).map((b) => b.id).join(',')}`);
 ok('部数提示在搜索框那一层（显示 N / M 部）', (appEl.querySelector('#subject-count')?.textContent ?? '').includes('部'));
 
 // 票的硬性验收：搜索框焦点不因点筛选而丢失。
@@ -552,6 +612,61 @@ collapseBtn()?.click();
 resetFilters();
 state.filtersCollapsed = false;
 app.renderSeason();
+
+console.log('\n【A4】搜索改成显式提交：打字只写草稿，点「搜索」/ Enter 才筛（.scratch/season-picker）');
+const searchInput = () => appEl.querySelector('#season-search');
+const searchGo = () => appEl.querySelector('#search-go');
+const searchRows = () => appEl.querySelectorAll('.subject-row').length;
+const rowsAtStart = searchRows();
+const firstSubject = (
+  overview as { subjects: { titleCn?: string; titleOriginal?: string }[] }
+).subjects[0];
+const keyword = String(firstSubject?.titleCn ?? firstSubject?.titleOriginal ?? '');
+ok('取到了可用于搜索的关键词（否则这一节测不出东西）', keyword.length > 0, `keyword="${keyword}"`);
+const inputNodeNow = searchInput();
+inputNodeNow!.value = keyword;
+inputNodeNow!.dispatch('input');
+ok('打字只写草稿、不改已提交的搜索词', state.searchDraft === keyword && state.searchQuery === '');
+ok('打字时列表一行都不动（用户要的"别边打边搜"）', searchRows() === rowsAtStart, `${searchRows()} vs ${rowsAtStart}`);
+ok('「搜索」按钮进入待提交状态（is-pending）', searchGo()?.classList.contains('is-pending') === true);
+searchGo()?.click();
+ok(
+  '点「搜索」后真的筛了（且只剩包含关键词的行）',
+  state.searchQuery === keyword && searchRows() >= 1 && searchRows() < rowsAtStart,
+  `行数 ${rowsAtStart}→${searchRows()}`,
+);
+ok('点搜索不换掉输入框节点（焦点不会丢）', searchInput() === inputNodeNow);
+ok(
+  '已提交的关键词显示在部数旁（#search-active）',
+  collectText(appEl.querySelector('#search-active')).includes(keyword),
+  `实际=${JSON.stringify(collectText(appEl.querySelector('#search-active')))}`,
+);
+ok('待提交圆点消失（草稿 = 已提交）', searchGo()?.classList.contains('is-pending') === false);
+
+inputNodeNow!.value = `${keyword} `;
+inputNodeNow!.dispatch('input');
+inputNodeNow!.dispatch('keydown', { key: 'Enter' });
+ok('按 Enter 与点「搜索」等效', state.searchQuery === keyword);
+
+inputNodeNow!.value = '';
+inputNodeNow!.dispatch('input');
+ok(
+  '把输入框清空就立即清除筛选（不会停在旧词上）',
+  state.searchQuery === '' && searchRows() === rowsAtStart,
+  `行数=${searchRows()} query="${String(state.searchQuery)}"`,
+);
+
+inputNodeNow!.value = keyword;
+inputNodeNow!.dispatch('input');
+inputNodeNow!.dispatch('keydown', { key: 'Enter' });
+const searchClearBtn = appEl.querySelector('#search-active')?.querySelectorAll('button')[0];
+searchClearBtn?.click();
+ok(
+  '点关键词旁的 ✕ 能清除搜索（输入框也清空）',
+  state.searchQuery === '' && searchRows() === rowsAtStart && searchInput()?.value === '',
+  `query="${String(state.searchQuery)}" input="${searchInput()?.value}"`,
+);
+resetFilters();
 
 console.log('\n【B】逐个点各类筛选块，看哪一类没反应');
 const cases: { label: string; attr: string; value: string; expectChange: boolean }[] = [
@@ -907,7 +1022,7 @@ ok(
   Boolean(appEl.querySelector('#season-search')) && Boolean(appEl.querySelector('#filter-panel')),
 );
 
-// 季度全选：按钮要排在季度标签**最前面**，点一次选中库里所有季度。
+// 季度区改版（.scratch/season-picker）：收起时一行，点开是按年矩阵。
 const overviewSeasons = ((overview as { seasonSummaries?: { season: string }[] }).seasonSummaries ?? []).map(
   (item) => item.season,
 );
@@ -916,36 +1031,100 @@ console.log(`    库里季度=${overviewSeasons.join(', ')}`);
 // 这个文件里找节点的既有口径是"属性名 + 精确值"（见 findChip 的 `b.attrs[attr] === value`），
 // dataset 的键是驼峰形态，两套混用容易在看代码的人那里产生误解。
 const findSeasonAll = () => appEl.querySelectorAll('button').find((b) => 'data-season-all' in b.attrs);
+const findSeasonBtn = (attr: string, value: string) =>
+  appEl.querySelectorAll('button').find((b) => b.attrs[attr] === value);
+const pickerBtn = () => appEl.querySelector('#season-picker-btn');
+const seasonPanelEl = () => appEl.querySelector('#season-panel');
+const pickedCount = () => appEl.querySelector('#season-picks-count')?.textContent ?? '';
+const pickedIds = () => state.selectedSeasons as string[];
+
+ok('季度区收起时只占一行：面板是 hidden 的', seasonPanelEl()?.hidden === true);
+ok('「选择季度」与「全选」都在收起的那一行里', Boolean(pickerBtn()) && Boolean(findSeasonAll()));
+ok('已选季度渲染成可点掉的 chip（默认 1 个）', appEl.querySelectorAll('.chip.is-active').length === 1);
+
+pickerBtn()?.click();
+ok(
+  '点「选择季度」展开面板（只切 hidden，不重绘）',
+  seasonPanelEl()?.hidden === false && state.seasonsOpen === true,
+);
+
+const seasonYears = [...new Set(overviewSeasons.map((id) => id.slice(0, 4)))];
+const expectedCells = seasonYears.length * 4;
+ok(
+  '矩阵格子数 = 年份 × 4（缺的季度也占一格）',
+  appEl.querySelectorAll('.season-cell').length === expectedCells,
+  `实际=${appEl.querySelectorAll('.season-cell').length} 期望=${expectedCells}（${seasonYears.length} 年）`,
+);
+ok(
+  `库里缺的季度显示为「—」（${expectedCells - overviewSeasons.length} 格）`,
+  appEl.querySelectorAll('.season-cell.is-empty').length === expectedCells - overviewSeasons.length,
+);
+
+// 点格子 = 加进选中集合；再点一次取消
+const cellTarget = overviewSeasons.find((id) => id !== state.currentSeason) ?? overviewSeasons[0];
+findSeasonBtn('data-season-toggle', cellTarget)?.click();
+await waitFor(() => pickedCount() === '已选 2 季', '点格子后重绘');
+ok(`点格子把 ${cellTarget} 加进选中集合`, pickedIds().includes(cellTarget), `实际=${pickedIds().join(',')}`);
+ok('面板展开状态在重绘后保留', seasonPanelEl()?.hidden === false);
+findSeasonBtn('data-season-toggle', cellTarget)?.click();
+await waitFor(() => pickedCount() === '已选 1 季', '取消后重绘');
+ok(`再点一次把 ${cellTarget} 取消`, !pickedIds().includes(cellTarget), `实际=${pickedIds().join(',')}`);
+
+// 点「全年」：该年一起选中 / 取消（取消到空回落到当季）
+const yearOfCurrent = String(state.currentSeason).slice(0, 4);
+const yearIds = overviewSeasons.filter((id) => id.startsWith(`${yearOfCurrent}-`));
+findSeasonBtn('data-season-year', yearOfCurrent)?.click();
+await waitFor(() => pickedCount() === `已选 ${yearIds.length} 季`, '全年选中后重绘');
+ok(
+  `点「全年」把 ${yearOfCurrent} 年 ${yearIds.length} 季一起选中`,
+  yearIds.every((id) => pickedIds().includes(id)),
+);
+findSeasonBtn('data-season-year', yearOfCurrent)?.click();
+await waitFor(() => pickedCount() === '已选 1 季', '取消全季后重绘');
+ok(
+  '再点「全年」取消该年（不会变空，回落到当季）',
+  pickedIds().length === 1 && pickedIds()[0] === state.currentSeason,
+  `实际=${pickedIds().join(',')}`,
+);
+
+// 预设
+findSeasonBtn('data-season-preset', 'last4')?.click();
+await waitFor(() => pickedCount() === '已选 4 季', '近 4 季后重绘');
+ok(
+  '「近 4 季」选中 4 季，主季仍是当季',
+  pickedIds().length === 4 && pickedIds()[0] === state.currentSeason,
+);
+
+findSeasonBtn('data-season-preset', 'current')?.click();
+await waitFor(() => pickedCount() === '已选 1 季', '当季后重绘');
+ok('「当季」回到只选当季', pickedIds().join(',') === String(state.currentSeason));
+
+// 全选：一次选中全部；不再"再点一次回到当季"
 const allBtn = findSeasonAll();
 ok('渲染出「全选」按钮', Boolean(allBtn), `文本=${allBtn?.textContent.trim() ?? '(没有)'}`);
-if (allBtn) {
-  const chipRow = allBtn.parent;
-  const firstChip = chipRow?.children[0];
-  ok(
-    '「全选」排在季度标签最前面',
-    firstChip === allBtn,
-    `第一个是 <${firstChip?.tag} class="${firstChip?.className}">`,
-  );
-  const wantAll = [state.season, ...overviewSeasons.filter((s) => s !== state.season)];
-  allBtn.click();
-  await new Promise((resolve) => setTimeout(resolve, 30));
-  const gotAll = (state.selectedSeasons as string[]).join(',');
-  ok(
-    `点「全选」选中全部 ${wantAll.length} 个季度（主季仍是 ${String(state.season)}）`,
-    gotAll === wantAll.join(','),
-    `实际=${gotAll}`,
-  );
-  const freshAll = findSeasonAll();
-  ok('全部选中时「全选」按钮显示为按下状态', freshAll?.classList.contains('is-active') ?? false);
-  // 再点一次要能回到"只选当季"：全选之后逐个点掉 8 个标签体验太差
-  freshAll?.click();
-  await new Promise((resolve) => setTimeout(resolve, 30));
-  ok(
-    '再点一次回到只选当季',
-    (state.selectedSeasons as string[]).join(',') === String(state.season),
-    `实际=${(state.selectedSeasons as string[]).join(',')}`,
-  );
-}
+const wantAll = [String(state.currentSeason), ...overviewSeasons.filter((s) => s !== state.currentSeason)];
+allBtn?.click();
+const allRendered = await waitFor(() => pickedCount() === `已选 ${wantAll.length} 季`, '全选后重绘');
+ok(
+  `点「全选」选中全部 ${wantAll.length} 季（主季仍是当季）`,
+  pickedIds().join(',') === wantAll.join(','),
+  `实际=${pickedIds().join(',')}`,
+);
+ok('全选后列表重绘完成', allRendered);
+findSeasonAll()?.click();
+await waitFor(() => pickedCount() === `已选 ${wantAll.length} 季`, '再次全选后重绘');
+await new Promise((resolve) => setTimeout(resolve, 60));
+ok(
+  '「全选」再点一次仍是全选（回到单季请用「当季」预设）',
+  pickedIds().length === wantAll.length,
+  `实际=${pickedIds().length} 季`,
+);
+
+// 还原成单季、收起面板，避免影响后面的断言
+state.selectedSeasons = [state.season];
+state.seasonsOpen = false;
+state.overview = overview;
+app.renderSeason();
 
 // 导航栏里那几个 tab 在 index.html，**不在 #app 内**，这个手写壳量不到 ——
 // 那条断言放在 verify.ts（直接读 index.html），这里只确认总览视图没被改坏。
@@ -1136,7 +1315,7 @@ const scopeBoxes = () =>
   modalBox()
     ?.querySelectorAll('input')
     .filter((input) => 'data-scope-season' in input.attrs) ?? [];
-const pickedIds = () =>
+const pickedScopeIds = () =>
   scopeBoxes()
     .filter((input) => input.checked)
     .map((input) => input.attrs['data-scope-season'] ?? '')
@@ -1174,7 +1353,7 @@ ok(
   (modalBox()?.querySelectorAll('.scope-note') ?? []).some((note) => note.textContent.includes('库里没有')),
 );
 
-ok('默认只勾当季（保住"一键更新"的心智）', pickedIds().join(',') === '2026-10', `实际 ${pickedIds().join(',')}`);
+ok('默认只勾当季（保住"一键更新"的心智）', pickedScopeIds().join(',') === '2026-10', `实际 ${pickedScopeIds().join(',')}`);
 ok('摘要里写了预计耗时', /预计/.test(scopeSummary()) && /秒/.test(scopeSummary()), scopeSummary().slice(0, 80));
 
 // 勾上第二个季度 → 摘要与请求范围都要跟着变
@@ -1185,14 +1364,21 @@ if (toggleSeasonBox('2024-10')) {
   ok('能找到 2024-10 这个候选（库里没有也要能勾）', false, `候选=${candidates.slice(0, 8).join(',')}`);
 }
 
-// 强制重抓开关
-const forceBox = modalBox()?.querySelector('#scope-force');
-if (forceBox) {
-  forceBox.checked = true;
-  forceBox.dispatch('change');
-  ok('「重抓已选季度」开关写进了 state', (state.updateScope as { force?: boolean } | null)?.force === true);
+// 增量开关：默认勾上（跳过上次真抓过的），取消勾选 = 把勾中的季度全部重抓
+const incrementalBox = modalBox()?.querySelector('#scope-incremental');
+if (incrementalBox) {
+  ok(
+    '增量开关默认勾上（默认跳过已真抓过的季度）',
+    (state.updateScope as { incremental?: boolean } | null)?.incremental === true,
+  );
+  incrementalBox.checked = false;
+  incrementalBox.dispatch('change');
+  ok(
+    '取消勾选后 state.updateScope.incremental 变成 false',
+    (state.updateScope as { incremental?: boolean } | null)?.incremental === false,
+  );
 } else {
-  ok('对话框里有「重抓已选季度」开关', false);
+  ok('对话框里有「只抓没抓过的季度（增量）」开关', false);
 }
 
 // 预设：跨年的那一条走的是前端的季度移位（2026-01 往前一季必须是 2025-10）
@@ -1202,16 +1388,16 @@ updateBtn?.click();
 presetBtn('recent')?.click();
 ok(
   '「当季 + 最近 3 季」跨年正确（2026-01 → 2025-10 → 2025-07）',
-  pickedIds().join(',') === '2025-07,2025-10,2026-01',
-  `实际 ${pickedIds().join(',')}`,
+  pickedScopeIds().join(',') === '2025-07,2025-10,2026-01',
+  `实际 ${pickedScopeIds().join(',')}`,
 );
 presetBtn('current')?.click();
-ok('「只勾当季」回到单季', pickedIds().join(',') === '2026-01', `实际 ${pickedIds().join(',')}`);
+ok('「只勾当季」回到单季', pickedScopeIds().join(',') === '2026-01', `实际 ${pickedScopeIds().join(',')}`);
 presetBtn('library')?.click();
 ok(
   '「库里全部季度」把库里的都勾上',
-  librarySeasons.every((season) => pickedIds().includes(season)),
-  `实际 ${pickedIds().length} 季`,
+  librarySeasons.every((season) => pickedScopeIds().includes(season)),
+  `实际 ${pickedScopeIds().length} 季`,
 );
 
 // 手填一个库里没有的老季度
@@ -1219,11 +1405,11 @@ const extraInput = modalBox()?.querySelector('#scope-extra');
 if (extraInput) {
   extraInput.value = '2020-13'; // 月份不合法 → 必须被拦住
   findInDialog('data-scope-add', '1')?.click();
-  ok('手填非法季度被拦住（不会静默加进去）', !pickedIds().includes('2020-13'), `picked=${pickedIds().length}`);
+  ok('手填非法季度被拦住（不会静默加进去）', !pickedScopeIds().includes('2020-13'), `picked=${pickedScopeIds().length}`);
   const reopened = modalBox()?.querySelector('#scope-extra');
   if (reopened) reopened.value = '2020-01';
   findInDialog('data-scope-add', '1')?.click();
-  ok('手填 2020-01 能加进来并自动勾上', pickedIds().includes('2020-01'), `picked=${pickedIds().join(',')}`);
+  ok('手填 2020-01 能加进来并自动勾上', pickedScopeIds().includes('2020-01'), `picked=${pickedScopeIds().join(',')}`);
 } else {
   ok('对话框里有"其它季度"输入框', false);
 }
@@ -1234,7 +1420,7 @@ requestedUrls.length = 0;
 findInDialog('data-scope-start', '1')?.click();
 ok('一个季度都没勾时不会发请求（也不关对话框）', requestedUrls.length === 0 && backdrop?.hidden === false);
 
-// 回到 2026-10 那一季，全勾 + 强制重抓，真的发一次
+// 回到 2026-10 那一季，全勾，真的发一次
 state.season = '2026-10';
 app.renderSeason();
 updateBtn?.click();
@@ -1242,19 +1428,37 @@ scopeBoxes().forEach((input) => {
   input.checked = true;
 });
 scopeBoxes()[0]?.dispatch('change');
-const forceAgain = modalBox()?.querySelector('#scope-force');
-if (forceAgain) {
-  forceAgain.checked = true;
-  forceAgain.dispatch('change');
+
+// 「顺带补中文名」开关：默认勾上；取消后请求必须带 translate=0
+const translateBox = modalBox()?.querySelector('#scope-translate');
+if (translateBox) {
+  ok(
+    '「顺带补中文名（机翻）」默认勾上',
+    (state.updateScope as { translate?: boolean } | null)?.translate === true,
+  );
+  translateBox.checked = false;
+  translateBox.dispatch('change');
+  ok(
+    '取消勾选后 state.updateScope.translate 变成 false',
+    (state.updateScope as { translate?: boolean } | null)?.translate === false,
+  );
+  translateBox.checked = true;
+  translateBox.dispatch('change');
+} else {
+  ok('对话框里有「顺带补中文名（机翻）」开关', false);
 }
+
 requestedUrls.length = 0;
 findInDialog('data-scope-start', '1')?.click();
 const updateUrl = requestedUrls.find((url) => url.includes('/api/update')) ?? '';
 ok('请求带上了 seasons 参数（勾中的季度列表）', /seasons=/.test(updateUrl), updateUrl);
 ok('seasons 里含当季与库里没有的老季度', /2026-10/.test(decodeURIComponent(updateUrl)) && /20\d\d-\d\d/.test(updateUrl), updateUrl);
-ok('请求带上了 force=1（勾了重抓）', /force=1/.test(updateUrl), updateUrl);
+ok('请求带上了增量开关（默认勾上 → incremental=1）', /incremental=1/.test(updateUrl), updateUrl);
+ok('更新走的是后台任务（async=1），不再是同步长请求', /async=1/.test(updateUrl), updateUrl);
 ok('开始更新后对话框关掉了', backdrop?.hidden === true);
-await new Promise((resolve) => setTimeout(resolve, 40));
+// 后台任务：POST 只回任务快照，结果靠轮询 /api/job 拿 —— 多等一会儿让轮询跑完
+await new Promise((resolve) => setTimeout(resolve, 250));
+ok('轮询了 /api/job 拿进度', requestedUrls.some((url) => url.includes('/api/job')), `请求数=${requestedUrls.length}`);
 const reportText = collectText(appEl);
 ok('报告里能看出每一季的结果（各季结果 + 跳过的说明）', reportText.includes('各季结果') && reportText.includes('2024-10'));
 ok('报告里写明了本次范围', reportText.includes('本次范围') && reportText.includes('你挑的'));

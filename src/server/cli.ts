@@ -42,6 +42,7 @@ import {
   clearFetchedData,
   clearMyAnime,
   countMachineTitles,
+  deriveSeasonFromAirTimes,
   describeSyncRun,
   getMyAnime,
   getSubjectDetail,
@@ -49,6 +50,7 @@ import {
   listChanges,
   listMyAnime,
   listSchedule,
+  listSeasonFetchStates,
   listSyncRuns,
   migrate,
   openDb,
@@ -234,9 +236,17 @@ async function cmdSync(args: ParsedArgs): Promise<void> {
       //   实际上会把中间的季度一起抓了（和帮助里写的意思不符）。现在直接把列表交给
       //   syncArchive 的 seasons 路径：**只抓列的这些**，一个不多。
       console.log(
-        `\x1b[1m回填历史季度\x1b[0m ${ids.join('、')}${force ? '（强制重抓）' : '（增量）'}\n`,
+        `\x1b[1m回填历史季度\x1b[0m ${ids.join('、')}` +
+          `${force ? '（强制重抓）' : args.flags.has('incremental') ? '（增量：跳过上次真抓过的）' : '（全抓）'}\n`,
       );
-      const result = await syncArchive(db, { seasons: ids, force, intervalMs: 1_000 });
+      const result = await syncArchive(db, {
+        seasons: ids,
+        force,
+        mode: 'explicit',
+        incremental: args.flags.has('incremental'),
+        intervalMs: 1_000,
+        trigger: 'cli',
+      });
       printArchiveResult(result);
       db.close();
       return;
@@ -248,7 +258,14 @@ async function cmdSync(args: ParsedArgs): Promise<void> {
     console.log(
       `\x1b[1m回填历史季度\x1b[0m 最近 ${count} 个季度（到 ${toSeason}）${force ? '（强制重抓）' : '（增量）'}\n`,
     );
-    const result = await syncArchive(db, { toSeason, backfill: count, force, intervalMs: 1_000, trigger: 'cli' });
+    const result = await syncArchive(db, {
+      toSeason,
+      backfill: count,
+      force,
+      mode: 'backfill',
+      intervalMs: 1_000,
+      trigger: 'cli',
+    });
     printArchiveResult(result);
     db.close();
     return;
@@ -301,7 +318,8 @@ function printArchiveResult(result: ArchiveSyncResult): void {
       case 'fetched':
         fetched += 1;
         console.log(
-          `  \x1b[32m✓\x1b[0m ${item.season}  写入 ${item.written} 部 / ${item.episodeCount} 集`,
+          `  \x1b[32m✓\x1b[0m ${item.season}  写入 ${item.written} 部（新增 ${item.added}）/ ${item.episodeCount} 集` +
+            `${item.schedules ? '' : '  \x1b[2m（过去季度：不抓逐集放送时刻）\x1b[0m'}`,
         );
         break;
       case 'skipped':
@@ -318,7 +336,7 @@ function printArchiveResult(result: ArchiveSyncResult): void {
   }
   console.log(
     `\n回填完成：抓取 ${fetched} 季、跳过 ${skipped} 季${failed ? `、失败 ${failed} 季` : ''}` +
-      `，共写入 ${result.totalWritten} 部 / ${result.totalEpisodes} 集。`,
+      `，共写入 ${result.totalWritten} 部（新增 ${result.totalAdded}）/ ${result.totalEpisodes} 集。`,
   );
   console.log('提示：历史季度一旦落库就会一直保留，之后的同步不会删除它们。');
 }
@@ -347,25 +365,32 @@ async function cmdUpdate(args: ParsedArgs): Promise<void> {
   const translate = mustTranslate || !noTranslate;
   const limitFlag = Number(flagString(args, 'limit') ?? 0);
   const limit = Number.isFinite(limitFlag) ? Math.max(0, Math.floor(limitFlag)) : 0;
+  const concurrencyFlag = Number(flagString(args, 'concurrency') ?? 4);
+  const concurrency = Number.isFinite(concurrencyFlag) && concurrencyFlag > 0 ? Math.floor(concurrencyFlag) : 4;
 
   const db = openDb();
   migrate(db);
 
+  const incremental = args.flags.has('incremental');
   console.log(`\x1b[1m一键更新数据\x1b[0m  ${season.label}（${season.id}）`);
   if (seasons.length > 0) {
     console.log(
       `范围：你挑的 ${seasons.length} 个季度 —— ${seasons.join('、')}` +
-        `${args.flags.has('force') ? '（强制重抓）' : '（增量：库里已有数据的季度会跳过）'}` +
+        `${args.flags.has('force') ? '（强制重抓）' : incremental ? '（增量：跳过上次真抓过的）' : '（全抓）'}` +
         `${flagString(args, 'backfill') !== undefined ? '；--backfill 同时给了，已忽略（以 --seasons 为准）' : ''}`,
     );
   } else {
     console.log(
       `范围：当季 + 往回 ${backfill - 1} 季（含当季共 ${backfill} 季）` +
-        `${args.flags.has('force') ? '（强制重抓）' : '（增量：库里已有数据的季度会跳过）'}`,
+        `${args.flags.has('force') ? '（强制重抓）' : '（增量：跳过上次真抓过的）'}`,
     );
   }
   console.log(
-    `预计耗时：每季约 10~30 秒（含季度间 1 秒间隔${translate ? '），机翻每条约 0.7 秒' : '）'}\n`,
+    `预计耗时：每季约 3~8 秒（三源并发，AniList 每页 1.2 秒是下限）` +
+      `${translate ? `；机翻约 0.35 秒/条 × ${concurrency} 路并发` : '；本次不机翻'}\n`,
+  );
+  console.log(
+    '\x1b[2m过去季度不抓逐集放送时刻（番已播完，那些时刻没有使用场景）；首播时刻与星期仍会写入。\x1b[0m\n',
   );
 
   const result = await runFullUpdate(db, {
@@ -374,16 +399,23 @@ async function cmdUpdate(args: ParsedArgs): Promise<void> {
     //   报告里的 scope.backfillIgnored 会一直为真（明明是这里塞的默认值）。
     ...(seasons.length > 0 ? { seasons } : { backfill }),
     force: args.flags.has('force'),
+    incremental,
     translate,
     translateLimit: limit,
+    translateConcurrency: concurrency,
     trigger: 'cli',
     onProgress: (message) => console.log(`  \x1b[2m${message}\x1b[0m`),
+    onTranslateProgress: (done, total) => {
+      // 后台在跑的时候不想刷屏，每 10 条报一次
+      if (done % 10 === 0 || done === total) console.log(`  \x1b[2m机翻 ${done}/${total}\x1b[0m`);
+    },
   });
 
   console.log('');
   printProviderReports(result.current.reports);
   console.log(
-    `\n主季 ${result.scope.seasons[0]} 写入 ${result.current.written} 部 / ${result.current.episodeCount} 集` +
+    `\n主季 ${result.scope.seasons[0]} 写入 ${result.current.written} 部（新增 ${result.current.added}）/ ${result.current.episodeCount} 集` +
+      (result.current.schedules ? '' : '  \x1b[2m（过去季度：不抓逐集放送时刻）\x1b[0m') +
       (result.current.changes.length ? `，检测到 ${result.current.changes.length} 条改档` : ''),
   );
   printMoved(result.current.archive);
@@ -421,6 +453,7 @@ async function cmdUpdate(args: ParsedArgs): Promise<void> {
   const summary = stats(db);
   console.log(
     `\n\x1b[1m汇总\x1b[0m：写入 ${result.summary.written} 部 / ${result.summary.episodes} 集 · ` +
+      `\x1b[1m新增 ${result.summary.added} 部\x1b[0m · ` +
       `官方名替换 ${result.summary.officialReplaced} · 机翻补齐 ${result.summary.machineFilled} · ` +
       `移入补番库 ${result.summary.movedToBacklog} · 改档 ${result.summary.changeCount}`,
   );
@@ -438,6 +471,8 @@ async function cmdTranslate(args: ParsedArgs): Promise<void> {
   const season = all ? null : seasonFlag ? seasonFromId(seasonFlag).id : seasonOf(new Date()).id;
   const limitFlag = Number(flagString(args, 'limit') ?? 0);
   const limit = Number.isFinite(limitFlag) ? Math.max(0, Math.floor(limitFlag)) : 0;
+  const concurrencyFlag = Number(flagString(args, 'concurrency') ?? 4);
+  const concurrency = Number.isFinite(concurrencyFlag) && concurrencyFlag > 0 ? Math.floor(concurrencyFlag) : 4;
 
   const db = openDb();
   migrate(db);
@@ -446,13 +481,16 @@ async function cmdTranslate(args: ParsedArgs): Promise<void> {
   const result = await translateMissingTitles(db, {
     season,
     limit,
+    concurrency,
     onProgress: (done, total, title) => {
       if (done % 5 === 0 || done === total) console.log(`  \x1b[2m${done}/${total}\x1b[0m ${truncateWidth(title, 40)}`);
     },
   });
 
   console.log(
-    `\n机翻完成：成功 ${result.translated.length} 部，跳过 ${result.skipped} 部（不需要翻的类型），失败 ${result.failed.length} 部。`,
+    `\n机翻完成：成功 ${result.translated.length} 部，跳过 ${result.skipped} 部（不需要翻的类型），失败 ${result.failed.length} 部` +
+      (result.stopped ? `，停止时还有 ${result.stopped} 条没翻` : '') +
+      '。',
   );
   for (const item of result.translated) {
     console.log(`  ${pad(truncateWidth(item.titleOriginal, 34), 36)} → ${item.titleCn}  \x1b[2m[${item.engine}]\x1b[0m`);
@@ -842,6 +880,127 @@ function cmdStats(): void {
   db.close();
 }
 
+/**
+ * 季度体检（**只读，不写库**）。
+ *
+ * 为什么要有这个命令：库里「某个季度有几部」并不等于「这个季度抓过」。
+ * 抓 2024-04 时 bangumi-data 的窗口是「季首前 20 天 ~ 季末后 20 天」，而季度归属按条目
+ * 自己的放送时刻判定 —— 于是 3 月开播的番会以「2024-01」的身份被顺带写进来。
+ * 以前增量判断用的就是「库里有没有条目」，于是 2024-01 永远被判成"抓过了"，
+ * 用户看到的就是「一个季度只有 10 部，怎么更新都不增加」。
+ *
+ * 这张表把三件事摆在一起：库里几部、其中几部的首播**真的**落在本季、
+ * 以及本季**上一次真抓**是什么时候（先看 `season_state`，再看 `sync_run` 的历史）。
+ * 后两列都没有记录的季度，就是「看起来有数据、其实没抓过」的那些。
+ */
+function cmdAudit(): void {
+  const db = openDb();
+  migrate(db);
+
+  const rows = db
+    .prepare(
+      `SELECT s.season AS season, s.key AS key, s.first_air_at_utc AS first_air_at_utc,
+              (SELECT e.air_at_utc FROM episode e
+                WHERE e.subject_key = s.key AND e.air_at_utc IS NOT NULL
+                ORDER BY e.ep_number LIMIT 1) AS first_ep
+         FROM subject s
+        WHERE s.season IS NOT NULL AND s.season <> ''`,
+    )
+    .all() as unknown as Array<{ season: string; key: string; first_air_at_utc: string | null; first_ep: string | null }>;
+
+  type Bucket = { total: number; own: number; elsewhere: number; noTime: number };
+  const buckets = new Map<string, Bucket>();
+  for (const row of rows) {
+    const bucket = buckets.get(row.season) ?? { total: 0, own: 0, elsewhere: 0, noTime: 0 };
+    bucket.total += 1;
+    // 判据与写入 / 纠正完全一样（db.ts 的 deriveSeasonFromAirTimes，唯一实现）
+    const derived = deriveSeasonFromAirTimes(row.first_air_at_utc, [
+      { epNumber: 1, airAtUtc: row.first_ep },
+    ]);
+    if (!derived) bucket.noTime += 1;
+    else if (derived === row.season) bucket.own += 1;
+    else bucket.elsewhere += 1;
+    buckets.set(row.season, bucket);
+  }
+
+  const states = listSeasonFetchStates(db);
+  // season_state 是第八轮才有的表，之前真抓过的季度它不知道 —— 用 sync_run 的流水账补。
+  // 两者都没有 = 没有抓取记录（可能真的没抓过，也可能是更早版本抓的，都该重抓一次看看）。
+  const runFetchedAt = new Map<string, string>();
+  const runs = db
+    .prepare("SELECT started_at, seasons FROM sync_run WHERE error IS NULL AND written > 0 ORDER BY id")
+    .all() as unknown as Array<{ started_at: string; seasons: string | null }>;
+  for (const run of runs) {
+    let ids: string[] = [];
+    try {
+      const parsed: unknown = JSON.parse(run.seasons ?? '[]');
+      if (Array.isArray(parsed)) ids = parsed.filter((item): item is string => typeof item === 'string');
+    } catch {
+      ids = [];
+    }
+    for (const id of ids) runFetchedAt.set(id, run.started_at);
+  }
+
+  const allSeasons = [...new Set([...buckets.keys(), ...states.keys()])].sort().reverse();
+  if (allSeasons.length === 0) {
+    console.log('库里还没有任何番剧。先跑一次 sync 或 update。');
+    db.close();
+    return;
+  }
+
+  const table = allSeasons.map((season) => {
+    const bucket = buckets.get(season) ?? { total: 0, own: 0, elsewhere: 0, noTime: 0 };
+    const state = states.get(season);
+    const runAt = runFetchedAt.get(season);
+    const when = state ? state.lastFetchedAt.slice(5, 16).replace('T', ' ') : runAt ? runAt.slice(5, 16).replace('T', ' ') : '—';
+    let verdict: string;
+    if (state) {
+      verdict =
+        state.lastStatus === 'failed'
+          ? '✗ 上次全失败（下次会重试）'
+          : state.lastStatus === 'empty'
+            ? '· 上次源站没返回数据'
+            : `✓ 上次写入 ${state.lastWritten} 部（新增 ${state.lastAdded}）`;
+    } else if (runAt) {
+      verdict = '· 有抓取记录（当时还没有本表）';
+    } else {
+      verdict = bucket.total === 0 ? '· 没有任何抓取记录' : `⚠ 没有抓取记录（库里 ${bucket.total} 部是顺带进来的）`;
+    }
+    const extra = bucket.elsewhere > 0 ? `（其中 ${bucket.elsewhere} 部按首播属于别季）` : '';
+    return [
+      season,
+      String(bucket.total),
+      String(bucket.own),
+      String(bucket.noTime),
+      when,
+      verdict + extra,
+    ];
+  });
+
+  console.log('\x1b[1m季度体检\x1b[0m（只读：不抓取、不写库）\n');
+  printTable(['季度', '库内', '首播在本季', '无首播时刻', '上次真抓', '结论'], table);
+
+  const recorded = new Set([...states.keys(), ...runFetchedAt.keys()]);
+  const noRecord = allSeasons.filter((season) => !recorded.has(season));
+  const suspicious = noRecord.filter((season) => (buckets.get(season)?.total ?? 0) > 0);
+  console.log('\n读法：');
+  console.log('  「库内」= 库里这一季有几部；「首播在本季」= 条目自己的首播时刻真的落在本季的部数；');
+  console.log('  「无首播时刻」= 只有名字、没有时刻的条目（多半只被 yuc 抓到）。');
+  console.log('  「上次真抓」= 这个季度上次**真的去抓**是什么时候（拼数据不等于抓过它）。\n');
+  console.log(
+    `共 ${allSeasons.length} 季，其中 \x1b[33m${noRecord.length} 季没有任何抓取记录\x1b[0m` +
+      `（${suspicious.length} 季库里已经有数据，看起来像"抓过了"）。`,
+  );
+  if (suspicious.length > 0) {
+    console.log(
+      `\n想补齐它们：\x1b[1mnode src/server/cli.ts update --seasons=${suspicious.slice(0, 4).join(',')}\x1b[0m` +
+        '（勾了就一定会抓：没有抓取记录的季度不受增量跳过影响）',
+    );
+  }
+  console.log('过去季度不抓逐集放送时刻，只抓清单 + 首播，因此比以前快很多。');
+  db.close();
+}
+
 function cmdHelp(): void {
   console.log(`新番追番日历 · CLI
 
@@ -849,13 +1008,17 @@ function cmdHelp(): void {
   sync   [--season=2026-10]     抓取当季并写入数据库（含季度自动归档）
          --backfill=4           顺便增量回填最近 4 个季度
          --seasons=2026-04,2026-07  只回填指定季度
-         --force                已有数据的季度也重抓
+         --incremental          跳过「上次真抓过」的季度（默认：你列的季度全都抓）
+         --force                连上次真抓过的也重抓
   update [--season=2026-10]     一键更新数据（当季 + 历史回填 + 机翻 + 汇总报告）
          --seasons=2026-10,2024-10  只更新这几个季度（按给定顺序；可以挑库里没有的老季度）
          --backfill=3           当季 + 往回数几季（含当季，默认 3，最小 1）
-         --force                已有数据的季度也重抓
+         --incremental          跳过「上次真抓过」的季度（更省时间）
+         --force                连上次真抓过的也重抓
          --no-translate         跳过机翻阶段（更快）
          --limit=20             机翻条数上限
+         --concurrency=4        机翻并发数（默认 4；实测 0.32 秒/条）
+  audit                         季度体检：每季库里几部 / 几部真的属于本季 / 上次真抓是什么时候（只读）
   translate [--season=2026-10 | --all] [--limit=N]
                                 只给缺中文名的番做临时机翻（官方名一到会被自动替换）
   search <关键词>               搜索番剧（补番库加老番用）
@@ -928,6 +1091,9 @@ async function main(): Promise<void> {
       break;
     case 'stats':
       cmdStats();
+      break;
+    case 'audit':
+      cmdAudit();
       break;
     default:
       cmdHelp();

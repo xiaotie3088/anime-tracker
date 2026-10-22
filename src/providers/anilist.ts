@@ -16,7 +16,7 @@ import { seasonFromId, weekdayInZone } from '../core/time.ts';
 import type { SeasonInfo } from '../core/time.ts';
 import type { MediaType, Platform, RawEpisode, RawSeasonAnime, AiringStatus } from '../core/types.ts';
 import { postJson } from './http.ts';
-import type { Provider } from './provider.ts';
+import type { Provider, SeasonFetchOptions } from './provider.ts';
 import { parseOrThrow } from './validate.ts';
 
 const ENDPOINT = 'https://graphql.anilist.co';
@@ -46,11 +46,14 @@ export function anilistSeasonId(season: string | null | undefined, year: number 
   }
 }
 
-const SEASON_QUERY = `
-query ($season: MediaSeason, $seasonYear: Int, $page: Int, $perPage: Int) {
-  Page(page: $page, perPage: $perPage) {
-    pageInfo { total currentPage lastPage hasNextPage }
-    media(season: $season, seasonYear: $seasonYear, type: ANIME, sort: [POPULARITY_DESC]) {
+/**
+ * 季度查询的字段块。
+ *
+ * 拆成两段是因为「过去季度不抓逐集时刻」这条要求：GraphQL **不能**用变量决定
+ * 一个字段取不取（只有 `@include` 指令，而 AniList 对它的支持没实测过，不敢赌），
+ * 所以用两个查询字符串。字段块共用，避免以后加字段时两个查询漏改。
+ */
+const SEASON_SUBJECT_FIELDS = `
       id
       idMal
       title { romaji native english }
@@ -64,9 +67,35 @@ query ($season: MediaSeason, $seasonYear: Int, $page: Int, $perPage: Int) {
       genres
       startDate { year month day }
       studios(isMain: true) { nodes { name } }
+      externalLinks { site url type }`;
+
+/** 逐集时刻（只在当季 / 未来季度抓，见 `SeasonFetchOptions.schedules`）。 */
+const AIRING_FIELDS = `
       nextAiringEpisode { airingAt episode }
-      airingSchedule(perPage: 50) { nodes { airingAt episode } }
-      externalLinks { site url type }
+      airingSchedule(perPage: 50) { nodes { airingAt episode } }`;
+
+const SEASON_QUERY = `
+query ($season: MediaSeason, $seasonYear: Int, $page: Int, $perPage: Int) {
+  Page(page: $page, perPage: $perPage) {
+    pageInfo { total currentPage lastPage hasNextPage }
+    media(season: $season, seasonYear: $seasonYear, type: ANIME, sort: [POPULARITY_DESC]) {${SEASON_SUBJECT_FIELDS}${AIRING_FIELDS}
+    }
+  }
+}`;
+
+/**
+ * 不取逐集时刻的版本：过去季度用。
+ *
+ * 少了 `airingSchedule` 之后 `mapMedia()` 不需要改 —— 它本来就把
+ * 「没有分集」当成正常情况，首播时刻退回到 `startDate`（只有日期，按 JST 00:00 处理）。
+ * 这也顺带修掉一类怪归属：某些长篇在 AniList 的排期起点在更早的年份，
+ * 逐集时刻会把整部番拉去别的季度（实测出现过一条 2024-04 的番被判进 2022-01）。
+ */
+const SEASON_QUERY_NO_SCHEDULE = `
+query ($season: MediaSeason, $seasonYear: Int, $page: Int, $perPage: Int) {
+  Page(page: $page, perPage: $perPage) {
+    pageInfo { total currentPage lastPage hasNextPage }
+    media(season: $season, seasonYear: $seasonYear, type: ANIME, sort: [POPULARITY_DESC]) {${SEASON_SUBJECT_FIELDS}
     }
   }
 }`;
@@ -306,10 +335,12 @@ export const anilistProvider: Provider = {
   label: 'AniList',
   capabilities: ['season', 'episodes', 'search', 'platforms'],
 
-  async fetchSeason(season: SeasonInfo): Promise<RawSeasonAnime[]> {
+  async fetchSeason(season: SeasonInfo, options: SeasonFetchOptions = {}): Promise<RawSeasonAnime[]> {
+    // 过去季度不抓逐集时刻：番都播完了，那些时刻没有使用场景（见 SeasonFetchOptions）
+    const query = options.schedules === false ? SEASON_QUERY_NO_SCHEDULE : SEASON_QUERY;
     const collected: RawSeasonAnime[] = [];
     for (let page = 1; page <= MAX_PAGES; page += 1) {
-      const media = await fetchPage(SEASON_QUERY, {
+      const media = await fetchPage(query, {
         season: season.aniList,
         seasonYear: season.year,
         page,

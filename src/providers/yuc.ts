@@ -33,7 +33,7 @@ import type { SeasonInfo } from '../core/time.ts';
 import { resolveAiringSlot } from '../core/time.ts';
 import type { MediaType, Platform, RawEpisode, RawSeasonAnime } from '../core/types.ts';
 import { fetchText } from './http.ts';
-import type { Provider } from './provider.ts';
+import type { Provider, SeasonFetchOptions } from './provider.ts';
 
 /** 解析出的条目少于这个数就认为页面结构变了（当季正常有 60+ 部）。 */
 const MIN_EXPECTED_ENTRIES = 20;
@@ -273,7 +273,14 @@ function resolveYear(month: number, day: number, season: SeasonInfo): number {
   return season.year;
 }
 
-export function parseYucSeasonPage(html: string, season: SeasonInfo): RawSeasonAnime[] {
+export function parseYucSeasonPage(
+  html: string,
+  season: SeasonInfo,
+  options: SeasonFetchOptions = {},
+): RawSeasonAnime[] {
+  // 过去季度不抓逐集时刻（见 SeasonFetchOptions）：网格里那一条「首播时刻」仍然保留 ——
+  // 它是季度归属与总览排序的依据，而且页面上就写着，不额外花请求。
+  const withSchedules = options.schedules !== false;
   const details = parseDetailBlocks(html);
   const grid = parseGridEntries(html);
 
@@ -335,7 +342,7 @@ export function parseYucSeasonPage(html: string, season: SeasonInfo): RawSeasonA
       }
     }
 
-    const episodes: RawEpisode[] = firstAirAtUtc
+    const episodes: RawEpisode[] = firstAirAtUtc && withSchedules
       ? [{ epNumber: 1, airAtUtc: firstAirAtUtc, source: 'yuc' }]
       : [];
 
@@ -391,19 +398,41 @@ export function parseYucSeasonPage(html: string, season: SeasonInfo): RawSeasonA
 
 // ---------------------------------------------------------------------------
 
+/**
+ * 已经确认「这一季站点上没有表」的季度。
+ *
+ * 为什么需要：老季度（2022 及以前）访问 `/YYYYMM/` 拿到的不是 404，而是某个**能返回 200
+ * 但没有番剧表格**的页面 —— 解析出 0 块，然后按"页面改版"抛错。
+ * 实测这一路的耗时极不稳定：同一次更新里 0.5 s / 8 s / 19 s / **31 s** 都出现过。
+ * 一次「补古早季度」要试十几季，白等的时间比真正抓取还长。
+ *
+ * 记在**进程内**：同一进程里再遇到这一季就直接跳过；重启后重试一次（站点可能补档）。
+ */
+const seasonsWithoutArchive = new Set<string>();
+
+/** 只给自检用：清掉这层记忆，避免测试之间互相影响。 */
+export function resetYucArchiveCache(): void {
+  seasonsWithoutArchive.clear();
+}
+
 export const yucProvider: Provider = {
   id: 'yuc',
   label: 'yuc.wiki（校对）',
   capabilities: ['season', 'platforms'],
 
-  async fetchSeason(season: SeasonInfo): Promise<RawSeasonAnime[]> {
+  async fetchSeason(season: SeasonInfo, options: SeasonFetchOptions = {}): Promise<RawSeasonAnime[]> {
+    if (seasonsWithoutArchive.has(season.id)) return [];
+
     // 路径规则实测为 /YYYYMM/（四位年份）；HTTPS 证书已过期，只能走 HTTP
     const yyyymm = `${season.year}${String(season.month).padStart(2, '0')}`;
     const url = `http://yuc.wiki/${yyyymm}/`;
+    // 过去季度基本没有存档（`schedules === false` 就是"过去季度"的信号）：
+    // 超时压到 10 秒、不重试 —— 不值得为一张不存在的表等 30 秒 × 2 次。
+    const past = options.schedules === false;
 
     const response = await fetchText(url, {
-      timeoutMs: 30_000,
-      retries: 1,
+      timeoutMs: past ? 10_000 : 30_000,
+      retries: past ? 0 : 1,
       minIntervalMs: 1_000,
       userAgent: 'anime-tracker/0.1 (season list, low rate)',
       headers: { accept: 'text/html,application/xhtml+xml' },
@@ -412,12 +441,25 @@ export const yucProvider: Provider = {
     if (response.status === 404) {
       // 下一季的页面往往还没建，这属于正常情况，不该让整个同步失败
       console.warn(`[yuc] ${url} 返回 404（该季度页面还没建），跳过`);
+      seasonsWithoutArchive.add(season.id);
       return [];
     }
     if (!response.ok) {
       throw new Error(`yuc.wiki 返回 HTTP ${response.status}：${url}`);
     }
 
-    return parseYucSeasonPage(response.text, season);
+    try {
+      return parseYucSeasonPage(response.text, season, options);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      // 「解析出 0 块」= 这季没有表，不是改版 —— 老季度安静跳过；
+      // 当季/未来季度仍然响亮地失败（那才是真的站点改版，必须被发现）。
+      if (past && /详细块 0 个、网格 0 个/.test(message)) {
+        seasonsWithoutArchive.add(season.id);
+        console.warn(`[yuc] ${url} 没有这一季的表格（老季度常见），本次更新不再请求它`);
+        return [];
+      }
+      throw error;
+    }
   },
 };

@@ -23,12 +23,13 @@ import type { SeasonInfo } from '../core/time.ts';
 import { RawSeasonAnimeSchema, TRACK_CATEGORIES, TRACK_CATEGORY_LABELS } from '../core/types.ts';
 import type { TrackCategory } from '../core/types.ts';
 import { anilistProvider } from '../providers/anilist.ts';
-import { DATA_DIR } from '../providers/snapshot.ts';
+import { DEFAULT_TRANSLATE_CONCURRENCY } from '../providers/mt.ts';
 import {
   acknowledgeChanges,
   addMyAnime,
   availableSeasons,
   backupDatabase,
+  DEFAULT_DB_PATH,
   getSubjectDetail,
   getSubjectSeason,
   listChanges,
@@ -55,12 +56,15 @@ import {
 import { changeKindLabel, describeChangeItem } from './changes.ts';
 import { buildIcs, icsFileName } from './ics.ts';
 import { DEFAULT_BACKFILL, runFullUpdate, syncSeason, translateMissingTitles } from './sync.ts';
+import type { FullUpdateResult } from './sync.ts';
 
 const PORT = Number(process.env.PORT ?? 8787);
 const HOST = process.env.HOST ?? '127.0.0.1';
 
 const WEB_DIR = fileURLToPath(new URL('../../web/', import.meta.url));
-const dbPath = path.join(DATA_DIR, 'anime.db');
+// ⚠ 库路径只认 db.ts 的 DEFAULT_DB_PATH（它读 `ANIME_DB_PATH` 逃生口）——
+//   以前这里自己拼了一遍 `DATA_DIR/anime.db`，于是"在副本上起一个服务验证"根本做不到。
+const dbPath = DEFAULT_DB_PATH;
 const db = openDb(dbPath);
 migrate(db);
 
@@ -357,6 +361,130 @@ async function handleSync(url: URL, reply: Reply): Promise<void> {
   });
 }
 
+// ---------------------------------------------------------------------------
+// 长时间任务（一键更新 / 补中文名）：后台跑 + 轮询进度 + 停止
+// ---------------------------------------------------------------------------
+//
+// 为什么要它：`POST /api/update` 原本是**同步**的 —— 抓 15 季 + 翻几百条要几分钟，
+// 前端只能干等（用户看到的就是「已等待 358 秒」）。现在：
+//   POST /api/update?async=1    立刻返回 202 + 任务快照
+//   GET  /api/job               轮询：阶段、当前季度、各季结果、机翻 done/total
+//   POST /api/job/cancel        请求停止（当前这一季/这一条做完就收尾，已落库的保留）
+// 同一时刻只允许一个任务（抓取会写库，两个并行只会互相打架）。
+// 同步路径保留：`scripts/verify-api.ts` 与命令行仍按"一次请求拿全部结果"来验。
+
+export type JobStage = 'fetch' | 'translate' | 'done' | 'error' | 'cancelled';
+
+export type JobSnapshot = {
+  kind: 'update' | 'translate';
+  running: boolean;
+  stage: JobStage;
+  message: string;
+  /** 正在处理的季度（形如 "2020-01"），没有则为 null */
+  currentSeason: string | null;
+  /** 已出结果的季度（界面直接铺一行：✓ 2021-04 写入 189（新增 132）） */
+  seasons: Array<{ season: string; status: string; written: number; added: number }>;
+  /** 机翻进度（done/total；没进机翻阶段时 total 为 0） */
+  translate: { done: number; total: number };
+  startedAt: string;
+  finishedAt: string | null;
+  cancelRequested: boolean;
+  result?: unknown;
+  error?: string;
+};
+
+export type JobContext = {
+  shouldCancel: () => boolean;
+  onProgress: (message: string) => void;
+  onTranslateProgress: (done: number, total: number) => void;
+  onSeasonDone: (entry: { season: string; status: string; written: number; added: number }) => void;
+};
+
+let activeJob: { snapshot: JobSnapshot; cancelled: boolean; requestCancel: () => void; done: Promise<void> } | null =
+  null;
+
+/** 从进度文案里认出「正在抓取 2020-01」这种，好在界面上显示当前季度。 */
+function seasonFromMessage(message: string): string | undefined {
+  return /(\d{4}-(?:01|04|07|10))/.exec(message)?.[1];
+}
+
+/**
+ * 起一个后台任务并立刻回 202。
+ *
+ * 注意 `done` 一律 resolve（不 reject）：任务失败通过 `snapshot.error` 表达，
+ * 否则一个未捕获的 rejection 会把服务进程带走。
+ */
+function beginJob(kind: JobSnapshot['kind'], reply: Reply, run: (ctx: JobContext) => Promise<unknown>): void {
+  if (activeJob?.snapshot.running) {
+    reply(409, { error: '已经有一个任务在跑，等它结束或先点「停止」', job: activeJob.snapshot });
+    return;
+  }
+
+  const snapshot: JobSnapshot = {
+    kind,
+    running: true,
+    stage: kind === 'update' ? 'fetch' : 'translate',
+    message: kind === 'update' ? '准备开始…' : '准备开始机翻…',
+    currentSeason: null,
+    seasons: [],
+    translate: { done: 0, total: 0 },
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+    cancelRequested: false,
+  };
+
+  const job: { snapshot: JobSnapshot; cancelled: boolean; requestCancel: () => void; done: Promise<void> } = {
+    snapshot,
+    cancelled: false,
+    requestCancel: () => {
+      job.cancelled = true;
+      snapshot.cancelRequested = true;
+      snapshot.message = '正在停止（当前这一步做完就收尾）…';
+    },
+    done: Promise.resolve(),
+  };
+  activeJob = job;
+
+  const ctx: JobContext = {
+    shouldCancel: () => job.cancelled,
+    onProgress: (message) => {
+      snapshot.message = message;
+      const season = seasonFromMessage(message);
+      if (season) snapshot.currentSeason = season;
+      if (message.includes('机翻')) snapshot.stage = 'translate';
+    },
+    onTranslateProgress: (done, total) => {
+      snapshot.stage = 'translate';
+      snapshot.translate = { done, total };
+    },
+    onSeasonDone: (entry) => {
+      const list = snapshot.seasons;
+      const index = list.findIndex((item) => item.season === entry.season);
+      if (index >= 0) list[index] = entry;
+      else list.push(entry);
+    },
+  };
+
+  job.done = (async () => {
+    try {
+      const result = await run(ctx);
+      snapshot.result = result;
+      snapshot.stage = job.cancelled ? 'cancelled' : 'done';
+      snapshot.message = job.cancelled ? '已停止（已抓到并落库的部分都保留）' : '完成';
+    } catch (error) {
+      snapshot.stage = 'error';
+      snapshot.error = error instanceof Error ? error.message : String(error);
+      snapshot.message = `失败：${snapshot.error}`;
+    } finally {
+      snapshot.running = false;
+      snapshot.finishedAt = new Date().toISOString();
+      snapshot.currentSeason = null;
+    }
+  })();
+
+  reply(202, { job: snapshot });
+}
+
 /**
  * 一键更新数据（用户诉求 2）。
  *
@@ -370,45 +498,44 @@ async function handleSync(url: URL, reply: Reply): Promise<void> {
  *                    可以是**库里没有的**老季度。给了它就以它为准，`backfill` 被忽略
  *                    （不是静默忽略：报告里的 scope.backfillIgnored 会说，界面也显示）
  *   backfill=3       回填最近几个季度（含当季，最小 1 —— 0 等同于只抓当季）
+ *   incremental=1    增量：跳过「上次真抓过」的季度（不传 = 你勾的季度全都抓）
  *   translate=0      关掉机翻（跑批量翻译很慢）
  *   limit=N          机翻条数上限
- *   force=1          已有数据的季度也重抓
+ *   force=1          连「上次真抓过」的季度也重抓（与 incremental 同时给时以它为准）
  */
 async function handleUpdate(url: URL, reply: Reply): Promise<void> {
-  const season = resolveSeason(url.searchParams.get('season'));
-  // ⚠ 逗号分隔而不是多个同名参数：URLSearchParams.get() 只取第一个，多写几个会静默丢参数
-  const seasons = (url.searchParams.get('seasons') ?? '')
-    .split(',')
-    .map((value) => value.trim())
-    .filter(Boolean);
-  const backfillParam = Number(url.searchParams.get('backfill') ?? DEFAULT_BACKFILL);
-  const translate = url.searchParams.get('translate') !== '0';
-  const limit = Number(url.searchParams.get('limit') ?? 0);
-  const force = url.searchParams.get('force') === '1';
+  // 异步模式：立刻返回 202，前端轮询 GET /api/job 看进度，POST /api/job/cancel 停止。
+  // 抓 15 季 + 翻几百条要几分钟，同步请求让前端只能干等（"已等待 358 秒"就是这么来的）。
+  if (url.searchParams.get('async') === '1') {
+    beginJob('update', reply, (ctx) =>
+      runUpdateForUrl(url, {
+        shouldCancel: ctx.shouldCancel,
+        onProgress: ctx.onProgress,
+        onTranslateProgress: ctx.onTranslateProgress,
+        onSeasonDone: ctx.onSeasonDone,
+      }),
+    );
+    return;
+  }
 
-  const result = await runFullUpdate(db, {
-    season,
-    // ⚠ 有 seasons 时**不要**再传 backfill：传了就变成"两个都给了"，
-    //   报告里的 scope.backfillIgnored 会一直为真（明明是服务端自己塞的默认值）。
-    ...(seasons.length > 0
-      ? { seasons }
-      : { backfill: Number.isFinite(backfillParam) ? backfillParam : DEFAULT_BACKFILL }),
-    force,
-    translate,
-    translateLimit: Number.isFinite(limit) ? Math.max(0, limit) : 0,
-    heal: url.searchParams.get('heal') === '1',
-    trigger: 'web',
-  });
+  const result = await runUpdateForUrl(url);
+  reply(200, formatUpdateResponse(result, resolveSeason(url.searchParams.get('season'))));
+}
 
-  reply(200, {
+/** 把 `runFullUpdate` 的返回整理成接口响应（同步 / 异步两条路共用）。 */
+function formatUpdateResponse(result: FullUpdateResult, season: SeasonInfo): Record<string, unknown> {
+  return {
     season: { id: season.id, label: season.label },
     scope: result.scope,
     summary: result.summary,
     // 身份判定审计（票 A）：界面上能看出"这次拦住了几条本来会变成新重复的行"
     identity: result.identity,
     runId: result.runId,
+    cancelled: result.cancelled,
     current: {
       written: result.current.written,
+      added: result.current.added,
+      schedules: result.current.schedules,
       episodeCount: result.current.episodeCount,
       reports: result.current.reports,
       moved: result.moved,
@@ -437,6 +564,46 @@ async function handleUpdate(url: URL, reply: Reply): Promise<void> {
       failed: result.translated.failed,
     },
     backup: result.backup,
+  };
+}
+
+/** 从 URL 解析「更新数据」的全部参数并跑一遍（同步 / 异步共用）。 */
+async function runUpdateForUrl(
+  url: URL,
+  hooks: {
+    shouldCancel?: () => boolean;
+    onProgress?: (message: string) => void;
+    onTranslateProgress?: (done: number, total: number) => void;
+    onSeasonDone?: (entry: { season: string; status: string; written: number; added: number }) => void;
+  } = {},
+): Promise<FullUpdateResult> {
+  const season = resolveSeason(url.searchParams.get('season'));
+  // ⚠ 逗号分隔而不是多个同名参数：URLSearchParams.get() 只取第一个，多写几个会静默丢参数
+  const seasons = (url.searchParams.get('seasons') ?? '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const backfillParam = Number(url.searchParams.get('backfill') ?? DEFAULT_BACKFILL);
+  const translate = url.searchParams.get('translate') !== '0';
+  const limit = Number(url.searchParams.get('limit') ?? 0);
+  const force = url.searchParams.get('force') === '1';
+  // 只有显式给了才传 —— 不传时由 runFullUpdate 按范围决定默认值（显式=全抓、回填=增量）
+  const incremental = url.searchParams.has('incremental') ? url.searchParams.get('incremental') !== '0' : undefined;
+
+  return runFullUpdate(db, {
+    season,
+    // ⚠ 有 seasons 时**不要**再传 backfill：传了就变成"两个都给了"，
+    //   报告里的 scope.backfillIgnored 会一直为真（明明是服务端自己塞的默认值）。
+    ...(seasons.length > 0
+      ? { seasons }
+      : { backfill: Number.isFinite(backfillParam) ? backfillParam : DEFAULT_BACKFILL }),
+    force,
+    ...(incremental === undefined ? {} : { incremental }),
+    translate,
+    translateLimit: Number.isFinite(limit) ? Math.max(0, limit) : 0,
+    heal: url.searchParams.get('heal') === '1',
+    trigger: 'web',
+    ...hooks,
   });
 }
 
@@ -446,21 +613,42 @@ async function handleTranslate(url: URL, reply: Reply): Promise<void> {
   const season = seasonParam === 'all' ? null : seasonParam ? resolveSeason(seasonParam).id : null;
   const limit = Number(url.searchParams.get('limit') ?? 0);
 
-  const result = await translateMissingTitles(db, {
-    season,
-    limit: Number.isFinite(limit) ? Math.max(0, limit) : 0,
-    minIntervalMs: 700,
-  });
+  const runTranslate = async (hooks: { shouldCancel?: () => boolean; onTranslateProgress?: (done: number, total: number) => void } = {}) => {
+    const result = await translateMissingTitles(db, {
+      season,
+      limit: Number.isFinite(limit) ? Math.max(0, limit) : 0,
+      concurrency: DEFAULT_TRANSLATE_CONCURRENCY,
+      ...(hooks.shouldCancel ? { shouldStop: hooks.shouldCancel } : {}),
+      onProgress: (done, total) => hooks.onTranslateProgress?.(done, total),
+    });
 
-  reply(200, {
-    season: season ?? 'all',
-    translatedCount: result.translated.length,
-    skipped: result.skipped,
-    candidates: result.candidates,
-    translated: result.translated,
-    failed: result.failed,
-    remaining: listSeasonSubjects(db, season ?? resolveSeason(null).id).filter((s) => !s.titleCn).length,
-  });
+    const remaining = season
+      ? listSeasonSubjects(db, season).filter((item) => !item.titleCn).length
+      : Number(
+          (db.prepare("SELECT COUNT(*) AS n FROM subject WHERE title_cn IS NULL OR title_cn = ''").get() as
+            | { n?: number }
+            | undefined)?.n ?? 0,
+        );
+
+    return {
+      season: season ?? 'all',
+      translatedCount: result.translated.length,
+      skipped: result.skipped,
+      candidates: result.candidates,
+      translated: result.translated,
+      failed: result.failed,
+      remaining,
+    };
+  };
+
+  if (url.searchParams.get('async') === '1') {
+    beginJob('translate', reply, (ctx) =>
+      runTranslate({ shouldCancel: ctx.shouldCancel, onTranslateProgress: ctx.onTranslateProgress }),
+    );
+    return;
+  }
+
+  reply(200, await runTranslate());
 }
 
 /**
@@ -807,6 +995,23 @@ const server = createServer((req, res) => {
         return;
       }
 
+      // 长任务进度（一键更新 / 补中文名）：前端轮询它画进度条
+      if (pathname === '/api/job' && req.method === 'GET') {
+        reply(200, { job: activeJob?.snapshot ?? null });
+        return;
+      }
+
+      // 请求停止当前长任务（当前这一步做完就收尾，已落库的保留）
+      if (pathname === '/api/job/cancel' && req.method === 'POST') {
+        if (!activeJob || !activeJob.snapshot.running) {
+          reply(200, { ok: false, job: activeJob?.snapshot ?? null, note: '当前没有在跑的任务' });
+          return;
+        }
+        activeJob.requestCancel();
+        reply(200, { ok: true, job: activeJob.snapshot });
+        return;
+      }
+
       // 导出「我的数据」（追番列表 / 进度 / 手动修正 / 变更历史）
       if (pathname === '/api/export' && req.method === 'GET') {
         res.writeHead(200, {
@@ -853,7 +1058,7 @@ const server = createServer((req, res) => {
 
 server.listen(PORT, HOST, () => {
   console.log(`新番追番日历已启动：http://${HOST}:${PORT}`);
-  console.log(`数据库：${path.join(DATA_DIR, 'anime.db')}`);
+  console.log(`数据库：${dbPath}`);
   console.log('按 Ctrl+C 停止。');
 });
 

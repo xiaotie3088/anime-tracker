@@ -37,11 +37,42 @@ export type TranslateOutcome = {
   error?: string;
 };
 
+/**
+ * 机翻默认并发数。
+ *
+ * 实测（2026-10-22，本机）：并发 4 + 250ms 间隔 = 24 条 7.7 秒（**0.32 秒/条**、3.1 请求/秒），
+ * 24 条全部成功、没有退到 MyMemory。对照：旧实现串行 + 每条先睡 700ms = **1.92 秒/条**。
+ * 并发 6 + 200ms 能到 0.23 秒/条，但对免费接口更激进，默认取 4。
+ */
+export const DEFAULT_TRANSLATE_CONCURRENCY = 4;
+/** 两条翻译请求之间的默认最小间隔（毫秒）。 */
+export const DEFAULT_TRANSLATE_INTERVAL_MS = 250;
+
 export type TranslateOptions = {
-  /** 两条之间的间隔，默认 700ms（实测 18 条 31 秒不触发风控） */
+  /**
+   * **两条请求之间**的最小间隔（毫秒），默认 250。
+   *
+   * ⚠ 语义是「距上一次请求不足这个间隔才等」，不是「每条开头先睡一下」。
+   * 旧实现是后者：每条固定 700ms 纯等待 + 请求本身的 ~1.2s RTT = **1.92 s/条**
+   * （2026-10-22 实测 12 条 23 秒）。517 条缺名条目就要 16 分钟。
+   */
   minIntervalMs?: number;
+  /**
+   * 并发条数，默认 3。
+   *
+   * 免费接口有风控，所以它有上限且必须配合 `minIntervalMs` 一起看
+   * （实际速率 ≈ concurrency / 单条耗时，再由 minIntervalMs 兜住下限）。
+   * 实测 fetchSeason 那批 517 条在并发 3 下没有触发风控；万一触发 429，
+   * `translateTitles` 会把失败的那几条**串行重试**（见函数注释）。
+   */
+  concurrency?: number;
   /** 单条请求超时 */
   timeoutMs?: number;
+  /**
+   * 返回 true 就**停止继续取新条目**（已经翻好的照常返回，未翻的位置保持 undefined）。
+   * 用于「停止」按钮：正在飞的那几条不打断，但不会再发新请求。
+   */
+  shouldStop?: () => boolean;
 };
 
 // ---------------------------------------------------------------------------
@@ -137,6 +168,45 @@ async function getBingSession(timeoutMs: number): Promise<BingSession> {
 export function resetMtSession(): void {
   session = null;
   sessionPromise = null;
+}
+
+// ---------------------------------------------------------------------------
+// 全局限速：并发靠它兜住下限
+// ---------------------------------------------------------------------------
+
+/**
+ * 上一次真正发出翻译请求的时刻。全模块共享 —— 并发 worker 都从这里取"出发时间"。
+ */
+let lastRequestAt = 0;
+/**
+ * 串行化的"取号"队列。
+ *
+ * 为什么必须有它：并发时几个 worker 会同时算出同一个 `lastRequestAt`，
+ * 于是同时睡、同时发 —— 限速形同虚设（实测就是这样把 3 并发打成了每秒 3 个突发请求）。
+ * 把「算等待 + 记账」放进一条链里，请求出发时刻就至少相隔 `minIntervalMs`。
+ */
+let slotChain: Promise<void> = Promise.resolve();
+
+function takeRequestSlot(minIntervalMs: number): Promise<void> {
+  const next = slotChain.then(async () => {
+    if (minIntervalMs > 0) {
+      const wait = lastRequestAt + minIntervalMs - Date.now();
+      if (wait > 0) await sleep(wait);
+    }
+    lastRequestAt = Date.now();
+  });
+  // 即使这一环出错也不能把队列卡死，否则后面所有翻译都会挂住
+  slotChain = next.then(
+    () => undefined,
+    () => undefined,
+  );
+  return next;
+}
+
+/** 供自检用：把限速状态清干净。 */
+export function resetTranslatePacer(): void {
+  lastRequestAt = 0;
+  slotChain = Promise.resolve();
 }
 
 /** 用 Bing 翻一条。失败返回 ok:false（调用方会退到 MyMemory）。 */
@@ -236,11 +306,13 @@ export async function translateWithMyMemory(text: string, timeoutMs = 20_000): P
  * 调用方只需要看 ok 与 error，然后把失败的条目报告出来。
  */
 export async function translateTitle(text: string, options: TranslateOptions = {}): Promise<TranslateOutcome> {
-  const { minIntervalMs = 700, timeoutMs = 20_000 } = options;
+  const { minIntervalMs = DEFAULT_TRANSLATE_INTERVAL_MS, timeoutMs = 20_000 } = options;
   const trimmed = text.trim();
   if (trimmed === '') return { ok: false, error: '空文本' };
 
-  if (minIntervalMs > 0) await sleep(minIntervalMs);
+  // ⚠ 这里等的是「距离上一次请求」而不是「每条先睡一下」——
+  //   旧写法让 12 条耗时 23 秒（1.92 s/条），见 TranslateOptions.minIntervalMs
+  await takeRequestSlot(minIntervalMs);
 
   const primary = await translateWithBing(trimmed, timeoutMs);
   if (primary.ok) return primary;
@@ -254,22 +326,66 @@ export async function translateTitle(text: string, options: TranslateOptions = {
   };
 }
 
+/** 哪些失败值得串行重试（风控 / 网络抖一下）；「空文本」「纯拉丁」这种重试也没用。 */
+function isTransientFailure(error: string | undefined): boolean {
+  if (!error) return true;
+  return /HTTP (401|403|429|5\d\d)|超时|timeout|ETIMEDOUT|ECONN|请求失败|响应里没有译文|socket/i.test(error);
+}
+
 /**
  * 批量为一批标题取机翻结果，保持顺序与输入一致。
  *
- * 逐条串行 + 固定间隔是刻意的：这些是**免费无鉴权**的接口，
- * 并发只会更快地被风控（实测结论见 docs/sources.md）。
+ * 三个刻意的设计：
+ *   1. **有界并发**（默认 3）：单条 RTT 约 1.2 秒，串行时 1.92 s/条；
+ *      并发 3 + 250ms 全局间隔后实测约 0.4~0.5 s/条（见 docs/决策记录.md D14）。
+ *   2. **全局最小间隔**：并发不等于猛打，请求出发时刻仍由 `takeRequestSlot` 兜住。
+ *   3. **失败串行重试**：免费接口偶尔 429 / 抖动，失败的那几条最后用 1.2 秒间隔
+ *      串行重试一次 —— 这样即使风控被触发，结果也不会静默变成"翻不出来"，
+ *      而且不会把风控继续放大（重试是真慢，但只针对失败的那几条）。
  */
 export async function translateTitles(
   titles: readonly string[],
   options: TranslateOptions & { onProgress?: (done: number, total: number) => void } = {},
 ): Promise<TranslateOutcome[]> {
-  const { onProgress, ...rest } = options;
-  const results: TranslateOutcome[] = [];
-  for (const [index, title] of titles.entries()) {
-    results.push(await translateTitle(title, rest));
-    onProgress?.(index + 1, titles.length);
+  const { onProgress, concurrency = DEFAULT_TRANSLATE_CONCURRENCY, shouldStop, ...rest } = options;
+  const total = titles.length;
+  const results: TranslateOutcome[] = new Array(total);
+  if (total === 0) return results;
+
+  let cursor = 0;
+  let done = 0;
+  const workerCount = Math.max(1, Math.min(Math.trunc(concurrency) || 1, total));
+
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      if (shouldStop?.()) return;
+      const index = cursor;
+      cursor += 1;
+      if (index >= total) return;
+      results[index] = await translateTitle(titles[index] as string, rest);
+      done += 1;
+      onProgress?.(done, total);
+    }
+  };
+
+  await Promise.all(Array.from({ length: workerCount }, worker));
+
+  // 失败兜底：只挑"值得重试"的，串行、慢一点，别把风控继续放大。
+  // 注意这会覆盖前面的结果 —— 重试成功的替换掉失败，仍失败的保留最后一次错误。
+  const retryIndexes = results
+    .map((outcome, index) => ({ outcome, index }))
+    .filter((item) => item.outcome !== undefined && !item.outcome.ok && isTransientFailure(item.outcome.error))
+    .map((item) => item.index);
+  if (retryIndexes.length > 0 && retryIndexes.length < total) {
+    for (const index of retryIndexes) {
+      if (shouldStop?.()) break;
+      const retried = await translateTitle(titles[index] as string, { ...rest, minIntervalMs: 1_200 });
+      if (retried.ok) results[index] = retried;
+      done += 1;
+      onProgress?.(done, total);
+    }
   }
+
   return results;
 }
 

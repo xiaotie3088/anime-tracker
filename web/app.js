@@ -113,6 +113,15 @@ const STATUS_CHIPS = [
   ['nozh', '缺中文名'],
 ];
 
+/**
+ * 季度的四个月份（季度 id 是 `YYYY-01|04|07|10`）。
+ * 季度面板按「年 × 月」排成矩阵，缺的格子显示「—」，一眼能看出哪一季库里没有。
+ */
+const SEASON_MONTHS = ['01', '04', '07', '10'];
+
+/** 收起时最多直接列出几个已选季度（超过就收成「等 N 季」，避免全选时排出一屏 chip）。 */
+const SEASON_CHIP_LIMIT = 6;
+
 /** localStorage 的键：布局偏好要跨刷新记住，否则每次打开都得重设一遍。 */
 const LS_PER_ROW = 'anime-tracker.perRow';
 const LS_SORT = 'anime-tracker.sort';
@@ -189,6 +198,14 @@ function emptyFilters() {
 const state = {
   view: 'week',
   season: null,
+  /**
+   * 服务端在启动时判定的「当季」（`/api/overview` 不带 season 参数时返回的那一季）。
+   *
+   * 为什么单独存一份：`state.season` 会跟着用户点选的季度漂移（看 2024-01 时它就是 2024-01），
+   * 而「当季」这个动作必须永远回到日历上的当季，不能变成"回到上次看的季度"。
+   * 只在页面加载时取一次 —— 开着页面跨季度的情况极少，且与原来 state.season 的行为一致。
+   */
+  currentSeason: null,
   /** 同时选中的季度（多选，第一个是主季 —— 周视图 / .ics 用它） */
   selectedSeasons: [],
   rule: 'clock',
@@ -218,7 +235,17 @@ const state = {
   sort: 'firstAir',
   perRow: PER_ROW_DEFAULT,
   showAllChanges: false,
+  /** 已提交的搜索词：`baseFilteredSubjects()` 只认它，列表真正按它筛 */
   searchQuery: '',
+  /**
+   * 搜索框里的**草稿**：打字只改它，点「搜索」/ Enter 才提交成 searchQuery。
+   *
+   * 用户明确要"打完字点搜索才搜"：原来的 `input` 事件边打边筛，列表一直跳。
+   * 分开存还有第二个好处 —— 点季度 / 切排序会重绘第 1 层，草稿能让没提交的文字原样留在框里。
+   */
+  searchDraft: '',
+  /** 季度面板展开着没有（收起时季度区只占一行：已选季度 + 选择季度 / 全选） */
+  seasonsOpen: false,
   detailKey: null,
   /** 「更新数据」范围选择器的临时状态（picked = 勾中的季度 id，只在对话框开着时有效） */
   updateScope: null,
@@ -242,6 +269,66 @@ async function api(path, options = {}) {
   }
   if (!response.ok) throw new Error(payload.error ?? `HTTP ${response.status}`);
   return payload;
+}
+
+// ---------------------------------------------------------------------------
+// 长任务（一键更新 / 补中文名）：后台跑 + 轮询进度 + 停止
+// ---------------------------------------------------------------------------
+//
+// 以前这两个动作是**一个同步请求**：抓 15 季 + 翻几百条要几分钟，界面只能显示
+// 「已等待 N 秒」。现在服务端改成后台任务（POST ...&async=1），这里轮询 /api/job
+// 画阶段与进度，并提供「停止」。
+
+/** 轮询间隔（毫秒）。任务本身是秒级到分钟级，700ms 足够跟手。 */
+const JOB_TICK_MS = 700;
+
+/** 顶栏「停止」按钮：只在有任务在跑时出现。 */
+function showCancel(visible) {
+  const button = $('#cancel-btn');
+  if (!button) return;
+  button.hidden = !visible;
+  button.disabled = false;
+}
+
+/** 进度文案：抓取阶段报「第几季 / 当前季」，机翻阶段报「done/total」。 */
+function jobProgressText(job) {
+  const doneSeasons = (job.seasons ?? []).length;
+  if (job.stage === 'translate') {
+    const total = job.translate?.total ?? 0;
+    const done = job.translate?.done ?? 0;
+    return `正在机翻补中文名 ${done}/${total || '?'}…（可点「停止」，已翻好的会保留）`;
+  }
+  const tail = doneSeasons > 0 ? `，已抓完 ${doneSeasons} 季` : '';
+  const current = job.currentSeason ? `（${job.currentSeason}）` : '';
+  return `正在抓取${current}…${tail}（可点「停止」，已抓到的会保留）`;
+}
+
+/**
+ * 起一个后台任务并轮询到结束，返回任务快照（`job.result` 就是接口结果）。
+ *
+ * `startPath` 必须带 `async=1`。取消是「请求停止」而不是直接掐断：
+ * 服务端会把当前这一季/这一条做完再收尾，已落库的数据一律保留。
+ */
+async function runJob(startPath, { onTick, tickMs = JOB_TICK_MS } = {}) {
+  const started = await api(startPath, { method: 'POST' });
+  if (!started?.job) throw new Error('服务端没有返回任务信息（版本不匹配？）');
+  onTick?.(started.job);
+  showCancel(true);
+  try {
+    for (;;) {
+      const snapshot = await api('/api/job');
+      const job = snapshot?.job;
+      if (!job) throw new Error('任务消失了（服务可能被重启过）');
+      onTick?.(job);
+      if (!job.running) {
+        if (job.stage === 'error') throw new Error(job.error ?? '任务失败');
+        return job;
+      }
+      await new Promise((resolve) => setTimeout(resolve, tickMs));
+    }
+  } finally {
+    showCancel(false);
+  }
 }
 
 let statusTimer = null;
@@ -920,12 +1007,19 @@ function filterConditionCount() {
  */
 function filterPanelHeadHtml(base) {
   const count = filterConditionCount();
+  const pending = searchPending();
   return `
     <div class="filter-layer">
       <div class="toolbar">
         <input type="search" id="season-search" placeholder="搜索中文名 / 原名（也可以直接搜别名）" value="${esc(
-          state.searchQuery,
+          state.searchDraft,
         )}" />
+        <button type="button" class="btn btn-sm${pending ? ' is-pending' : ''}" id="search-go"
+          title="${
+            pending
+              ? '有还没提交的搜索词：点这里（或按 Enter）才会筛'
+              : '搜索（打完字点这里或按 Enter；输入时不筛）'
+          }">搜索</button>
         <button class="btn btn-sm" id="filter-toggle" data-filter-collapse="1"
           aria-expanded="${state.filtersCollapsed ? 'false' : 'true'}"
           title="${
@@ -935,8 +1029,68 @@ function filterPanelHeadHtml(base) {
             state.filtersCollapsed ? '▼' : '▲'
           }</button>
         <span class="hint" id="subject-count">显示 ${applyFilters(base).length} / ${base.length} 部</span>
+        <span class="hint search-active" id="search-active">${searchActiveHtml()}</span>
       </div>
     </div>`;
+}
+
+/** 输入框里有没有"打了字但还没点搜索"的内容 —— 「搜索」按钮上的小圆点用它。 */
+function searchPending() {
+  return state.searchDraft.trim() !== state.searchQuery;
+}
+
+/** 已提交搜索词时，跟在「显示 N / M 部」后面的那一小段：`·「药屋」✕`。 */
+function searchActiveHtml() {
+  if (!state.searchQuery) return '';
+  // 文字包一层 span：`syncSearchState` 是整段改写 innerHTML，字面文字单独成节点更稳
+  // （也让样式能单独管关键词的截断）。
+  return `<span class="search-word">·「${esc(state.searchQuery)}」</span><button type="button" class="search-clear" data-search-clear="1"
+      title="清除搜索词（与把输入框清空同效）">✕</button>`;
+}
+
+/**
+ * 只同步搜索相关的两处（按钮上的待提交圆点 + 已提交关键词），**不重绘输入框**。
+ *
+ * 为什么单独一个函数：`#search-active` 和输入框同在第 1 层常驻节点里，
+ * 但只要不碰输入框节点，把旁边那两处就地改掉就不会丢焦点。
+ */
+function syncSearchState() {
+  const button = $('#search-go');
+  if (button) {
+    const pending = searchPending();
+    button.classList.toggle('is-pending', pending);
+    button.setAttribute('title', pending ? '有还没提交的搜索词：点这里（或按 Enter）才会筛' : '搜索（打完字点这里或按 Enter；输入时不筛）');
+  }
+  const active = $('#search-active');
+  if (active) active.innerHTML = searchActiveHtml();
+}
+
+/**
+ * 提交搜索：把草稿写进 `state.searchQuery` 并刷新列表与面板正文。
+ *
+ * ⚠ 只重绘"列表 + 已选条件 + 面板正文"，第 1 层（输入框）不重绘 —— 焦点留在框中，
+ *   可以接着改词再按一次 Enter。
+ */
+function applySearch(raw) {
+  state.searchDraft = String(raw ?? '');
+  state.searchQuery = state.searchDraft.trim();
+  const input = $('#season-search');
+  if (input && input.value !== state.searchDraft) input.value = state.searchDraft;
+  refreshSubjectList();
+  renderFilterPanelBody();
+}
+
+/** 清除搜索：输入框、草稿、已提交的词一起清掉（清空输入框也走这里）。 */
+function clearSearch() {
+  state.searchDraft = '';
+  state.searchQuery = '';
+  const input = $('#season-search');
+  if (input) {
+    input.value = '';
+    input.focus?.();
+  }
+  refreshSubjectList();
+  renderFilterPanelBody();
 }
 
 /**
@@ -1107,54 +1261,130 @@ function filterGroupHtml(dimension, base, { scroll = false } = {}) {
 }
 
 /**
- * 「历史季度会一直保留」的显式说明（用户诉求 4）。
+ * 季度区（全季总览顶部）：**收起时一行、展开时按年矩阵**。
  *
- * 数据库层面本来就保留历史季度 —— 但用户看不到这件事，所以要在界面上说出来：
- * 库里有哪些季度、各有多少部、最后一次更新是什么时候。
- * 第五轮起这里同时是**多选器**：点一下选中/取消，选多个季度会合并查询。
+ * 原来是一行 `nowrap + overflow-x` 的 chip 长条：季度涨到近 30 个之后要横向滚两屏多，
+ * 点右侧的季度还会整页重绘、滚动条弹回最左 —— 选几个不连续的季度要反复找。
+ * 现在收起时只有「已选季度 + 选择季度 / 全选」一行，季度再多也不占地方；
+ * 展开后按「年 × 月」排成矩阵，缺的季度显示「—」，点格子 / 点全年 / 点预设都是**一次请求**。
+ *
+ * 「历史季度一直保留」这件事仍然要说出来（用户诉求 4）：标题旁常驻「共 N 季」，
+ * 每格有部数与最后更新时间，展开就看得到全貌。
  */
 function seasonLibraryNotice(overview) {
   const summaries = overview.seasonSummaries ?? [];
   if (summaries.length === 0) return '';
 
   const selected = state.selectedSeasons.length > 0 ? state.selectedSeasons : [state.season];
-  // 「全选」按钮：放在季度标签**最前面**（用户诉求 2 —— 全选之后再逐个点掉 8 个标签太麻烦）。
-  // 再点一次的含义是"回到只选当季"：不这么设计的话，全选之后想回到单季没有任何快捷出路。
-  // ⚠ 判定"是否已全选"只看**每个季度是否都在选中集合里**，不要额外比长度：
-  //   选中集合里可能还含 `state.season`（若它不在 seasonSummaries 里），比长度会得出"没全选"，
-  //   而界面上看起来明明全选了 —— 按钮状态与点击行为就会不一致。
-  const allSelected = summaries.every((item) => selected.includes(item.season));
-  const allButton = `<button class="chip chip-all ${allSelected ? 'is-active' : ''}" data-season-all="1"
-      aria-pressed="${allSelected ? 'true' : 'false'}"
-      title="点一下选中库里所有季度（主季仍是当季）；再点一次回到只选当季">${
-        allSelected ? '✓ ' : ''
-      }全选${allSelected ? ' · 全部季度' : ''}</button>`;
-
-  const chips = summaries
-    .map((item) => {
-      const active = selected.includes(item.season);
-      return `<button class="chip ${active ? 'is-active' : ''}" data-season-toggle="${esc(
-        item.season,
-      )}" aria-pressed="${active ? 'true' : 'false'}" title="点一下选中/取消；选多个季度会合并查询。最后更新：${esc(
-        String(item.updatedAt ?? '').slice(0, 16).replace('T', ' '),
-      )}">${active ? '✓ ' : ''}${esc(item.season)} · ${item.subjects} 部</button>`;
-    })
-    .join('');
-
-  const isMulti = selected.length > 1;
+  const primary = selected[0];
+  const multi = selected.length > 1;
   return `
     <section class="season-bar">
       <div class="season-bar-head">
         <h3 class="section-title">库里已有的季度</h3>
-        <span class="season-bar-note">可多选 · 历史不删 · 同步只写当季 · 当前合集 ${overview.totals.all} 部</span>
+        <span class="season-bar-note">共 ${summaries.length} 季 · 历史不删 · 同步只写当季 · 当前合集 ${overview.totals.all} 部</span>
+        <span class="season-bar-primary">主季 <b>${esc(primary)}</b>${multi ? ' · 周视图 / .ics 用它' : ''}</span>
       </div>
-      <div class="my-tabs">${allButton}${chips}</div>
+      ${seasonPicksHtml(selected, primary)}
+      ${seasonPanelHtml(overview, selected)}
       ${
-        isMulti
-          ? '<p class="season-warning">⚠ 周视图与 .ics 导出按主季（第一个选中的季度）计算。</p>'
+        multi
+          ? `<p class="season-warning">已选 ${selected.length} 季：列表是这几季的并集；周视图与 .ics 仍按主季 ${esc(primary)} 计算。</p>`
           : ''
       }
     </section>`;
+}
+
+/** 收起状态的那一行：已选季度做成可点掉的 chip（超过 SEASON_CHIP_LIMIT 就收成「另 N 季」）。 */
+function seasonPicksHtml(selected, primary) {
+  const shown = selected.slice(0, SEASON_CHIP_LIMIT);
+  const rest = selected.length - shown.length;
+  const chips = shown
+    .map((season) => {
+      const isPrimary = season === primary;
+      return `<button type="button" class="chip is-active${isPrimary ? ' is-primary' : ''}" data-season-toggle="${esc(
+        season,
+      )}" title="${
+        isPrimary ? '主季（周视图 / .ics 用它）。点一下取消这一季' : '已选中，点一下取消这一季'
+      }">${esc(season)}${isPrimary ? '<span class="season-primary">主</span>' : ''}<span class="season-chip-x" aria-hidden="true">✕</span></button>`;
+    })
+    .join('');
+  return `
+    <div class="season-picks">
+      <span class="season-picks-count" id="season-picks-count">已选 ${selected.length} 季</span>
+      ${chips}${rest > 0 ? `<span class="season-picks-more">另 ${rest} 季</span>` : ''}
+      <span class="season-picks-actions">
+        <button type="button" class="btn btn-sm" id="season-picker-btn" data-season-picker="1"
+          aria-expanded="${state.seasonsOpen ? 'true' : 'false'}"
+          title="展开 / 收起季度面板：按年份一次选多季（季度再多也不怕）">选择季度 ${
+            state.seasonsOpen ? '▲' : '▼'
+          }</button>
+        <button type="button" class="btn btn-sm" data-season-all="1"
+          title="选中库里所有季度（主季仍是当季；想回到单季点面板里的「当季」）">全选</button>
+      </span>
+    </div>`;
+}
+
+/**
+ * 展开的季度面板：快捷预设 + 年 × 月矩阵。
+ *
+ * 矩阵按年分组（新年在上），四列固定是 01 / 04 / 07 / 10 —— 季度 id 只可能是这四个月，
+ * 所以「缺哪一季」用一列「—」就能看出来，不需要再数格子。
+ */
+function seasonPanelHtml(overview, selected) {
+  const years = new Map();
+  for (const item of overview.seasonSummaries ?? []) {
+    const year = String(item.season).slice(0, 4);
+    if (!years.has(year)) years.set(year, []);
+    years.get(year).push(item);
+  }
+
+  const rows = [...years.entries()]
+    .sort((a, b) => b[0].localeCompare(a[0]))
+    .map(([year, items]) => {
+      const counts = new Map(items.map((item) => [item.season, item.subjects]));
+      const updated = new Map(items.map((item) => [item.season, item.updatedAt]));
+      const cells = SEASON_MONTHS.map((month) => {
+        const id = `${year}-${month}`;
+        if (!counts.has(id)) return `<span class="season-cell is-empty" title="库里还没有 ${esc(id)}">—</span>`;
+        const on = selected.includes(id);
+        const when = String(updated.get(id) ?? '').slice(0, 16).replace('T', ' ');
+        return `<button type="button" class="season-cell${on ? ' is-on' : ''}" data-season-toggle="${esc(id)}"
+            aria-pressed="${on}" title="${on ? '点一下取消' : '点一下选中'} ${esc(id)}（${counts.get(id)} 部）${
+              when ? `；最后更新：${esc(when)}` : ''
+            }">${on ? '<span class="season-cell-check">✓</span>' : ''}${counts.get(id)}<span class="season-cell-u">部</span></button>`;
+      }).join('');
+      const picked = items.filter((item) => selected.includes(item.season)).length;
+      const allOn = picked === items.length;
+      return `<div class="season-matrix-row">
+          <span class="season-year">${esc(year)}<span class="season-year-count">${picked}/${items.length}</span></span>
+          ${cells}
+          <button type="button" class="btn btn-sm season-year-btn${allOn ? ' is-on' : ''}" data-season-year="${esc(year)}"
+            aria-pressed="${allOn}" title="${allOn ? '取消' : '选中'} ${esc(year)} 年库里所有季度">全年</button>
+        </div>`;
+    })
+    .join('');
+
+  return `
+    <div class="season-panel" id="season-panel"${state.seasonsOpen ? '' : ' hidden'}>
+      <div class="season-presets">
+        <button type="button" class="btn btn-sm" data-season-preset="current" title="只选当季">当季</button>
+        <button type="button" class="btn btn-sm" data-season-preset="last4" title="当季 + 往前 3 个有数据的季度">近 4 季</button>
+        <button type="button" class="btn btn-sm" data-season-preset="last8" title="当季 + 往前 7 个有数据的季度">近 8 季</button>
+        <button type="button" class="btn btn-sm" data-season-preset="all" title="库里所有季度 + 当季">全部</button>
+      </div>
+      <div class="season-matrix" role="group" aria-label="按年份选择季度">
+        <div class="season-matrix-row is-head" aria-hidden="true">
+          <span class="season-year">年份</span>
+          ${SEASON_MONTHS.map((month) => `<span class="season-month">${month} 月</span>`).join('')}
+          <span></span>
+        </div>
+        ${rows}
+      </div>
+      <p class="filter-note">点格子 = 加 / 去掉这一季（与已选的合并）；想只留某一季，用顶部的「季度」下拉。
+        点「全年」= 该年库里所有季度一起切换；库里缺的季度显示「—」。
+        主季 = 选中里「当季优先、否则最新」的那一季，周视图与 .ics 按它算。</p>
+    </div>`;
 }
 
 function emptyListHtml() {
@@ -1212,6 +1442,8 @@ function refreshSubjectList() {
   if (active) active.innerHTML = activeFilterChips();
   // 开关上的徽标（筛了几项）要跟着变；收起时它是"我筛了东西"的唯一可见提示之一
   syncFilterToggle();
+  // 搜索按钮上的待提交圆点 / 已提交关键词：只改这两处，不碰输入框节点
+  syncSearchState();
 }
 
 /**
@@ -1243,14 +1475,30 @@ function renderSeason() {
 
   const search = $('#season-search');
   if (search) {
+    // 打字只更新草稿：**不筛列表、不重绘面板**（用户要求"点搜索才搜"）。
+    // 例外是把输入框清空 —— 那时立即清掉已提交的词，否则点了搜索再删字，
+    // 列表会一直停在旧关键词上，看起来像坏了。
     search.addEventListener('input', (event) => {
-      state.searchQuery = event.target.value;
-      refreshSubjectList();
-      // 搜索词会改变候选与部数，所以面板正文要跟着刷新 —— 但**不能**碰第 1 层自己，
-      // 否则每打一个字就换一次输入框节点，光标直接飞走。
-      renderFilterPanelBody();
+      state.searchDraft = event.target.value;
+      if (state.searchDraft.trim() === '') {
+        if (state.searchQuery) {
+          state.searchQuery = '';
+          refreshSubjectList();
+          renderFilterPanelBody();
+        } else {
+          syncSearchState();
+        }
+        return;
+      }
+      syncSearchState();
+    });
+    search.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter') return;
+      event.preventDefault?.();
+      applySearch(search.value);
     });
   }
+  $('#search-go')?.addEventListener('click', () => applySearch($('#season-search')?.value ?? ''));
 }
 
 // ---------------------------------------------------------------------------
@@ -1843,7 +2091,7 @@ function reportArchiveMove(moved) {
 // ---------------------------------------------------------------------------
 
 /** 选择器里额外列出"再往前"多少个季度（库里还没有的那些就是从这里挑的）。 */
-const UPDATE_OLDER_SEASONS = 16;
+const UPDATE_OLDER_SEASONS = 24;
 
 /**
  * 季度 id 前后移位（`'2026-01'` 往前一季 → `'2025-10'`）。
@@ -1886,7 +2134,16 @@ function updateSeasonCandidates() {
 
 /** 打开范围选择器时先把它重置成"默认只更新当季"（用户的心智：一键更新）。 */
 function openUpdateDialog() {
-  state.updateScope = { picked: new Set([state.season].filter(Boolean)), extra: [], force: false };
+  // incremental 默认勾上：跳过「上次真抓过」的季度，省时间也少打源站。
+  // 从没真抓过的季度（含只有邻季漏入的那几部）**不受它影响**，照样会抓。
+  // translate 默认勾上：机翻是上一版最慢的一段（4 路并发后一套 500 条约 3 分钟），
+  // 取消勾选就只抓清单，中文名以后点「补全中文名（机翻）」再补。
+  state.updateScope = {
+    picked: new Set([state.season].filter(Boolean)),
+    extra: [],
+    incremental: true,
+    translate: true,
+  };
   const modal = $('#modal');
   if (!modal) return;
   modal.innerHTML = updateScopeDialogHtml();
@@ -1900,9 +2157,22 @@ function closeUpdateDialog() {
   state.updateScope = null;
 }
 
-/** 对话框里的季度行：库里已有的标部数，没有的明确标"库里没有"；手填的排在最前面。 */
+/**
+ * 某一季在勾选框旁边的那行小字。
+ *
+ * 「库里 N 部」本身会骗人：抓相邻季度时，按条目自己的放送时刻会有几条被判进这一季，
+ * 于是没抓过的季度也显示"有数据"。所以这里必须把「上次真抓」一并说出来。
+ */
+function scopeSeasonNote(item) {
+  if (item.manual) return '手动加的';
+  if (!item.inLibrary) return '库里没有';
+  if (!item.lastFetchedAt) return `库里 ${item.subjects} 部 · 未真抓过`;
+  return `库里 ${item.subjects} 部 · 上次真抓 ${String(item.lastFetchedAt).slice(5, 10)}`;
+}
+
+/** 对话框里的季度行：库里已有的标部数与上次真抓时间，没有的明确标"库里没有"；手填的排在最前面。 */
 function updateScopeDialogHtml() {
-  const scope = state.updateScope ?? { picked: new Set(), force: false };
+  const scope = state.updateScope ?? { picked: new Set(), incremental: true };
   const manual = (scope.extra ?? []).map((id) => ({ id, subjects: 0, inLibrary: false, manual: true }));
   const candidates = [
     ...manual,
@@ -1914,7 +2184,7 @@ function updateScopeDialogHtml() {
       <label class="scope-item">
         <input type="checkbox" data-scope-season="${esc(item.id)}"${scope.picked.has(item.id) ? ' checked' : ''} />
         <span class="scope-id">${esc(item.id)}</span>
-        <span class="scope-note">${item.manual ? '手动加的' : item.inLibrary ? `库里 ${item.subjects} 部` : '库里没有'}</span>
+        <span class="scope-note">${esc(scopeSeasonNote(item))}</span>
       </label>`,
     )
     .join('');
@@ -1922,7 +2192,7 @@ function updateScopeDialogHtml() {
     <div class="modal-head is-text">
       <div class="h-info">
         <h2>更新数据：这次抓哪些季度</h2>
-        <div class="orig">默认只更新当季；勾多季会依次抓，每季之间停 1 秒</div>
+        <div class="orig">默认只更新当季；勾多季会依次抓，每季之间停 1 秒。过去季度不抓逐集放送时刻。</div>
       </div>
       <button class="close-x" data-close="1">×</button>
     </div>
@@ -1943,9 +2213,13 @@ function updateScopeDialogHtml() {
         </div>
       </div>
       <aside class="scope-side">
-        <label class="scope-force">
-          <input type="checkbox" id="scope-force"${scope.force ? ' checked' : ''} />
-          <span>重抓已选季度（不勾则跳过库里已有数据的季度，省时间也少打源站）</span>
+        <label class="scope-toggle">
+          <input type="checkbox" id="scope-incremental"${scope.incremental === false ? '' : ' checked'} />
+          <span>只抓没抓过的季度（增量）。库里"有几部"不等于抓过 —— 抓相邻季度会顺带判进几条。取消勾选＝把勾中的季度全部重抓。</span>
+        </label>
+        <label class="scope-toggle">
+          <input type="checkbox" id="scope-translate"${scope.translate === false ? '' : ' checked'} />
+          <span>顺带补中文名（机翻）。取消勾选＝这次只抓清单，中文名以后点「补全中文名（机翻）」再补。</span>
         </label>
         <div class="filter-note" id="scope-summary"></div>
       </aside>
@@ -1962,20 +2236,40 @@ function updateScopeSummaryText() {
   const scope = state.updateScope;
   if (!host || !scope) return;
   const picked = [...scope.picked].sort().reverse();
-  const libraryIds = new Set((state.overview?.seasonSummaries ?? []).map((item) => item.season));
+  const summaries = new Map((state.overview?.seasonSummaries ?? []).map((item) => [item.season, item]));
+  const incremental = scope.incremental !== false;
   const lines = [];
   if (picked.length === 0) {
     lines.push('<b>还没勾任何季度</b> —— 至少勾一个才能开始');
   } else {
     lines.push(`<b>已选 ${picked.length} 季</b>：${esc(picked.join('、'))}`);
-    lines.push(
-      `预计 <b>${picked.length * 10}~${picked.length * 30} 秒</b>` +
-        `（每季 10~30 秒 + 季间 1 秒；机翻每条约 0.7 秒，另算）`,
-    );
-    const fresh = picked.filter((id) => !libraryIds.has(id));
-    if (fresh.length) {
-      lines.push(`其中 <b>${esc(fresh.join('、'))}</b> 库里还没有，这次会真的去抓（老季度源站可能查不到，会如实报告）`);
+    // 「从没真抓过」与「库里没有」都一定会去抓；这两类才是用户真正会等的。
+    const neverFetched = picked.filter((id) => {
+      const item = summaries.get(id);
+      return !item || !item.lastFetchedAt;
+    });
+    const willSkip = incremental ? picked.filter((id) => summaries.get(id)?.lastFetchedAt) : [];
+    if (neverFetched.length) {
+      lines.push(
+        `其中 <b>${esc(neverFetched.join('、'))}</b> 从没真抓过，这次会真的去抓` +
+          '（老季度的源站页面可能没有，会如实报告）',
+      );
     }
+    if (willSkip.length) {
+      lines.push(
+        `<span class="change-msg">${esc(willSkip.join('、'))} 上次已真抓过，这次跳过；要重抓请取消勾「只抓没抓过的季度」</span>`,
+      );
+    }
+    // 耗时口径按实测：抓一季约 3~8 秒（三源并发，AniList 每页 1.2 秒是下限）；
+    // 机翻 4 路并发约 0.35 秒/条 —— 只有缺中文名的条目才算（每季几十条）。
+    const fetchCount = Math.max(1, picked.length - willSkip.length);
+    const wantTranslate = scope.translate !== false;
+    lines.push(
+      `<b>预计</b>：抓取 ${fetchCount * 3}~${fetchCount * 8} 秒` +
+        (wantTranslate
+          ? `，机翻另按缺名条目数算（约 0.35 秒/条，古早季度一季几十条 → 十几秒）`
+          : '（本次不机翻，抓完就结束）'),
+    );
   }
   host.innerHTML = lines.join('<br />');
 }
@@ -2027,9 +2321,10 @@ function startScopedUpdate() {
     toast('至少勾一个季度', true);
     return;
   }
-  const force = Boolean(scope?.force);
+  const incremental = scope?.incremental !== false;
+  const wantTranslate = scope?.translate !== false;
   closeUpdateDialog();
-  void updateData({ seasons: picked, force });
+  void updateData({ seasons: picked, incremental, translate: wantTranslate });
 }
 
 /**
@@ -2037,32 +2332,40 @@ function startScopedUpdate() {
  *
  * 范围由对话框给（`seasons` 显式列表）。服务端也支持 `backfill=N` 那种"当季 + 往回 N 季"，
  * 但界面统一走显式列表 —— 用户看到的勾选与真正抓的季度就是同一份东西，不用换算。
+ *
+ * `incremental` 让服务端跳过「上次真抓过」的季度。判据是抓取记录（season_state），
+ * **不是**库里现有条目数 —— 抓相邻季度会按放送时刻顺带判进来几条，按条目数判会把
+ * 从没抓过的季度误判成"抓过了"（第八轮修的那个 bug）。
  */
-async function updateData({ seasons = [], force = false } = {}) {
+async function updateData({ seasons = [], incremental = true, translate = true } = {}) {
   const button = $('#update-btn');
   if (button) button.disabled = true;
   const label =
     seasons.length > 0
       ? `${seasons.length} 个季度（${seasons.join('、')}）`
       : '当季 + 历史回填';
-  setStatus(`正在更新数据：抓取 ${label} → 补中文名…（可能要 1~2 分钟）`);
-
-  // 机翻是逐条串行的，进度只能靠轮询状态文案；先给一个会变的提示
-  let tick = 0;
-  const timer = setInterval(() => {
-    tick += 1;
-    setStatus(`正在更新数据…已等待 ${tick * 2} 秒（多季抓取与机翻都比较慢，请勿关闭页面）`);
-  }, 2000);
+  setStatus(`正在更新数据：抓取 ${label}${translate ? ' → 补中文名' : '（本次不机翻）'}…`);
 
   try {
-    const params = new URLSearchParams({ season: state.season });
+    const params = new URLSearchParams({ season: state.season, async: '1' });
     if (seasons.length > 0) params.set('seasons', seasons.join(','));
-    if (force) params.set('force', '1');
-    const result = await api(`/api/update?${params.toString()}`, { method: 'POST' });
+    // 总是显式传：服务端拿不到这个参数时会按「显式挑的季度 = 全抓」处理
+    params.set('incremental', incremental ? '1' : '0');
+    // 不机翻 = 只抓清单（抓十几季也就几十秒），中文名以后点「补全中文名（机翻）」再补
+    if (!translate) params.set('translate', '0');
+
+    const job = await runJob(`/api/update?${params.toString()}`, {
+      onTick: (tick) => setStatus(jobProgressText(tick)),
+    });
+    const result = job.result;
+    if (!result) throw new Error('任务结束但没有结果');
     const summary = result.summary;
 
     const parts = [
       `写入 ${summary.written} 部 / ${summary.episodes} 集`,
+      // ⚠「新增」必须单独说：重抓一季永远是「写入 130 部」，而新增可能是 0 ——
+      //   以前只有写入数，看起来就像"更新成功了但番没变多"。
+      `其中新增 ${summary.added ?? 0} 部`,
       summary.machineFilled ? `机翻补齐 ${summary.machineFilled} 个中文名` : '',
       summary.officialReplaced ? `官方名替换 ${summary.officialReplaced} 个` : '',
       summary.movedToBacklog ? `${summary.movedToBacklog} 部移入补番库` : '',
@@ -2070,7 +2373,11 @@ async function updateData({ seasons = [], force = false } = {}) {
       summary.failedProviders.length ? `${summary.failedProviders.length} 个源失败` : '',
     ].filter(Boolean);
 
-    setStatus(`更新完成：${parts.join(' · ')}`, summary.failedProviders.length ? 'error' : 'ok');
+    const stopped = job.stage === 'cancelled' || result.cancelled;
+    setStatus(
+      `${stopped ? '已停止' : '更新完成'}：${parts.join(' · ')}`,
+      summary.failedProviders.length || stopped ? 'error' : 'ok',
+    );
 
     reportArchiveMove(result.current?.moved ?? []);
     if (summary.machineFilled) {
@@ -2094,7 +2401,6 @@ async function updateData({ seasons = [], force = false } = {}) {
   } catch (error) {
     setStatus(`更新失败：${error.message}`, 'error');
   } finally {
-    clearInterval(timer);
     if (button) button.disabled = false;
   }
 }
@@ -2110,15 +2416,17 @@ function showUpdateDetail(result) {
     const how = scope.mode === 'seasons' ? `你挑的 ${scope.seasons.length} 季` : `当季 + 往回 ${scope.backfill - 1} 季`;
     lines.push(
       `<b>本次范围</b>：${esc(how)} —— ${esc(scope.seasons.join('、'))}` +
-        `${scope.force ? '（重抓已选季度）' : '（增量：已有数据的跳过）'}` +
+        `${scope.force ? '（强制重抓）' : scope.incremental ? '（增量：跳过上次真抓过的）' : '（全抓）'}` +
         `${scope.backfillIgnored ? '　<span class="change-msg">backfill 参数已忽略（以挑的季度为准）</span>' : ''}`,
     );
   }
 
+  const archiveWritten = result.archive?.totalWritten ?? 0;
+  const archiveAdded = result.archive?.totalAdded ?? 0;
+  const archiveEpisodes = result.archive?.totalEpisodes ?? 0;
   lines.push(
-    `<b>主季 ${esc(scope?.seasons?.[0] ?? result.season ?? '')}</b>：写入 ${
-      summary.written - (result.archive?.totalWritten ?? 0)
-    } 部 / ${summary.episodes - (result.archive?.totalEpisodes ?? 0)} 集`,
+    `<b>主季 ${esc(scope?.seasons?.[0] ?? result.season ?? '')}</b>：写入 ${summary.written - archiveWritten} 部` +
+      `（新增 ${Math.max(0, (summary.added ?? 0) - archiveAdded)}） / ${summary.episodes - archiveEpisodes} 集`,
   );
 
   const seasons = result.archive?.seasons ?? [];
@@ -2126,7 +2434,12 @@ function showUpdateDetail(result) {
     const detail = seasons
       .map((item) => {
         const mark = item.status === 'fetched' ? '✓' : item.status === 'skipped' ? '·' : '!';
-        return `${mark} ${item.season}${item.status === 'fetched' ? `（${item.written} 部）` : item.note ? `（${item.note}）` : ''}`;
+        if (item.status === 'fetched') {
+          return `${mark} ${item.season}（写入 ${item.written} 部 / 新增 ${item.added ?? 0}${
+            item.schedules === false ? '；过去季度不抓逐集时刻' : ''
+          }）`;
+        }
+        return `${mark} ${item.season}${item.note ? `（${esc(item.note)}）` : ''}`;
       })
       .join('　');
     lines.push(`<b>各季结果</b>：${detail}`);
@@ -2165,18 +2478,37 @@ function showUpdateDetail(result) {
   $('#app').prepend(panel);
 }
 
-/** 只补中文名（机翻）。官方译名一到，更新数据会自动替换。 */
+/**
+ * 只补中文名（机翻）。官方译名一到，更新数据会自动替换。
+ *
+ * 范围是**全库缺中文名的条目**（最多 200 条/次，再点一次继续补）：
+ * 补名这件事跟"当前在看哪一季"没关系 —— 你刚补完 2020 年的番，
+ * 缺名的就在 2020 年，而不是界面上选中的这一季。
+ */
 async function translateMissing() {
   const button = $('#translate-btn');
-  button.disabled = true;
-  setStatus('正在为缺中文名的番做临时机翻…（逐条串行，可能要一会儿）');
+  if (button) button.disabled = true;
+  setStatus('正在为缺中文名的番做临时机翻（4 路并发）…');
   try {
-    const result = await api(`/api/translate?season=${encodeURIComponent(state.season)}`, { method: 'POST' });
+    const job = await runJob('/api/translate?all=1&limit=200&async=1', {
+      onTick: (tick) => {
+        const total = tick.translate?.total ?? 0;
+        const done = tick.translate?.done ?? 0;
+        setStatus(
+          total > 0
+            ? `正在机翻补中文名 ${done}/${total}…（可点「停止」，已翻好的会保留）`
+            : '正在收集缺中文名的条目…',
+        );
+      },
+    });
+    const result = job.result;
+    if (!result) throw new Error('任务结束但没有结果');
     setStatus(
       `机翻完成：补上 ${result.translatedCount} 个中文名` +
         (result.skipped ? ` · 跳过 ${result.skipped} 部（纯拉丁原名等不需要翻）` : '') +
+        (result.stopped ? ` · 停止时还有 ${result.stopped} 条没翻（再点一次会接着补）` : '') +
         (result.failed.length ? ` · ${result.failed.length} 条失败` : '') +
-        ` · 本季仍缺中文名 ${result.remaining} 部`,
+        ` · 全库仍缺中文名 ${result.remaining} 部（每次最多补 200，可再点一次）`,
       result.failed.length ? 'error' : 'ok',
     );
     if (result.translatedCount) {
@@ -2188,7 +2520,7 @@ async function translateMissing() {
   } catch (error) {
     setStatus(`机翻失败：${error.message}`, 'error');
   } finally {
-    button.disabled = false;
+    if (button) button.disabled = false;
   }
 }
 
@@ -2263,6 +2595,7 @@ async function bootstrap() {
   const current = await api(`/api/overview?season=&sort=${encodeURIComponent(state.sort)}`);
 
   state.season = current.season.id;
+  state.currentSeason = current.season.id;
   state.selectedSeasons = [current.season.id];
   state.overview = current;
 
@@ -2294,7 +2627,8 @@ async function bootstrap() {
 // 顶部控制区的按钮自己绑了监听，所以要在事件委托里排除掉，
 // 否则点一次会跑两遍（「更新数据」跑两遍 = 两倍的源站请求与机翻额度）。
 // 这是加固时发现的既有缺陷：界面上点了会重复触发，只是以前的两个按钮恰好幂等才没暴露。
-const SELF_HANDLED = new Set(['update-btn', 'sync-btn', 'translate-btn']);
+// `search-go` 也是这样：它在 renderSeason 里直接绑 click，委托里不必再处理一次。
+const SELF_HANDLED = new Set(['update-btn', 'sync-btn', 'translate-btn', 'search-go']);
 
 /**
  * 收起顶栏的「更多」菜单。
@@ -2364,6 +2698,23 @@ document.addEventListener('click', (event) => {
   //   （复制已改成标题上的双击，不再有独立的按钮分支；单击标题在上面就 return 了。）
   if (dataset.seasonAll) {
     void selectAllSeasons();
+    return;
+  }
+  if (dataset.seasonPicker) {
+    state.seasonsOpen = !state.seasonsOpen;
+    applySeasonPanel();
+    return;
+  }
+  if (dataset.seasonPreset) {
+    void selectSeasonPreset(dataset.seasonPreset);
+    return;
+  }
+  if (dataset.seasonYear) {
+    void toggleSeasonYear(dataset.seasonYear);
+    return;
+  }
+  if (dataset.searchClear) {
+    clearSearch();
     return;
   }
   if (dataset.seasonToggle) {
@@ -2586,6 +2937,16 @@ document.addEventListener('keydown', (event) => {
 $('#update-btn').addEventListener('click', () => openUpdateDialog());
 $('#sync-btn').addEventListener('click', () => void syncSeason());
 $('#translate-btn').addEventListener('click', () => void translateMissing());
+$('#cancel-btn')?.addEventListener('click', () => {
+  const button = $('#cancel-btn');
+  if (button) button.disabled = true;
+  setStatus('正在停止…（当前这一季 / 这一条做完就收尾，已抓到的会保留）');
+  void api('/api/job/cancel', { method: 'POST' })
+    .then((result) => {
+      if (!result?.ok) setStatus('当前没有在跑的任务');
+    })
+    .catch((error) => setStatus(`停止失败：${error.message}`, 'error'));
+});
 
 /** 请求总览时带上"选中的季度们"和排序口径。 */
 function overviewQuery() {
@@ -2620,56 +2981,121 @@ function syncSeasonUi() {
   if (select) select.value = primarySeason();
 }
 
-/** 点季度标签：选中 / 取消（可多选）。 */
-async function toggleSeason(seasonId) {
-  const index = state.selectedSeasons.indexOf(seasonId);
-  if (index >= 0) {
-    // 不允许一个都不选 —— 空集合会让请求回落到"当季"，和界面显示对不上
-    if (state.selectedSeasons.length === 1) {
-      toast('至少要留一个季度');
-      return;
-    }
-    state.selectedSeasons.splice(index, 1);
-  } else {
-    state.selectedSeasons.push(seasonId);
+/**
+ * 季度 id 定序：**当季优先（它就是主季），其余从新到旧**。
+ *
+ * 为什么要有这一步：主季是 `selectedSeasons[0]`，周视图与 `.ics` 都按它算。
+ * 以前"谁先被点中谁是主季"，点掉主季之后主季会跳到哪一季没人说得清；
+ * 现在所有入口（格子里点、全年、预设、全选）都先过这里，主季永远可预测。
+ */
+function orderedSeasons(ids) {
+  const unique = [...new Set(ids.filter(Boolean))];
+  const current = state.currentSeason;
+  const rest = unique.filter((id) => id !== current).sort((a, b) => b.localeCompare(a));
+  return unique.includes(current) ? [current, ...rest] : rest;
+}
+
+/** 选中集合的唯一入口：去重 → 定序 → 一次请求。 */
+async function setSelectedSeasons(ids) {
+  const next = orderedSeasons(ids);
+  if (next.length === 0) {
+    toast('至少要留一个季度');
+    return;
   }
+  state.selectedSeasons = next;
   await applySeasonChange();
+}
+
+/** 点一格 / 点已选 chip：选中 / 取消（可多选）。 */
+async function toggleSeason(seasonId) {
+  const selected = state.selectedSeasons.length > 0 ? state.selectedSeasons : [state.season];
+  if (selected.length === 1 && selected[0] === seasonId) {
+    // 不允许一个都不选 —— 空集合会让请求回落到"当季"，和界面显示对不上
+    toast('至少要留一个季度');
+    return;
+  }
+  await setSelectedSeasons(
+    selected.includes(seasonId) ? selected.filter((id) => id !== seasonId) : [...selected, seasonId],
+  );
 }
 
 /** 单选切换季度（顶部下拉框用）：整体替换选中集合。 */
 async function selectSeason(seasonId) {
-  state.selectedSeasons = [seasonId];
-  await applySeasonChange();
+  await setSelectedSeasons([seasonId]);
+}
+
+/** 点某一年的「全年」：该年库里所有季度一起选中 / 一起取消（取消到空就回落到当季）。 */
+async function toggleSeasonYear(year) {
+  const items = (state.overview?.seasonSummaries ?? []).filter((item) =>
+    String(item.season).startsWith(`${year}-`),
+  );
+  if (items.length === 0) return;
+  const yearIds = items.map((item) => item.season);
+  const selected = state.selectedSeasons;
+  const allOn = yearIds.every((id) => selected.includes(id));
+  const next = allOn ? selected.filter((id) => !yearIds.includes(id)) : [...selected, ...yearIds];
+  // 取消一整年可能把集合清空 —— 不允许"一季都不选"（空集合会让请求回落到当季、
+  // 与界面显示对不上），这时退回当季，比弹一句"至少要留一个季度"更有用。
+  await setSelectedSeasons(
+    next.length > 0 ? next : [state.currentSeason ?? state.season],
+  );
 }
 
 /**
- * 「全选」：选中库里所有季度；已经全选时再点一次 = 回到只选当季。
+ * 快捷预设：当季 / 近 4 季 / 近 8 季 / 全部。
  *
- * 两个刻意的设计：
- * 1. **主季（`selectedSeasons[0]`）保持为当前季**。周视图与 `.ics` 导出按主季算
- *    （见 primarySeason 与下方那句警告），若把列表里最新的季度排到最前，
- *    用户点一下"全选"就会连带改变周视图的内容 —— 那不是他要的效果。
- * 2. **再点一次回到只选当季**。全选后想回到单季，否则得逐个点掉 8 个标签。
+ * 「近 N 季」按**库里有数据的季度**数，不按日历硬推 —— 否则库里缺的季度也会被算进去，
+ * 选中 4 季却只看到 3 季的数据。顺序仍是「当季 → 从新到旧」，所以主季不会因为预设而变。
  */
-async function selectAllSeasons() {
-  const all = (state.overview?.seasonSummaries ?? []).map((item) => item.season);
-  if (all.length === 0) return;
-
-  // 与 seasonLibraryNotice() 里的判定保持同一口径：只问"库里每个季度是否都已选中"，
-  // 不比较集合长度（原因见那里的注释）。
-  const isAllSelected = all.every((season) => state.selectedSeasons.includes(season));
-
-  state.selectedSeasons = isAllSelected ? [state.season] : [state.season, ...all.filter((s) => s !== state.season)];
-  await applySeasonChange();
+async function selectSeasonPreset(name) {
+  const library = (state.overview?.seasonSummaries ?? []).map((item) => item.season);
+  const current = state.currentSeason ?? state.season;
+  if (name === 'current') return setSelectedSeasons([current]);
+  if (name === 'all') return setSelectedSeasons([current, ...library]);
+  const recent = orderedSeasons([current, ...library]);
+  if (name === 'last4') return setSelectedSeasons(recent.slice(0, 4));
+  if (name === 'last8') return setSelectedSeasons(recent.slice(0, 8));
 }
 
+/**
+ * 「全选」：选中库里所有季度（主季仍是当季）。
+ *
+ * 原来"再点一次回到只选当季"的双态已经去掉：面板里有显式的「当季」预设，
+ * 一个按钮只做一件事，不会点两下莫名回到单季。
+ */
+async function selectAllSeasons() {
+  const library = (state.overview?.seasonSummaries ?? []).map((item) => item.season);
+  if (library.length === 0) return;
+  await setSelectedSeasons([state.currentSeason ?? state.season, ...library]);
+}
+
+/** 季度面板开合：只切 `hidden` 与箭头，**不重绘任何东西**（保住搜索框焦点与列表滚动位置）。 */
+function applySeasonPanel() {
+  const panel = $('#season-panel');
+  if (panel) panel.hidden = !state.seasonsOpen;
+  const button = $('#season-picker-btn');
+  if (button) {
+    button.innerHTML = `选择季度 ${state.seasonsOpen ? '▲' : '▼'}`;
+    button.setAttribute('aria-expanded', state.seasonsOpen ? 'true' : 'false');
+  }
+}
+
+/** 季度切换的请求序号：连续快速点选时只认最后一次，晚到的旧响应不能把列表刷回上一组。 */
+let seasonSwitchSeq = 0;
+
 async function applySeasonChange() {
+  const seq = ++seasonSwitchSeq;
   state.season = primarySeason();
   state.offset = 0;
   try {
-    await loadOverview();
+    const overview = await api(`/api/overview?${overviewQuery()}`);
+    if (seq !== seasonSwitchSeq) return;
+    state.overview = overview;
     syncSeasonUi();
-    await refresh();
+    // 赛季视图里 refresh() 就是「再 loadOverview 一次 + renderSeason」—— 这里已经拉过了，
+    // 直接重绘即可，省掉一次多余的请求。其它视图（顶栏下拉切季时）仍交给 refresh 按视图重画。
+    if (state.view === 'season') renderSeason();
+    else await refresh();
   } catch (error) {
     setStatus(error.message, 'error');
   }
@@ -2822,8 +3248,12 @@ document.addEventListener('change', (event) => {
     updateScopeSummaryText();
     return;
   }
-  if (target?.id === 'scope-force') {
-    if (state.updateScope) state.updateScope.force = Boolean(target.checked);
+  if (target?.id === 'scope-incremental') {
+    if (state.updateScope) state.updateScope.incremental = Boolean(target.checked);
+    updateScopeSummaryText();
+  }
+  if (target?.id === 'scope-translate') {
+    if (state.updateScope) state.updateScope.translate = Boolean(target.checked);
     updateScopeSummaryText();
   }
 });

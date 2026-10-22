@@ -585,8 +585,6 @@ a { color: inherit; }
   text-decoration: line-through;
 }
 
-.chip-all { border-style: dashed; }
-
 .tag {
   display: inline-flex;
   align-items: center;
@@ -1040,15 +1038,174 @@ main {
   gap: 6px;
 }
 
-.season-bar .my-tabs {
-  flex-wrap: nowrap;
-  gap: 4px;
-  overflow-x: auto;
-  padding-bottom: 3px;
-  scrollbar-width: thin;
+/* ---- 季度区：收起时一行（已选 + 两个动作），点开是按年矩阵 ----
+   旧的 `.season-bar .my-tabs`（nowrap + overflow-x）已去掉：季度快 30 个之后
+   横向滚两屏多，点右侧的季度还会整页重绘、滚动条弹回最左。 */
+.season-picks {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
 }
 
-.season-bar .chip { padding: 0 8px; }
+.season-bar-primary {
+  margin-left: auto;
+  font: 500 var(--fs-xs) / 1.4 var(--font-mono);
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+.season-bar-primary b { color: var(--text); font-weight: 600; }
+
+.season-picks-count {
+  font: 500 var(--fs-xs) / 1 var(--font-mono);
+  color: var(--text-faint);
+}
+
+.season-picks .chip { padding: 0 8px; gap: 5px; }
+
+/* 主季标记：朱红只用于"选中 / 今天 / 下一集 / 进度"这类信号，主季属于选中，可以用 */
+.season-primary {
+  padding: 1px 4px;
+  border: 1px solid var(--accent-border);
+  border-radius: var(--radius-sm);
+  color: var(--accent);
+  font: 600 var(--fs-2xs) / 1 var(--font-mono);
+}
+
+.season-chip-x { color: var(--text-faint); font-size: var(--fs-2xs); line-height: 1; }
+.season-picks .chip:hover .season-chip-x { color: var(--text); }
+
+.season-picks-more {
+  font: 500 var(--fs-xs) / 1 var(--font-mono);
+  color: var(--text-faint);
+}
+
+.season-picks-actions { display: flex; gap: 6px; margin-left: auto; }
+
+.season-panel {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  /* 宽屏：矩阵在左、说明在右，把横向空间用起来；窄屏在媒体查询里收成一列 */
+  display: grid;
+  grid-template-columns: minmax(0, 760px) minmax(240px, 1fr);
+  gap: 8px 22px;
+  align-items: start;
+}
+
+/* `hidden` 必须显式写回来：上面把面板设成了 display:grid，作者样式会盖掉 UA 的 [hidden]{display:none} */
+.season-panel[hidden] { display: none; }
+
+.season-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  grid-column: 1 / -1;
+}
+
+.season-presets .btn { min-height: 27px; }
+
+.season-panel .filter-note {
+  margin: 0;
+  padding: 0;
+  border-top: 0;
+  max-width: 56ch;
+  align-self: start;
+}
+
+.season-matrix {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  /* 不要把矩阵拉满整行：4 列格子铺到 1400px 宽会变成四条长条，读起来反而散 */
+  max-width: 760px;
+  overflow-x: auto;
+}
+
+.season-matrix-row {
+  display: grid;
+  grid-template-columns: 76px repeat(4, minmax(56px, 1fr)) 80px;
+  gap: 4px;
+  align-items: center;
+  /* 极窄屏（< 440px）才出现横向滚动，桌面上这些列本来放得下 */
+  min-width: 440px;
+}
+
+.season-matrix-row.is-head {
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--border);
+}
+
+.season-matrix-row.is-head .season-year,
+.season-month {
+  font: 500 var(--fs-2xs) / 1 var(--font-mono);
+  color: var(--text-faint);
+  text-align: center;
+}
+
+.season-matrix-row.is-head .season-year { text-align: left; }
+
+.season-year {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  font: 600 var(--fs-xs) / 1 var(--font-mono);
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.season-year-count { font-size: var(--fs-2xs); font-weight: 500; color: var(--text-faint); }
+
+.season-cell {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  min-height: 27px;
+  padding: 0 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text-dim);
+  font: 500 var(--fs-2xs) / 1 var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  transition: background .14s var(--ease), border-color .14s var(--ease), color .14s var(--ease);
+}
+
+.season-cell:hover { border-color: var(--text); color: var(--text); }
+
+.season-cell.is-on {
+  background: var(--strong-bg);
+  border-color: var(--strong-bg);
+  color: var(--strong-fg);
+}
+
+.season-cell.is-on:hover { background: var(--strong-bg); color: var(--strong-fg); }
+
+.season-cell.is-empty {
+  border-style: dashed;
+  background: transparent;
+  color: var(--text-faint);
+  cursor: default;
+}
+
+.season-cell-u { font-size: 10px; opacity: .75; }
+.season-cell-check { font-size: 10px; }
+
+.season-year-btn { min-height: 27px; padding: 0 6px; justify-self: end; }
+
+/* 整年已全选时「全年」按钮是按下态（文字不改成「取消全年」：窄屏放不下四个字） */
+.season-year-btn.is-on {
+  background: var(--strong-bg);
+  border-color: var(--strong-bg);
+  color: var(--strong-fg);
+}
+
+.season-year-btn.is-on:hover { background: var(--strong-bg); color: var(--strong-fg); }
 
 /* 筛选面板 */
 .filter-panel {
@@ -1074,6 +1231,43 @@ main {
 #season-search::placeholder { color: var(--text-faint); }
 
 #season-search:focus { outline: none; border-color: var(--accent); box-shadow: var(--ring); }
+
+/* 「搜索」按钮：和输入框同高；有未提交的输入时带一个朱红小圆点（"我打了字还没搜"） */
+#search-go { min-height: 36px; }
+#search-go.is-pending::after {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.search-active { display: inline-flex; align-items: center; gap: 4px; }
+
+/* 关键词可能很长（番剧全名）：截断显示，完整词看输入框 */
+.search-word {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.search-clear {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--surface);
+  color: var(--text-faint);
+  font: 500 11px / 1 var(--font-mono);
+  cursor: pointer;
+}
+
+.search-clear:hover { border-color: var(--text); color: var(--text); }
 
 #subject-count {
   font: 500 var(--fs-xs) / 1 var(--font-mono);
@@ -1728,7 +1922,7 @@ main {
 
 .scope-main { min-width: 0; }
 .scope-side { display: flex; flex-direction: column; min-width: 0; gap: 14px; }
-.scope-side .scope-force { margin-top: 0; }
+.scope-side .scope-toggle { margin-top: 0; }
 .scope-side .filter-note { margin-top: 0; }
 
 .scope-presets { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
@@ -1774,7 +1968,7 @@ main {
 
 .scope-add .field { flex: 1; }
 
-.scope-force {
+.scope-toggle {
   display: flex;
   align-items: flex-start;
   gap: 8px;
@@ -1785,7 +1979,7 @@ main {
   cursor: pointer;
 }
 
-.scope-force input { margin-top: 5px; accent-color: var(--accent); }
+.scope-toggle input { margin-top: 5px; accent-color: var(--accent); }
 
 .scope-skip { color: var(--text-faint); text-decoration: line-through; }
 
@@ -1854,7 +2048,6 @@ main {
 @media (max-width: 1180px) {
   .per-row-5, .per-row-6, .per-row-7 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .my-list { grid-template-columns: 1fr; }
-  .season-bar .my-tabs { flex-wrap: wrap; overflow: visible; }
 
   /* 宽度不够时，加权周板收成按天堆叠，避免 1 集的天被挤成一条 */
   .week-board { display: block; }
@@ -1898,6 +2091,7 @@ main {
   .upcoming-list { grid-template-columns: 1fr; }
   .filter-facets { grid-template-columns: 1fr; }
   .scope-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .season-panel { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 760px) {
@@ -1908,7 +2102,10 @@ main {
   .tabs { position: static; height: auto; min-height: 42px; flex-wrap: wrap; }
   .tab { min-height: 42px; }
   .status { flex: 1 1 100%; padding: 6px 0 8px; white-space: normal; max-width: none; }
-  .season-bar .my-tabs { flex-wrap: wrap; overflow: visible; }
+
+  /* 季度矩阵在窄屏收紧列宽；再窄就由面板内部横向滚动兜住，不把页面撑破 */
+  .season-matrix-row { grid-template-columns: 64px repeat(4, minmax(44px, 1fr)) 68px; min-width: 380px; }
+  .season-year-btn { padding: 0 4px; }
 
   .per-row-3, .per-row-4, .per-row-5, .per-row-6, .per-row-7 {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1934,6 +2131,19 @@ main {
   .modal-head h2 { font-size: 20px; }
   .ep-line { grid-template-columns: 44px minmax(0, 1fr) 96px; }
   .ep-line .ep-line-source { display: none; }
+}
+
+@media (max-width: 560px) {
+  .season-bar-head { flex-wrap: wrap; gap: 4px 12px; }
+  .season-bar-primary { margin-left: 0; }
+  /* 矩阵收进一屏：去掉年份旁的「已选/共几季」小计数，四列格子与「全年」才放得下 */
+  .season-matrix-row {
+    grid-template-columns: 46px repeat(4, minmax(38px, 1fr)) 46px;
+    min-width: 0;
+  }
+  .season-year-count { display: none; }
+  .season-year-btn,
+  .season-cell { padding: 0 2px; }
 }
 
 @media (max-width: 480px) {

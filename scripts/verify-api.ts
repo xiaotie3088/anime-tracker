@@ -171,7 +171,9 @@ await check('GET /app.js 返回 JS', async () => {
 await check('GET /styles.css 返回 CSS', async () => {
   const response = await fetch(`${BASE}/styles.css`);
   assert(response.ok, `HTTP ${response.status}`);
-  assert((await response.text()).includes('.week-grid'), 'CSS 内容不对');
+  // 断言的是「周视图的样式确实在这个文件里」。第七轮 UI 改版把 .week-grid 改名成 .week-board，
+  // 这里的锚点跟着改 —— 否则这条会一直红着，却与功能无关。
+  assert((await response.text()).includes('.week-board'), 'CSS 内容不对');
 });
 
 await check('目录穿越被拒绝', async () => {
@@ -653,6 +655,26 @@ await check('更新数据前会自动备份（用户数据不可重建）', asyn
   assert(typeof result.backup.path === 'string' && result.backup.path.includes('backups'), `备份路径可疑：${result.backup.path}`);
   assert(result.backup.bytes > 10_000, `备份文件只有 ${result.backup.bytes} 字节，可疑`);
   console.log(`      ${result.backup.path.split(/[\\/]/).pop()}（${Math.round(result.backup.bytes / 1024)} KB）`);
+});
+
+// 长任务接口（第八轮性能改造）：界面靠它画进度、点「停止」。
+// 这里只验路由与状态机，不真的起一个几分钟的任务 —— 那条路 ui-smoke 用桩覆盖了。
+await check('GET /api/job 能返回任务状态（没跑过任务时 job 为 null）', async () => {
+  const data = await getJson<{ job: unknown }>('/api/job');
+  assert('job' in data, '响应里缺少 job 字段');
+  if (data.job !== null) {
+    const job = data.job as { running?: boolean; stage?: string };
+    assert(typeof job.running === 'boolean', 'job.running 应当是布尔值');
+    assert(typeof job.stage === 'string', 'job.stage 应当是字符串');
+  }
+  console.log(`      当前任务：${data.job === null ? '无' : (data.job as { stage: string }).stage}`);
+});
+
+await check('POST /api/job/cancel 在没有任务时安全返回（不会 5xx）', async () => {
+  const result = await postJson<{ ok: boolean; note?: string }>('/api/job/cancel');
+  assert(result.ok === false, `没有任务时 ok 应为 false，实际 ${result.ok}`);
+  assert(typeof result.note === 'string' && result.note.length > 0, '应说明"当前没有在跑的任务"');
+  console.log(`      ${result.note}`);
 });
 
 // ---------------------------------------------------------------------------

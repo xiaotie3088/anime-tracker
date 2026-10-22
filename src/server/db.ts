@@ -23,17 +23,27 @@ import { DATA_DIR } from '../providers/snapshot.ts';
 
 const SCHEMA_SQL = readFileSync(new URL('./schema.sql', import.meta.url), 'utf8');
 
-export const DEFAULT_DB_PATH = path.join(DATA_DIR, 'anime.db');
+/**
+ * 数据库文件路径。
+ *
+ * `ANIME_DB_PATH` 是给**验证用的逃生口**：想在一份副本上试「重抓某个古早季度」，
+ * 又不想动 `data/anime.db` 时用它（`$env:ANIME_DB_PATH='tmp/copy.db'`）。
+ * 平时不要设它 —— 追番列表是真实资产，写到副本上会让你以为数据丢了。
+ */
+export const DEFAULT_DB_PATH = process.env.ANIME_DB_PATH ?? path.join(DATA_DIR, 'anime.db');
 /** 备份目录：用户数据（追番列表 / 进度 / 补番库）不可重建，所以要有兜底。 */
-export const BACKUP_DIR = path.join(DATA_DIR, 'backups');
+export const BACKUP_DIR = process.env.ANIME_BACKUP_DIR ?? path.join(DATA_DIR, 'backups');
 /**
  * 库结构版本。
  *
  *   2 -> 3：新增 `sync_run`（每次同步的运行记录，见 schema.sql 与票 A）。
  *           `migrate()` 里 `db.exec(SCHEMA_SQL)` 本身是幂等的 `IF NOT EXISTS`，
  *           所以新表不需要额外迁移语句 —— 提版本号是为了让"库是新的还是旧的"可查。
+ *   3 -> 4：新增 `season_state`（每季「上一次真抓」的结果）。同样是新建表，
+ *           老库启动时就地建出来；一条记录都没有 = 从没真抓过 = 该抓 ——
+ *           这正好是修「古早季度怎么更新都不增加」想要的行为。
  */
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 /** node:sqlite 只接受 null / number / string / bigint / Uint8Array，布尔和 undefined 必须转换。 */
 type BindValue = null | number | string | bigint | Uint8Array;
@@ -330,8 +340,12 @@ export function resolveSeasonForWrite(
  * ⚠ 比较时刻必须先 `Date.parse` 转成毫秒，**不能直接比字符串**：
  * `'2026-10-03…' < '2026-09-25…'` 在字典序下为 true（'1' < '9'），
  * 日期字符串的字典序只在格式完全一致时才等于时间顺序。
+ *
+ * ⚠ **季度归属只有这一份实现**：写入时由 `resolveSeasonForWrite` 用、写库后由
+ * `repairSeasonAssignments` 用、`cli audit` 体检时也用它。导出它是为了让体检结果
+ * 与写入逻辑永远同口径（改一处就等于三处一起改）。
  */
-function deriveSeasonFromAirTimes(
+export function deriveSeasonFromAirTimes(
   firstAirAtUtc: string | null | undefined,
   episodes: readonly { epNumber: number; airAtUtc?: string | null | undefined }[],
 ): string | null {
@@ -419,8 +433,13 @@ export function repairSeasonAssignments(db: DatabaseSync, scopeSeason?: string |
   return repaired;
 }
 
-/** 写入一部番及其分集（同一事务）。 */
-export function upsertSubject(db: DatabaseSync, subject: Subject, season: string | null = null): void {
+/** 写入一部番及其分集（同一事务）。返回「这一行是不是新增的」（写库前不存在 = 新增）。 */
+export function upsertSubject(
+  db: DatabaseSync,
+  subject: Subject,
+  season: string | null = null,
+  options: { inTransaction?: boolean } = {},
+): boolean {
   const updatedAt = nowIso();
   const effectiveSeason = resolveSeasonForWrite(
     db,
@@ -429,7 +448,10 @@ export function upsertSubject(db: DatabaseSync, subject: Subject, season: string
     subject.firstAirAtUtc,
     subject.episodes,
   );
-  db.exec('BEGIN');
+  // 「新增」必须在这里判：UPSERT 之后就看不出这一行原来有没有了
+  const isNew = !subjectKeyExists(db, subject.key);
+  const ownTransaction = options.inTransaction !== true;
+  if (ownTransaction) db.exec('BEGIN');
   try {
     db.prepare(UPSERT_SUBJECT_SQL).run(...bindAll(subjectValues(subject, effectiveSeason, updatedAt)));
 
@@ -437,17 +459,60 @@ export function upsertSubject(db: DatabaseSync, subject: Subject, season: string
     for (const ep of subject.episodes) {
       epStmt.run(...bindAll(episodeValues(subject.key, ep, subject.durationMin ?? null)));
     }
-    db.exec('COMMIT');
+    if (ownTransaction) db.exec('COMMIT');
   } catch (error) {
-    db.exec('ROLLBACK');
+    if (ownTransaction) db.exec('ROLLBACK');
     throw error;
   }
+  return isNew;
 }
 
-/** 批量写入，返回写入条数。 */
-export function upsertSubjects(db: DatabaseSync, subjects: readonly Subject[], season: string | null = null): number {
-  for (const subject of subjects) upsertSubject(db, subject, season);
-  return subjects.length;
+export type UpsertSummary = {
+  /** 写入（UPSERT）的部数 —— 每次同步都等于抓到的条数，**不代表新增** */
+  written: number;
+  /** 其中库里原本没有的条数 —— 用户真正关心的「这次多了几部」 */
+  added: number;
+};
+
+/**
+ * 批量写入。
+ *
+ * 为什么要把 `added` 和 `written` 分开：以前报告里只有一个「写入 N 部」，
+ * 重抓一季永远是「写入 135 部」，哪怕一行都没多 —— 用户看到的是
+ * 「更新成功了，但番没变多」。`added` 才是「这次真多了几部」。
+ *
+ * 为什么整批放**一个**事务：库是 WAL 模式，`COMMIT` 要落盘。一季 200 部如果一部一个
+ * 事务，就是 200 次落盘 —— 实测一季写库约 2 秒，占该季总耗时的三分之一。
+ *
+ * ⚠ 整批失败会退回「一部一个事务」重跑：宁可慢一点，也不该因为第 137 部有问题
+ *   就把前 136 部一起回滚掉（用户的观感是"这一季白抓了"）。
+ */
+export function upsertSubjects(
+  db: DatabaseSync,
+  subjects: readonly Subject[],
+  season: string | null = null,
+): UpsertSummary {
+  let added = 0;
+  db.exec('BEGIN');
+  try {
+    for (const subject of subjects) {
+      if (upsertSubject(db, subject, season, { inTransaction: true })) added += 1;
+    }
+    db.exec('COMMIT');
+    return { written: subjects.length, added };
+  } catch {
+    try {
+      db.exec('ROLLBACK');
+    } catch {
+      // 事务已经不在了（BEGIN 自己就失败）—— 不必再回滚
+    }
+  }
+
+  added = 0;
+  for (const subject of subjects) {
+    if (upsertSubject(db, subject, season)) added += 1;
+  }
+  return { written: subjects.length, added };
 }
 
 // ---------------------------------------------------------------------------
@@ -1397,6 +1462,17 @@ export type SeasonSummary = {
   episodes: number;
   /** 该季度最后一次写入时刻（ISO UTC），用于判断数据有多旧 */
   updatedAt: string | null;
+  /**
+   * 这一季**上一次真抓**的结果；null = 从没真抓过。
+   *
+   * 为什么要带出来：库里「有几部」不等于「抓过」—— 抓相邻季度会按条目自己的
+   * 放送时刻把几条判进这一季（见 `resolveSeasonForWrite`）。界面必须能说出
+   * 「库里 10 部，但从没真抓过」，否则用户只会看到「一个季度只有几部番」。
+   */
+  lastFetchedAt: string | null;
+  lastStatus: SeasonFetchStatus | null;
+  lastAdded: number | null;
+  lastWritten: number | null;
 };
 
 /** 每个季度各有多少部番、多少集 —— 界面标注「库里有哪些季度」用。 */
@@ -1413,12 +1489,127 @@ export function seasonSummaries(db: DatabaseSync): SeasonSummary[] {
        ORDER BY s.season DESC`,
     )
     .all() as unknown as Array<{ season: string; subjects: number; episodes: number; updated_at: string | null }>;
-  return rows.map((row) => ({
+  const fetchStates = listSeasonFetchStates(db);
+  return rows.map((row) => {
+    const state = fetchStates.get(row.season);
+    return {
+      season: row.season,
+      subjects: Number(row.subjects),
+      episodes: Number(row.episodes),
+      updatedAt: row.updated_at,
+      lastFetchedAt: state?.lastFetchedAt ?? null,
+      lastStatus: state?.lastStatus ?? null,
+      lastAdded: state?.lastAdded ?? null,
+      lastWritten: state?.lastWritten ?? null,
+    };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 每季「上一次真抓」的结果（`season_state`，见 schema.sql 与 docs/决策记录.md D13）
+// ---------------------------------------------------------------------------
+
+/** 'fetched' 抓到并写了 | 'empty' 源站没给这季的数据 | 'failed' 所有源都失败 */
+export type SeasonFetchStatus = 'fetched' | 'empty' | 'failed';
+
+export type SeasonFetchState = {
+  season: string;
+  lastFetchedAt: string;
+  lastStatus: SeasonFetchStatus;
+  lastWritten: number;
+  lastEpisodes: number;
+  lastAdded: number;
+  /** 上次有没有抓逐集放送时刻（过去季度不抓，见 Provider 的 SeasonFetchOptions） */
+  lastSchedules: boolean;
+  lastProviders: Array<{ provider: string; ok: boolean; items: number }>;
+};
+
+type SeasonStateRow = {
+  season: string;
+  last_fetched_at: string;
+  last_status: string;
+  last_written: number;
+  last_episodes: number;
+  last_added: number;
+  last_schedules: number;
+  last_providers: string | null;
+};
+
+function toSeasonFetchState(row: SeasonStateRow): SeasonFetchState {
+  return {
     season: row.season,
-    subjects: Number(row.subjects),
-    episodes: Number(row.episodes),
-    updatedAt: row.updated_at,
-  }));
+    lastFetchedAt: row.last_fetched_at,
+    lastStatus: row.last_status === 'failed' ? 'failed' : row.last_status === 'empty' ? 'empty' : 'fetched',
+    lastWritten: Number(row.last_written ?? 0),
+    lastEpisodes: Number(row.last_episodes ?? 0),
+    lastAdded: Number(row.last_added ?? 0),
+    lastSchedules: row.last_schedules !== 0,
+    lastProviders: parseJsonArray<{ provider: string; ok: boolean; items: number }>(row.last_providers),
+  };
+}
+
+const SEASON_STATE_SELECT =
+  `SELECT season, last_fetched_at, last_status, last_written, last_episodes, last_added,
+          last_schedules, last_providers
+     FROM season_state`;
+
+/** 某一季上次真抓的结果；`undefined` = 从没真抓过。 */
+export function getSeasonFetchState(db: DatabaseSync, season: string): SeasonFetchState | undefined {
+  const row = db.prepare(`${SEASON_STATE_SELECT} WHERE season = ?`).get(...bindAll([season])) as unknown as
+    | SeasonStateRow
+    | undefined;
+  return row ? toSeasonFetchState(row) : undefined;
+}
+
+/** 所有季度的真抓状态（季度 id → 状态）。 */
+export function listSeasonFetchStates(db: DatabaseSync): Map<string, SeasonFetchState> {
+  const rows = db.prepare(`${SEASON_STATE_SELECT}`).all() as unknown as SeasonStateRow[];
+  return new Map(rows.map((row) => [row.season, toSeasonFetchState(row)]));
+}
+
+/**
+ * 记下「这一季刚刚被真抓了」。
+ *
+ * 失败也要记（`lastStatus = 'failed'`）：判定逻辑对 failed 的态度是"下次重试"，
+ * 但体检 / 界面要能看到"上次全挂了"，而不是一片空白。
+ */
+export function recordSeasonFetch(
+  db: DatabaseSync,
+  state: {
+    season: string;
+    status: SeasonFetchStatus;
+    written: number;
+    episodes: number;
+    added: number;
+    schedules: boolean;
+    providers: readonly unknown[];
+    fetchedAt?: string;
+  },
+): void {
+  db.prepare(
+    `INSERT INTO season_state
+       (season, last_fetched_at, last_status, last_written, last_episodes, last_added, last_schedules, last_providers)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(season) DO UPDATE SET
+       last_fetched_at = excluded.last_fetched_at,
+       last_status = excluded.last_status,
+       last_written = excluded.last_written,
+       last_episodes = excluded.last_episodes,
+       last_added = excluded.last_added,
+       last_schedules = excluded.last_schedules,
+       last_providers = excluded.last_providers`,
+  ).run(
+    ...bindAll([
+      state.season,
+      state.fetchedAt ?? nowIso(),
+      state.status,
+      state.written,
+      state.episodes,
+      state.added,
+      state.schedules ? 1 : 0,
+      JSON.stringify(state.providers ?? []),
+    ]),
+  );
 }
 
 /** 某个季度是否已经有数据（增量回填时用来跳过）。 */
@@ -1830,6 +2021,8 @@ export function clearFetchedData(db: DatabaseSync): { subjects: number } {
     db.exec('DELETE FROM subject');
     // 运行记录是"账"，不是抓取数据 —— 但 reset 的语义就是"从头来过"，连带清掉才对
     db.exec('DELETE FROM sync_run');
+    // 每季「上次真抓」的状态同理：留着它会让 reset 之后每一季都被判成"抓过了"
+    db.exec('DELETE FROM season_state');
     db.exec('COMMIT');
   } catch (error) {
     db.exec('ROLLBACK');

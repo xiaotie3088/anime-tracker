@@ -27,8 +27,8 @@
 
 ```powershell
 pnpm exec tsc --noEmit        # 0 错误
-pnpm verify                   # 129 项，离线，不需要联网
-pnpm verify:api               # 28 项，需先启动服务；会真实写库（当前 2 项既有失败，见交接文档第八节）
+pnpm verify                   # 135 项，离线，不需要联网
+pnpm verify:api               # 30 项，需先启动服务；会真实写库（当前 2 项既有失败，见交接文档第八节）
 pnpm ui:smoke                 # 前端交互，需服务已启动
 ```
 

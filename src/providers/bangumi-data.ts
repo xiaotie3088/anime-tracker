@@ -20,7 +20,7 @@ import { z } from 'zod';
 import { parseIsoRepeatingInterval, toLiteralJstTime, type SeasonInfo } from '../core/time.ts';
 import type { AiringStatus, MediaType, Platform, RawEpisode, RawSeasonAnime } from '../core/types.ts';
 import { fetchText } from './http.ts';
-import type { Provider } from './provider.ts';
+import type { Provider, SeasonFetchOptions } from './provider.ts';
 import { DATA_DIR } from './snapshot.ts';
 import { parseOrThrow } from './validate.ts';
 
@@ -194,8 +194,13 @@ function idOf(item: Item, site: string): number | undefined {
  *
  * 如果数据里带 end（已知完结时刻），可以算出整部番每一集的放送时刻；
  * 正在播出的番通常没有 end，此时只给出第 1 集，其余留给 AniList 的 airingSchedule 补。
+ *
+ * `withSchedules=false`（过去季度）时**一条都不给**：番早就播完了，逐集时刻没有使用场景，
+ * 却要写几千行 `episode`。首播时刻仍在 `mapItem()` 里由 broadcast / begin 给出，
+ * 季度归属与总览排序不依赖本函数的输出。
  */
-function buildEpisodes(item: Item): RawEpisode[] {
+function buildEpisodes(item: Item, withSchedules = true): RawEpisode[] {
+  if (!withSchedules) return [];
   if (!item.broadcast) return [];
   const interval = parseIsoRepeatingInterval(item.broadcast);
   if (!interval) return [];
@@ -228,7 +233,7 @@ function totalEpsFromEnd(item: Item): number | undefined {
   return Math.min(MAX_EPISODES_PER_SUBJECT, Math.floor((endMs - startMs) / periodMs) + 1);
 }
 
-function mapItem(item: Item, siteMeta: Dataset['siteMeta']): RawSeasonAnime | null {
+function mapItem(item: Item, siteMeta: Dataset['siteMeta'], withSchedules = true): RawSeasonAnime | null {
   const zhHans = item.titleTranslate?.['zh-Hans'] ?? [];
   const zhHant = item.titleTranslate?.['zh-Hant'] ?? [];
   const en = item.titleTranslate?.['en'] ?? [];
@@ -282,7 +287,7 @@ function mapItem(item: Item, siteMeta: Dataset['siteMeta']): RawSeasonAnime | nu
     broadcastWeekdayJst: literal.broadcastWeekdayJst,
     broadcastTimeJst: literal.hhmmJst,
     platforms: mapPlatforms(item, siteMeta),
-    episodes: buildEpisodes(item),
+    episodes: buildEpisodes(item, withSchedules),
     siteUrl: `https://bangumi.tv/subject_search/${encodeURIComponent(item.title)}`,
     ...(item.comment ? { synopsis: item.comment } : {}),
   };
@@ -295,8 +300,9 @@ export const bangumiDataProvider: Provider = {
   label: 'bangumi-data 数据集',
   capabilities: ['season', 'platforms'],
 
-  async fetchSeason(season: SeasonInfo): Promise<RawSeasonAnime[]> {
+  async fetchSeason(season: SeasonInfo, options: SeasonFetchOptions = {}): Promise<RawSeasonAnime[]> {
     const dataset = await loadDataset();
+    const withSchedules = options.schedules !== false;
 
     // 宽松区间：收纳「提前一周开播」与「延后到季初才完结」的番
     const paddingDays = 20;
@@ -309,7 +315,7 @@ export const bangumiDataProvider: Provider = {
       if (!Number.isFinite(beginMs)) continue;
       if (beginMs < seasonStart || beginMs >= seasonEnd) continue;
 
-      const mapped = mapItem(item, dataset.siteMeta);
+      const mapped = mapItem(item, dataset.siteMeta, withSchedules);
       if (mapped) result.push(mapped);
     }
 
